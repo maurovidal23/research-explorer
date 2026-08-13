@@ -1,0 +1,187 @@
+"""Orchestrator — the main ACO loop that ties everything together.
+
+Initializes the colony, runs oleadas until convergence, and returns the
+winning agent's narrative.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+
+from research_explorer.aco.colony import Colony
+from research_explorer.aco.convergence import ConvergenceChecker
+from research_explorer.aco.scheduler import Scheduler
+from research_explorer.agents.llm_client import LLMClient
+from research_explorer.config import Config, get_api_key
+from research_explorer.evaluation.structural import StructuralMetrics
+from research_explorer.graph.embeddings import EmbeddingService
+from research_explorer.graph.feromone import PheromoneManager
+from research_explorer.graph.models import normalize_id
+from research_explorer.graph.store import GraphStore
+from research_explorer.logging_setup import configure_logging, get_logger
+from research_explorer.providers.base import ResilientProvider
+from research_explorer.providers.factory import build_all_providers, build_provider
+
+log = get_logger("orchestrator")
+
+_ARXIV_ID = re.compile(r"^(arxiv:)?\d{4}\.\d{4,5}(v\d+)?$", re.IGNORECASE)
+
+
+class Orchestrator:
+    """Runs the full ACO exploration loop.
+
+    Usage:
+        orch = Orchestrator(config)
+        narrative = await orch.run(seed_paper_id="10.1038/nrn3241", seed_query="...")
+    """
+
+    def __init__(self, config: Config):
+        self.cfg = config
+        configure_logging(config.log_level)
+
+        # Storage
+        self.graph = GraphStore(config.storage.db_path)
+        self.pheromone = PheromoneManager()
+
+        # LLM
+        api_key = get_api_key(config.llm.api_key_env)
+        self.llm = LLMClient(
+            base_url=config.llm.base_url,
+            api_key=api_key,
+            max_concurrent=config.llm.max_concurrent,
+            rpm=config.llm.rpm,
+        )
+
+        # Embedding service (wraps LLM embed with SQLite cache)
+        self.embedding = EmbeddingService(
+            self.graph, embedder=self.llm.embed
+        )
+
+        # Provider registry: all active providers, for cross-provider fetching
+        self.providers: dict[str, ResilientProvider] = build_all_providers(config)
+        self.provider: ResilientProvider = self.providers.get(
+            config.providers.default, build_provider(config.providers.default, config)
+        )
+
+        # Colony + scheduler
+        self.colony = Colony(
+            graph=self.graph,
+            llm=self.llm,
+            embedding=self.embedding,
+            provider=self.provider,
+            providers=self.providers,
+            config=config,
+        )
+        self.structural = StructuralMetrics(self.graph)
+        self.scheduler = Scheduler(self.colony, config, self.pheromone, self.structural)
+        self.convergence = ConvergenceChecker(config)
+
+    def _provider_for_seed(self, seed_paper_id: str) -> ResilientProvider:
+        """Route the seed to the right provider (arXiv IDs -> arXiv provider)."""
+        if "arxiv" in self.providers and _ARXIV_ID.match(seed_paper_id):
+            return self.providers["arxiv"]
+        return self.provider
+
+    async def run(self, seed_paper_id: str, seed_query: str) -> str:
+        """Run the full exploration and return the winning narrative.
+
+        Args:
+            seed_paper_id: The seed paper ID (DOI, S2 ID, PMID, arXiv ID, etc.).
+            seed_query: A text description of the research line to explore.
+
+        Returns:
+            The narrative of the agent with the highest Q score.
+        """
+        start_time = time.monotonic()
+        log.info(
+            "orchestrator_start",
+            seed=seed_paper_id,
+            query=seed_query,
+            colony_size=self.cfg.aco.colony_size,
+            K=self.cfg.aco.max_concurrent,
+            max_fetches=self.cfg.budget.max_fetches,
+        )
+
+        # 1. Fetch the seed paper and cache it
+        seed_provider = self._provider_for_seed(seed_paper_id)
+        seed_paper = await seed_provider.get_paper(seed_paper_id)
+        if seed_paper is None:
+            raise RuntimeError(f"Could not fetch seed paper: {seed_paper_id}")
+        self.graph.cache_paper(seed_paper)
+        seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
+
+        # 2. Initialize the colony (each agent reads the seed)
+        await self.colony.initialize(seed_nid, seed_query)
+
+        # 3. Run oleadas until convergence
+        while not self.convergence.should_stop(
+            self.colony.best_quality,
+            self.scheduler.total_fetches,
+            self.colony.pheromone_concentration(),
+        ):
+            await self.scheduler.run_oleada()
+
+            # Check if all agents are exhausted
+            if not self.colony.active_candidates():
+                log.info("all_agents_exhausted")
+                break
+
+        # 4. Return the winning narrative
+        winner = self.colony.best_agent
+        self._elapsed = time.monotonic() - start_time
+        if winner is None:
+            log.warning("no_winner")
+            return ""
+
+        log.info(
+            "orchestrator_complete",
+            winner=self.colony.best_snapshot_agent,
+            best_Q=winner.state.quality,
+            peak_Q=self.colony.best_quality,
+            snapshot_oleada=self.colony.best_snapshot_oleada,
+            total_fetches=self.scheduler.total_fetches,
+            oleadas=self.scheduler.oleada_count,
+            elapsed=self._elapsed,
+        )
+        return self.colony.best_narrative
+
+    def generate_report(self, seed_paper_id: str, seed_query: str) -> str:
+        """Build a full markdown exploration report after run() has completed."""
+        from research_explorer.orchestrator.report import build_report
+
+        return build_report(
+            config=self.cfg,
+            colony=self.colony,
+            scheduler=self.scheduler,
+            convergence=self.convergence,
+            graph=self.graph,
+            seed_paper_id=seed_paper_id,
+            seed_query=seed_query,
+            elapsed=getattr(self, "_elapsed", 0.0),
+        )
+
+    def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:
+        """Generate an Obsidian-compatible graph for the winner agent.
+
+        Returns the path to the generated folder, or None if no winner.
+        """
+        from research_explorer.orchestrator.obsidian import generate_obsidian_graph
+
+        winner = self.colony.best_agent
+        if winner is None:
+            return None
+        return generate_obsidian_graph(
+            agent_state=winner.state,
+            graph=self.graph,
+            seed_query=seed_query,
+            output_dir=output_dir,
+            shared_frontier=self.colony.shared_frontier,
+        )
+
+    async def aclose(self) -> None:
+        """Clean up resources."""
+        await self.llm.aclose()
+        for p in self.providers.values():
+            await p.aclose()
+        self.graph.close()

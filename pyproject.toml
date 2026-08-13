@@ -1,0 +1,80 @@
+[project]
+name = "research-explorer"
+version = "0.1.0"
+description = "ACO multi-agent heuristic exploration of scientific citation graphs via MCP"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Research Explorer Contributors" }]
+keywords = ["aco", "ant-colony", "multi-agent", "citation-graph", "mcp", "research", "heuristics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "openai>=1.50",
+    "httpx[http2]>=0.27",
+    "aiolimiter>=1.1",
+    "tenacity>=8.2",
+    "aiobreaker>=0.7",
+    "diskcache>=5.6",
+    "pydantic>=2.5",
+    "structlog>=24.1",
+    "typer>=0.12",
+    "tomli>=2.0; python_version < '3.11'",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "pypdf>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+research-explorer = "research_explorer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/research_explorer"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true

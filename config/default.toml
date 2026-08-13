@@ -1,0 +1,97 @@
+# Default config — NaN free-tier profile (K=3, 60rpm)
+# Copy this to config/local.toml and adjust API keys.
+
+log_level = "INFO"
+
+[llm]
+base_url = "https://api.nan.builders/v1"
+api_key_env = "NAN_API_KEY"
+max_concurrent = 5        # NaN limit: 5 concurrent
+rpm = 60                  # NaN limit: 60 rpm
+explorer_model = "qwen3.6"
+judge_model = "deepseek-v4-flash"
+embedding_model = "qwen3-embedding"
+rerank_model = "rerank"
+temperature = 0.6
+max_tokens = 2000
+
+[aco]
+colony_size = 15          # N — total agents in the colony
+max_concurrent = 3        # K — active agents per oleada (your concurrency limit)
+k_per_turn = 4            # fetches per agent per turn
+alpha = 1.0               # pheromone weight
+beta = 3.0                # heuristic weight
+rho = 0.1                 # evaporation
+epsilon = 0.1             # epsilon-greedy exploration
+tau_min = 0.1            # MMAS lower bound
+tau_max = 10.0           # MMAS upper bound
+lambda_elite = 0.5       # elitism deposit weight
+tau_init = 1.0           # initial pheromone
+
+[quality]
+w_self = 0.25
+w_peers = 0.25
+w_virgin = 0.25
+w_structural = 0.25
+peer_aggregation = "median"   # "median" | "reputation"
+
+[direction]
+ref_weight = 0.7          # favor fundamentals (references)
+cites_weight = 0.3       # impact (citants)
+phase_directional = false
+
+[heuristica]
+w_sim = 0.6              # embedding similarity weight
+w_citas = 0.2            # citation count weight
+w_recencia = 0.2         # recency weight
+use_rerank = true        # use NaN reranker to refine candidate ranking
+eta_llm = false          # use pure embedding for eta (cheap); true = LLM virgin (costly)
+
+[providers]
+default = "openalex"
+active = ["openalex", "semantic_scholar", "pubmed", "arxiv"]
+
+[providers.semantic_scholar]
+rate = 1                  # 1 req per 3s (unauthenticated ~100 req/5min)
+period = 3
+concurrency = 3
+timeout = 30.0
+api_key_env = "S2_API_KEY"
+
+[providers.openalex]
+rate = 10                 # 10 req/s
+period = 1
+concurrency = 10
+timeout = 30.0
+api_key_env = "OPENALEX_API_KEY"
+
+[providers.pubmed]
+rate = 10                 # 10 req/s with key
+period = 1
+concurrency = 5
+timeout = 30.0
+api_key_env = "PUBMED_API_KEY"
+
+[providers.arxiv]
+rate = 1                  # 1 req per 3s recommended (be polite)
+period = 3
+concurrency = 3
+timeout = 30.0
+
+[budget]
+type = "fetches"          # "fetches" | "time" | "convergence"
+max_fetches = 500
+max_time_seconds = 3600
+
+[convergence]
+plateau_T = 10
+epsilon = 0.01
+theta = 5.0
+
+[scheduler]
+gamma = 0.5              # frontier expected-value weight
+delta = 0.3             # remaining-budget weight
+
+[storage]
+db_path = "data/explorer.db"
+cache_dir = "data/.cache"

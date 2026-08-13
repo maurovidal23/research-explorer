@@ -1,0 +1,90 @@
+# NaN full profile — no concurrency limits (for paid / higher tiers)
+
+log_level = "INFO"
+
+[llm]
+base_url = "https://api.nan.builders/v1"
+api_key_env = "NAN_API_KEY"
+max_concurrent = 5
+rpm = 60
+explorer_model = "qwen3.6"
+judge_model = "deepseek-v4-flash"
+embedding_model = "qwen3-embedding"
+rerank_model = "rerank"
+temperature = 0.6
+max_tokens = 2000
+
+[aco]
+colony_size = 30
+max_concurrent = 5
+k_per_turn = 6
+alpha = 1.0
+beta = 3.0
+rho = 0.1
+epsilon = 0.1
+tau_min = 0.1
+tau_max = 10.0
+lambda_elite = 0.5
+tau_init = 1.0
+
+[quality]
+w_self = 0.25
+w_peers = 0.25
+w_virgin = 0.25
+w_structural = 0.25
+peer_aggregation = "reputation"
+
+[direction]
+ref_weight = 0.6
+cites_weight = 0.4
+phase_directional = true
+
+[heuristica]
+w_sim = 0.6
+w_citas = 0.2
+w_recencia = 0.2
+use_rerank = true
+eta_llm = false
+
+[providers]
+default = "semantic_scholar"
+active = ["semantic_scholar", "openalex", "pubmed"]
+
+[providers.semantic_scholar]
+rate = 1
+period = 1
+concurrency = 5
+timeout = 30.0
+api_key_env = "S2_API_KEY"
+
+[providers.openalex]
+rate = 10
+period = 1
+concurrency = 10
+timeout = 30.0
+api_key_env = "OPENALEX_API_KEY"
+
+[providers.pubmed]
+rate = 10
+period = 1
+concurrency = 5
+timeout = 30.0
+api_key_env = "PUBMED_API_KEY"
+
+[budget]
+type = "convergence"
+max_fetches = 5000
+max_time_seconds = 14400
+
+[convergence]
+plateau_T = 15
+epsilon = 0.005
+theta = 8.0
+
+[scheduler]
+gamma = 0.5
+delta = 0.3
+
+[storage]
+db_path = "data/explorer.db"
+cache_dir = "data/.cache"

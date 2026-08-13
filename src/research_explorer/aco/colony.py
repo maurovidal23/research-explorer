@@ -1,0 +1,211 @@
+"""Colony — manages the population of ACO agents.
+
+Initializes N agents at the seed, assigns castes, and tracks the best agent.
+Each agent keeps its own private graph; the seed's neighbors are discovered
+per-agent (reading the seed) during initialization.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from collections import Counter
+from typing import Literal
+
+from research_explorer.aco.frontier import SharedFrontier
+from research_explorer.agents.explorer import ExplorerAgent
+from research_explorer.agents.llm_client import LLMClient
+from research_explorer.agents.state import AgentState
+from research_explorer.config import Config
+from research_explorer.graph.embeddings import EmbeddingService
+from research_explorer.graph.store import GraphStore
+from research_explorer.logging_setup import get_logger
+from research_explorer.providers.base import ResilientProvider
+
+log = get_logger("colony")
+
+Caste = Literal["fundaciones", "impacto", "mixto"]
+
+
+class Colony:
+    """Manages the colony of ACO agents."""
+
+    def __init__(
+        self,
+        graph: GraphStore,
+        llm: LLMClient,
+        embedding: EmbeddingService,
+        provider: ResilientProvider,
+        config: Config,
+        providers: dict[str, ResilientProvider] | None = None,
+    ):
+        self.graph = graph
+        self.llm = llm
+        self.embedding = embedding
+        self.provider = provider
+        self.providers = providers or {provider.name: provider}
+        self.cfg = config
+        self.agents: list[ExplorerAgent] = []
+        self.seed_id: str = ""
+        self.seed_query: str = ""
+        self.seed_embedding: list[float] | None = None
+        self.shared_visited: set[str] = set()
+        self.shared_frontier = SharedFrontier()
+        self._best_agent: ExplorerAgent | None = None
+        self._best_quality: float = 0.0
+        self._best_narrative: str = ""
+        self._best_snapshot_agent: str = ""
+        self._best_snapshot_oleada: int = 0
+        self._current_oleada: int = 0
+
+    async def initialize(self, seed_id: str, seed_query: str) -> None:
+        """Initialize the colony: N agents at the seed with assigned castes."""
+        self.seed_id = seed_id
+        self.seed_query = seed_query
+
+        # Compute seed embedding for eta heuristic
+        seed_paper = self.graph.get_paper(seed_id)
+        if seed_paper:
+            text = f"{seed_paper.title} {seed_paper.abstract or ''}"
+            try:
+                self.seed_embedding = await self.embedding.embed(text)
+                self.graph.set_paper_embedding(seed_id, self.seed_embedding)
+            except Exception as e:
+                log.warning("seed_embedding_failed", error=str(e))
+
+        # Create N agents
+        n = self.cfg.aco.colony_size
+        budget_per_agent = self._compute_budget_per_agent()
+        castes = self._assign_castes(n)
+
+        for i in range(n):
+            state = AgentState(
+                id=f"agent-{i:03d}-{uuid.uuid4().hex[:6]}",
+                pos=seed_id,
+                visited=[seed_id],
+                frontier=[],
+                narrative="",
+                budget=budget_per_agent,
+                caste=castes[i],
+            )
+
+            agent = ExplorerAgent(
+                state=state,
+                graph=self.graph,
+                llm=self.llm,
+                embedding=self.embedding,
+                provider=self.provider,
+                providers=self.providers,
+                config=self.cfg,
+                seed_query=seed_query,
+                seed_embedding=self.seed_embedding,
+                shared_visited=self.shared_visited,
+                shared_frontier=self.shared_frontier,
+            )
+            self.agents.append(agent)
+
+        # Each agent reads the seed and discovers its neighbors into its own
+        # private graph (per-agent incomplete graph). Done concurrently.
+        self.shared_visited.add(seed_id)
+        await asyncio.gather(
+            *(a._discover_neighbors(seed_id) for a in self.agents),
+            return_exceptions=True,
+        )
+
+        log.info(
+            "colony_initialized",
+            size=n,
+            budget_per_agent=budget_per_agent,
+            castes=dict(Counter(castes)),
+            shared_frontier=len(self.shared_frontier),
+        )
+
+    def _compute_budget_per_agent(self) -> int:
+        """Distribute the global budget across the colony."""
+        total = self.cfg.budget.max_fetches
+        return max(1, total // self.cfg.aco.colony_size)
+
+    def _assign_castes(self, n: int) -> list[str]:
+        """Assign castes to agents for diversity.
+
+        Roughly: 40% fundaciones, 30% impacto, 30% mixto.
+        """
+        n_fund = max(1, int(n * 0.4))
+        n_imp = max(1, int(n * 0.3))
+        castes = (
+            ["fundaciones"] * n_fund
+            + ["impacto"] * n_imp
+            + ["mixto"] * (n - n_fund - n_imp)
+        )
+        return castes[:n]
+
+    def update_best(self, oleada: int = 0) -> ExplorerAgent | None:
+        """Track the agent with the highest Q across the colony.
+
+        When a new best Q is found, snapshot the narrative at that point
+        so later degradation doesn't overwrite the peak narrative.
+        """
+        self._current_oleada = oleada
+        for agent in self.agents:
+            if agent.state.quality > self._best_quality:
+                self._best_quality = agent.state.quality
+                self._best_agent = agent
+                self._best_narrative = agent.state.narrative
+                self._best_snapshot_agent = agent.state.id
+                self._best_snapshot_oleada = oleada
+                log.info(
+                    "new_best",
+                    agent=agent.state.id,
+                    Q=agent.state.quality,
+                    oleada=oleada,
+                )
+        return self._best_agent
+
+    @property
+    def best_narrative(self) -> str:
+        """The narrative snapshot at the moment of peak Q."""
+        return self._best_narrative
+
+    @property
+    def best_snapshot_agent(self) -> str:
+        return self._best_snapshot_agent
+
+    @property
+    def best_snapshot_oleada(self) -> int:
+        return self._best_snapshot_oleada
+
+    @property
+    def best_agent(self) -> ExplorerAgent | None:
+        return self._best_agent
+
+    @property
+    def best_quality(self) -> float:
+        return self._best_quality
+
+    def total_fetches_used(self) -> int:
+        """Count total fetches used across all agents."""
+        return sum(
+            self.cfg.budget.max_fetches // self.cfg.aco.colony_size - a.state.budget
+            for a in self.agents
+        )
+
+    def active_candidates(self) -> list[ExplorerAgent]:
+        """Agents that still have budget and there are unclaimed frontier papers."""
+        has_candidates = self.shared_frontier.best(exclude=self.shared_visited) is not None
+        if not has_candidates:
+            return []
+        return [a for a in self.agents if not a.state.is_exhausted()]
+
+    @property
+    def agent_states(self) -> list[AgentState]:
+        return [a.state for a in self.agents]
+
+    def pheromone_concentration(self) -> float:
+        """Colony-level pheromone concentration: max over agents' private trails.
+
+        With per-agent private pheromone there is no single shared trail, so we
+        take the most-concentrated agent as the convergence signal.
+        """
+        if not self.agents:
+            return 0.0
+        return max(a.state.pheromone_concentration() for a in self.agents)

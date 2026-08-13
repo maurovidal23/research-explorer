@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Data / caches (runtime artifacts, not source)
+data/
+.cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.env.local
+.nan-api-key
+
+# Generated exploration artifacts
+exploration_output*.txt
+exploration_report.md
+obsidian/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,78 @@
+# Experiment profile — bigger run for richer exploration.
+# arXiv-only (free, no API keys), 6 agents, 40 fetches, K=3 concurrent.
+# Use: uv run research-explorer explore -c config/profiles/experiment.toml <arxiv-id> "query"
+
+log_level = "INFO"
+
+[llm]
+base_url = "https://api.nan.builders/v1"
+api_key_env = "NAN_API_KEY"
+max_concurrent = 5
+rpm = 60
+explorer_model = "qwen3.6"
+judge_model = "deepseek-v4-flash"
+embedding_model = "qwen3-embedding"
+rerank_model = "rerank"
+temperature = 0.6
+max_tokens = 6000
+fulltext_max_chars = 100000
+
+[aco]
+colony_size = 4
+max_concurrent = 2
+k_per_turn = 3
+alpha = 1.0
+beta = 3.0
+rho = 0.1
+epsilon = 0.15
+tau_min = 0.1
+tau_max = 10.0
+lambda_elite = 0.5
+tau_init = 1.0
+
+[quality]
+w_self = 0.25
+w_peers = 0.25
+w_virgin = 0.25
+w_structural = 0.25
+peer_aggregation = "median"
+
+[direction]
+ref_weight = 0.8
+cites_weight = 0.2
+phase_directional = false
+
+[heuristica]
+w_sim = 0.6
+w_citas = 0.2
+w_recencia = 0.2
+use_rerank = false
+eta_llm = false
+
+[providers]
+default = "arxiv"
+active = ["arxiv"]
+
+[providers.arxiv]
+rate = 1
+period = 3
+concurrency = 3
+timeout = 30.0
+
+[budget]
+type = "fetches"
+max_fetches = 25
+max_time_seconds = 900
+
+[convergence]
+plateau_T = 5
+epsilon = 0.01
+theta = 8.0
+
+[scheduler]
+gamma = 0.5
+delta = 0.3
+
+[storage]
+db_path = "data/experiment.db"
+cache_dir = "data/.cache"
