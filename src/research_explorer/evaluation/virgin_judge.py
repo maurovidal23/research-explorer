@@ -10,6 +10,7 @@ from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import virgin_judge
 from research_explorer.config import Config
 from research_explorer.logging_setup import get_logger
+from research_explorer.replay.models import VirginJudgeDetail
 
 log = get_logger("eval.virgin")
 
@@ -34,8 +35,12 @@ class VirginJudge:
 
     async def judge(self, narrative: str, seed_query: str) -> float:
         """Return J ∈ [0, 1] — the virgin judge's impartial score."""
+        return (await self.judge_detail(narrative, seed_query)).score
+
+    async def judge_detail(self, narrative: str, seed_query: str) -> VirginJudgeDetail:
+        """Return the J component plus the judge's coverage and gaps."""
         if not narrative.strip():
-            return 0.0
+            return VirginJudgeDetail(score=0.0, coverage="", gaps="empty narrative")
         messages = virgin_judge(narrative, seed_query)
         try:
             result = await self.llm.chat_json(
@@ -46,7 +51,12 @@ class VirginJudge:
                 max_tokens=1500,
             )
             score = float(result.get("score", 0.5))
-            return max(0.0, min(1.0, score))
+            score = max(0.0, min(1.0, score))
+            return VirginJudgeDetail(
+                score=score,
+                coverage=str(result.get("coverage", "")),
+                gaps=str(result.get("gaps", "")),
+            )
         except Exception as e:
             log.warning("virgin_judge_failed", error=str(e))
-            return 0.5
+            return VirginJudgeDetail(score=0.0, coverage="", gaps=f"virgin judge failed: {e}")

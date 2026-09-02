@@ -1,0 +1,20 @@
+log_level = "INFO"
+
+[providers]
+default = "arxiv"
+active = ["arxiv", "openalex"]
+
+[aco]
+colony_size = 6
+max_concurrent = 2
+k_per_turn = 3
+
+[budget]
+type = "fetches"
+max_fetches = 30
+max_time_seconds = 1800
+
+[storage]
+db_path = "data/first-run-explorer.db"
+cache_dir = "data/first-run-cache"
+trace_db_path = "data/first-run-replay.db"

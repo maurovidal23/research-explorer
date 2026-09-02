@@ -48,8 +48,8 @@ use_rerank = true        # use NaN reranker to refine candidate ranking
 eta_llm = false          # use pure embedding for eta (cheap); true = LLM virgin (costly)
 
 [providers]
-default = "openalex"
-active = ["openalex", "semantic_scholar", "pubmed", "arxiv"]
+default = "arxiv"
+active = ["arxiv", "openalex"]
 
 [providers.semantic_scholar]
 rate = 1                  # 1 req per 3s (unauthenticated ~100 req/5min)

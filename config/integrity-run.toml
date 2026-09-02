@@ -1,0 +1,20 @@
+log_level = "INFO"
+
+[providers]
+default = "arxiv"
+active = ["arxiv", "openalex"]
+
+[aco]
+colony_size = 6
+max_concurrent = 2
+k_per_turn = 3
+
+[budget]
+type = "fetches"
+max_fetches = 30
+max_time_seconds = 1800
+
+[storage]
+db_path = "data/runs/arxiv-1905-07697v2-integrity-2/graph.db"
+cache_dir = "data/runs/arxiv-1905-07697v2-integrity-2/cache"
+trace_db_path = "data/runs/arxiv-1905-07697v2-integrity-2/replay.db"

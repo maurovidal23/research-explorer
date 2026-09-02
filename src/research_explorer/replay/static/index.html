@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Research Explorer Replay</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Research Explorer Replay</h1>
+    <span id="run-badge" class="hidden"></span>
+  </header>
+
+  <main>
+    <section id="selector-view">
+      <h2>Runs</h2>
+      <div id="run-list" class="run-list"></div>
+    </section>
+
+    <section id="room-view" class="hidden">
+      <div class="room-header">
+        <button id="back-btn" type="button">&larr; Runs</button>
+        <div id="run-meta"></div>
+      </div>
+
+      <div class="controls">
+        <button id="play-btn" type="button">&#9654; Play</button>
+        <button id="prev-btn" type="button">&laquo; Prev</button>
+        <button id="next-btn" type="button">Next &raquo;</button>
+        <label>Speed
+          <select id="speed-select">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </label>
+        <label>
+          <input id="seek-slider" type="range" min="0" max="0" value="0" aria-label="Seek" />
+          <span id="seek-label">0 / 0</span>
+        </label>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="scene" type="button">Scene Room</button>
+        <button class="tab" data-tab="timeline" type="button">Timeline</button>
+        <button class="tab" data-tab="narrative" type="button">Narrative</button>
+        <button class="tab" data-tab="evaluations" type="button">Evaluations</button>
+      </nav>
+
+      <section id="tab-scene" class="tab-panel">
+        <div id="scene-empty" class="scene-empty hidden">
+          <p>No evaluations recorded for this run.</p>
+        </div>
+        <div id="scene-container" class="scene-container hidden">
+          <div id="scene-info" class="scene-info"></div>
+          <div class="scene-stage">
+            <div id="scene-table" class="scene-table"></div>
+            <div id="scene-speech" class="scene-speech">
+              <div id="speech-role" class="speech-role"></div>
+              <div id="speech-title" class="speech-title"></div>
+              <div id="speech-body" class="speech-body"></div>
+              <div id="speech-scores" class="speech-scores"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-timeline" class="tab-panel hidden">
+        <ol id="event-list" class="event-list"></ol>
+      </section>
+
+      <section id="tab-narrative" class="tab-panel hidden">
+        <h2>Narrative snapshots</h2>
+        <div id="narrative-list"></div>
+      </section>
+
+      <section id="tab-evaluations" class="tab-panel hidden">
+        <h2>Detailed evaluations</h2>
+        <div id="evaluation-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

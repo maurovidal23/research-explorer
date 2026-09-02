@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from research_explorer.agents.explorer import ExplorerAgent, _parse_json_response
-from research_explorer.graph.models import PaperSummary
+from types import SimpleNamespace
+
+from research_explorer.agents.explorer import ExplorerAgent, _parse_json_response, _titles_match
+from research_explorer.agents.state import AgentState
+from research_explorer.graph.models import Paper, PaperSummary
 
 
 def _explorer(providers: dict[str, object] | None = None) -> ExplorerAgent:
@@ -103,3 +106,141 @@ def test_neighbor_summaries_falls_back_to_extracted() -> None:
     refs, cits = e._neighbor_summaries(paper, extracted)
     assert refs == extracted
     assert cits == []
+
+
+def test_titles_match_identical() -> None:
+    assert _titles_match("Attention Is All You Need", "Attention Is All You Need")
+
+
+def test_titles_match_close_punctuation() -> None:
+    assert _titles_match(
+        "A Cosmic Battery in accretion flows around astrophysical black holes",
+        "A Cosmic Battery in Accretion Flows Around Astrophysical Black Holes",
+    )
+
+
+def test_titles_match_minor_rewording() -> None:
+    assert _titles_match(
+        "Deep Residual Learning for Image Recognition",
+        "Deep Residual Learning for Image Recognition",
+    )
+
+
+def test_titles_match_partial_overlap() -> None:
+    assert _titles_match(
+        "On the Origin of Species by Means of Natural Selection",
+        "On the Origin of Species",
+    )
+
+
+def test_titles_reject_unrelated() -> None:
+    assert not _titles_match(
+        "Counterfactual Explanations for Machine Learning",
+        "A Cosmic Battery in Accretion Flows Around Black Holes",
+    )
+
+
+def test_titles_reject_completely_different() -> None:
+    assert not _titles_match(
+        "Diverse Feasible Counterfactual Explanations",
+        "Quantum Entanglement in Topological Insulators",
+    )
+
+
+def test_titles_match_empty_expected_passes() -> None:
+    assert _titles_match("", "Any title at all")
+
+
+def test_titles_match_empty_actual_passes() -> None:
+    assert _titles_match("Some Title", "")
+
+
+def test_titles_match_both_empty() -> None:
+    assert _titles_match("", "")
+
+
+async def test_take_turn_rejects_mismatched_title() -> None:
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    fetched_paper = Paper(
+        id="1901.03228", title="Completely Unrelated Paper",
+        year=2019, provider="arxiv",
+    )
+
+    class Provider:
+        name = "arxiv"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            return fetched_paper
+
+    e.provider = Provider()
+    e.providers = {"arxiv": e.provider}
+    cached = []
+    graph_mock = SimpleNamespace(
+        get_paper_summary=lambda nid: PaperSummary(
+            id="1901.03228", title="Expected Paper Title",
+            provider="arxiv",
+        ) if nid == "arxiv:1901.03228" else None,
+        get_paper=lambda nid: None,
+        cache_paper=cached.append,
+        cache_summary=lambda s: None,
+    )
+
+    e.graph = graph_mock
+    e.state = AgentState(id="test-agent", pos="arxiv:seed", budget=5, turn_count=1)
+    e.seed_query = "test query"
+    e.seed_embedding = None
+    e._shared_visited = set()
+    removed = []
+    emitted = []
+    e._frontier = SimpleNamespace(
+        best=lambda exclude=None: "arxiv:1901.03228" if not exclude or "arxiv:1901.03228" not in exclude else None,
+        sources={"arxiv:1901.03228": ("arxiv:seed", "ref")},
+        remove=removed.append,
+        unevaluated=lambda: [],
+        set_score=lambda nid, s: None,
+    )
+    e.llm = None
+    e.embedding = None
+    e.cfg = SimpleNamespace(
+        aco=SimpleNamespace(k_per_turn=1),
+        llm=SimpleNamespace(explorer_model="test", temperature=0.3, max_tokens=2000),
+        heuristica=SimpleNamespace(w_sim=0.5, w_citas=0.3, w_recencia=0.2),
+    )
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: emitted.append((event_type, payload)))
+    e._frontier.add = lambda *a, **kw: None
+    e._frontier.best_frontier = lambda exclude=None: None
+
+    async def _must_not_discover(*a, **kw):
+        raise RuntimeError("_discover must not be called")
+
+    async def _must_not_eval():
+        raise RuntimeError("_eval must not be called")
+
+    e._discover_neighbors = _must_not_discover
+    e._evaluate_new_refs = _must_not_eval
+
+    async def _noop_integrate(p):
+        return p.title, []
+
+    e._integrate = _noop_integrate
+    e.state.mark_discovered("arxiv:seed")
+
+    edges = await e.take_turn(1)
+    assert edges == []
+    assert e.state.narrative == ""
+    assert e.state.budget == 5
+    assert e._shared_visited == set()
+    assert cached == []
+    assert removed == ["arxiv:1901.03228"]
+    assert emitted == [
+        (
+            "id_title_mismatch",
+            {
+                "paper_id": "arxiv:1901.03228",
+                "expected_title": "Expected Paper Title",
+                "actual_title": "Completely Unrelated Paper",
+                "reason": "id_title_mismatch",
+            },
+        )
+    ]

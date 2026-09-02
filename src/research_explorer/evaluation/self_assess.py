@@ -9,6 +9,7 @@ from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import self_assess
 from research_explorer.config import Config
 from research_explorer.logging_setup import get_logger
+from research_explorer.replay.models import SelfAssessmentDetail
 
 log = get_logger("eval.self")
 
@@ -32,8 +33,12 @@ class SelfAssessment:
 
     async def score(self, narrative: str, seed_query: str) -> float:
         """Return S ∈ [0, 1] — the agent's self-assessment of its narrative."""
+        return (await self.score_detail(narrative, seed_query)).score
+
+    async def score_detail(self, narrative: str, seed_query: str) -> SelfAssessmentDetail:
+        """Return the S component with the agent's explicit reasoning."""
         if not narrative.strip():
-            return 0.0
+            return SelfAssessmentDetail(score=0.0, reasoning="empty narrative")
         messages = self_assess(narrative, seed_query)
         try:
             result = await self.llm.chat_json(
@@ -44,7 +49,9 @@ class SelfAssessment:
                 max_tokens=1000,
             )
             score = float(result.get("score", 0.5))
-            return max(0.0, min(1.0, score))
+            score = max(0.0, min(1.0, score))
+            reasoning = str(result.get("reasoning", ""))
+            return SelfAssessmentDetail(score=score, reasoning=reasoning)
         except Exception as e:
             log.warning("self_assess_failed", error=str(e))
-            return 0.5
+            return SelfAssessmentDetail(score=0.0, reasoning=f"self assessment failed: {e}")

@@ -11,7 +11,40 @@ compete on their separately-built graphs.
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from pydantic import BaseModel, Field
+
+
+def normalize_narrative(value: Any, fallback: str = "") -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for k in sorted(value, key=str):
+            v = value[k]
+            if isinstance(v, str):
+                parts.append(f"**{k}**: {v}")
+            elif v is not None:
+                parts.append(
+                    f"**{k}**: {json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)}"
+                )
+        return "\n\n".join(parts) if parts else fallback
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, str):
+                lines.append(f"- {item}")
+            elif isinstance(item, dict):
+                title = item.get("title") or item.get("name")
+                if title is None:
+                    title = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+                lines.append(f"- {title}")
+            else:
+                lines.append(f"- {item!s}")
+        return "\n".join(lines) if lines else fallback
+    return fallback
 
 
 def _pkey(src: str, dst: str, mode: str) -> str:

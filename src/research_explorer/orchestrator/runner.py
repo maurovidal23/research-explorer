@@ -6,6 +6,8 @@ winning agent's narrative.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import re
 import time
 
@@ -22,6 +24,7 @@ from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import configure_logging, get_logger
 from research_explorer.providers.base import ResilientProvider
 from research_explorer.providers.factory import build_all_providers, build_provider
+from research_explorer.replay.trace import RunTracer, RunTraceStore
 
 log = get_logger("orchestrator")
 
@@ -77,6 +80,10 @@ class Orchestrator:
         self.scheduler = Scheduler(self.colony, config, self.pheromone, self.structural)
         self.convergence = ConvergenceChecker(config)
 
+        # Evaluation replay trace store (lazily opened)
+        self.trace = RunTraceStore(config.storage.trace_db_path)
+        self.tracer: RunTracer | None = None
+
     def _provider_for_seed(self, seed_paper_id: str) -> ResilientProvider:
         """Route the seed to the right provider (arXiv IDs -> arXiv provider)."""
         if "arxiv" in self.providers and _ARXIV_ID.match(seed_paper_id):
@@ -94,7 +101,41 @@ class Orchestrator:
             The narrative of the agent with the highest Q score.
         """
         start_time = time.monotonic()
+        self._elapsed = 0.0
+
+        run_id = self.trace.create_run(
+            seed_paper_id,
+            seed_query,
+            config_json=json.dumps(dataclasses.asdict(self.cfg), default=str),
+        )
+        self.tracer = RunTracer(self.trace, run_id)
+        self.scheduler.tracer = self.tracer
+
         log.info(
+            "orchestrator_start",
+            seed=seed_paper_id,
+            query=seed_query,
+            colony_size=self.cfg.aco.colony_size,
+            K=self.cfg.aco.max_concurrent,
+            max_fetches=self.cfg.budget.max_fetches,
+        )
+        try:
+            return await self._run_impl(seed_paper_id, seed_query, start_time, run_id, self.tracer)
+        except Exception as e:
+            if self.tracer is not None:
+                self.tracer.record_artifact("run_error.txt", "error", str(e))
+            self.trace.finish_run(run_id, "failed")
+            raise
+
+    async def _run_impl(
+        self,
+        seed_paper_id: str,
+        seed_query: str,
+        start_time: float,
+        run_id: str,
+        tracer: RunTracer,
+    ) -> str:
+        tracer.emit(
             "orchestrator_start",
             seed=seed_paper_id,
             query=seed_query,
@@ -113,6 +154,13 @@ class Orchestrator:
 
         # 2. Initialize the colony (each agent reads the seed)
         await self.colony.initialize(seed_nid, seed_query)
+        for agent in self.colony.agents:
+            agent.tracer = tracer
+        tracer.emit(
+            "colony_initialized",
+            size=len(self.colony.agents),
+            seed=seed_nid,
+        )
 
         # 3. Run oleadas until convergence
         while not self.convergence.should_stop(
@@ -127,24 +175,46 @@ class Orchestrator:
                 log.info("all_agents_exhausted")
                 break
 
-        # 4. Return the winning narrative
+        # 4. Final event/artifact before marking run complete
         winner = self.colony.best_agent
         self._elapsed = time.monotonic() - start_time
+
         if winner is None:
             log.warning("no_winner")
-            return ""
+            tracer.emit("no_winner", elapsed=round(self._elapsed, 1))
+        else:
+            log.info(
+                "orchestrator_complete",
+                winner=self.colony.best_snapshot_agent,
+                best_Q=winner.state.quality,
+                peak_Q=self.colony.best_quality,
+                snapshot_oleada=self.colony.best_snapshot_oleada,
+                total_fetches=self.scheduler.total_fetches,
+                oleadas=self.scheduler.oleada_count,
+                elapsed=self._elapsed,
+            )
+            tracer.emit(
+                "orchestrator_complete",
+                winner=self.colony.best_snapshot_agent,
+                best_Q=round(winner.state.quality, 4),
+                peak_Q=round(self.colony.best_quality, 4),
+                snapshot_oleada=self.colony.best_snapshot_oleada,
+                total_fetches=self.scheduler.total_fetches,
+                oleadas=self.scheduler.oleada_count,
+                elapsed=round(self._elapsed, 1),
+            )
+            tracer.record_artifact(
+                f"narrative_{self.colony.best_snapshot_agent}.md",
+                "narrative",
+                self.colony.best_narrative,
+            )
 
-        log.info(
-            "orchestrator_complete",
-            winner=self.colony.best_snapshot_agent,
-            best_Q=winner.state.quality,
-            peak_Q=self.colony.best_quality,
-            snapshot_oleada=self.colony.best_snapshot_oleada,
-            total_fetches=self.scheduler.total_fetches,
-            oleadas=self.scheduler.oleada_count,
-            elapsed=self._elapsed,
+        self.trace.finish_run(
+            run_id,
+            "completed",
+            best_quality=round(self.colony.best_quality, 6),
         )
-        return self.colony.best_narrative
+        return self.colony.best_narrative if winner is not None else ""
 
     def generate_report(self, seed_paper_id: str, seed_query: str) -> str:
         """Build a full markdown exploration report after run() has completed."""
@@ -185,3 +255,4 @@ class Orchestrator:
         for p in self.providers.values():
             await p.aclose()
         self.graph.close()
+        self.trace.close()

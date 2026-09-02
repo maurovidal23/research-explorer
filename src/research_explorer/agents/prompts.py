@@ -6,6 +6,7 @@ English (model performs best), but the research query can be in any language.
 
 from __future__ import annotations
 
+from research_explorer.agents.state import normalize_narrative
 from research_explorer.graph.models import Paper, PaperSummary
 
 # --- Explorer: narrative integration (defense format) ------------------------
@@ -169,6 +170,7 @@ Respond with JSON: {"score": <float 0-1>, "reasoning": "<brief explanation>"}"""
 
 
 def self_assess(narrative: str, seed_query: str) -> list[dict[str, str]]:
+    narrative = normalize_narrative(narrative, "")
     user = (
         f"Research line: {seed_query}\n\n"
         f"--- Narrative to evaluate ---\n{narrative}\n\n"
@@ -208,6 +210,8 @@ def peer_vote(
     target_narrative: str,
     new_papers: list[Paper],
 ) -> list[dict[str, str]]:
+    voter_narrative = normalize_narrative(voter_narrative, "")
+    target_narrative = normalize_narrative(target_narrative, "")
     papers_info = "\n".join(
         f"- {p.title} ({p.year}) [citations: {p.citation_count}]" for p in new_papers
     )
@@ -248,6 +252,7 @@ Respond with JSON: {"score": <float 0-1>, "coverage": "<what's covered>", \
 
 
 def virgin_judge(narrative: str, seed_query: str) -> list[dict[str, str]]:
+    narrative = normalize_narrative(narrative, "")
     user = (
         f"Research line: {seed_query}\n\n"
         f"--- Narrative to evaluate ---\n{narrative}\n\n"
@@ -306,6 +311,7 @@ def evaluate_references(
     candidates: list[PaperSummary],
 ) -> list[dict[str, str]]:
     """Build messages for batch LLM evaluation of frontier candidates."""
+    narrative = normalize_narrative(narrative, "")
     lines: list[str] = []
     for s in candidates:
         authors = ", ".join(s.authors[:3]) if s.authors else "Unknown"

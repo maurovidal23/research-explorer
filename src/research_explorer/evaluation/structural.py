@@ -15,6 +15,7 @@ import numpy as np
 
 from research_explorer.agents.state import AgentState
 from research_explorer.graph.store import GraphStore
+from research_explorer.replay.models import StructuralComponentsDetail
 
 
 def _sigmoid(x: float) -> float:
@@ -40,8 +41,12 @@ class StructuralMetrics:
 
     def compute(self, state: AgentState) -> float:
         """Compute R ∈ [0, 1] from the agent's structural properties."""
+        return self.compute_detail(state).r
+
+    def compute_detail(self, state: AgentState) -> StructuralComponentsDetail:
+        """Compute R with a full component breakdown."""
         if not state.visited:
-            return 0.0
+            return StructuralComponentsDetail()
 
         coverage = self._coverage(state)
         diversity = self._diversity(state)
@@ -49,7 +54,14 @@ class StructuralMetrics:
         coherence = self._coherence(state)
 
         # Equal weights by default (configurable via the quality weights if needed)
-        return 0.25 * coverage + 0.25 * diversity + 0.25 * depth + 0.25 * coherence
+        r = 0.25 * coverage + 0.25 * diversity + 0.25 * depth + 0.25 * coherence
+        return StructuralComponentsDetail(
+            coverage=coverage,
+            diversity=diversity,
+            depth=depth,
+            coherence=coherence,
+            r=r,
+        )
 
     def _coverage(self, state: AgentState) -> float:
         """Coverage = min(1, |V_a| / L)."""

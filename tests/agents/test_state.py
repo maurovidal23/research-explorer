@@ -1,6 +1,6 @@
 """Tests for AgentState."""
 
-from research_explorer.agents.state import AgentState
+from research_explorer.agents.state import AgentState, normalize_narrative
 
 
 def test_state_defaults() -> None:
@@ -120,4 +120,85 @@ def test_pheromone_is_private_per_agent() -> None:
     s1 = AgentState(id="a1", pos="s2:seed")
     s2 = AgentState(id="a2", pos="s2:seed")
     s1.set_pheromone("a", "b", "ref", 5.0)
-    assert s2.get_pheromone("a", "b", "ref") == 1.0  # not shared
+    assert s2.get_pheromone("a", "b", "ref") == 1.0
+
+
+def test_normalize_narrative_string_passthrough() -> None:
+    assert normalize_narrative("hello world") == "hello world"
+
+
+def test_normalize_narrative_empty_string() -> None:
+    assert normalize_narrative("") == ""
+
+
+def test_normalize_narrative_dict_to_markdown() -> None:
+    d = {"Motivation": "Study X", "Key Concepts": "A and B"}
+    result = normalize_narrative(d)
+    assert "**Motivation**: Study X" in result
+    assert "**Key Concepts**: A and B" in result
+
+
+def test_normalize_narrative_dict_with_non_string_values() -> None:
+    d = {"summary": "OK", "count": 42}
+    result = normalize_narrative(d)
+    assert "**summary**: OK" in result
+    assert "**count**: 42" in result
+
+
+def test_normalize_narrative_nested_values_are_stable_json() -> None:
+    result = normalize_narrative({"details": {"z": 1, "a": ["x", "y"]}})
+    assert result == '**details**: {"a": ["x", "y"], "z": 1}'
+
+
+def test_normalize_narrative_empty_dict() -> None:
+    assert normalize_narrative({}) == ""
+    assert normalize_narrative({}, "fallback") == "fallback"
+
+
+def test_normalize_narrative_list_of_strings() -> None:
+    result = normalize_narrative(["alpha", "beta"])
+    assert "- alpha" in result
+    assert "- beta" in result
+
+
+def test_normalize_narrative_list_of_dicts() -> None:
+    result = normalize_narrative([{"title": "Paper A"}, {"title": "Paper B"}])
+    assert "- Paper A" in result
+    assert "- Paper B" in result
+
+
+def test_normalize_narrative_untitled_dict_list_is_stable_json() -> None:
+    result = normalize_narrative([{"z": 1, "a": 2}])
+    assert result == '- {"a": 2, "z": 1}'
+
+
+def test_normalize_narrative_empty_list() -> None:
+    assert normalize_narrative([]) == ""
+
+
+def test_normalize_narrative_none_returns_fallback() -> None:
+    assert normalize_narrative(None) == ""
+    assert normalize_narrative(None, "fallback") == "fallback"
+
+
+def test_normalize_narrative_int_returns_fallback() -> None:
+    assert normalize_narrative(42) == ""
+    assert normalize_narrative(42, "fb") == "fb"
+
+
+def test_normalize_narrative_dict_with_null_values() -> None:
+    d = {"a": "text", "b": None}
+    result = normalize_narrative(d)
+    assert "**a**: text" in result
+
+
+def test_evaluate_references_consumes_normalized_narrative() -> None:
+    from research_explorer.agents.prompts import evaluate_references
+    from research_explorer.graph.models import PaperSummary
+    dict_narrative = {"Section": "This is a test narrative"}
+    msgs = evaluate_references(
+        "query", dict_narrative,
+        [PaperSummary(id="1", title="T", provider="arxiv")],
+    )
+    user_msg = msgs[1]["content"]
+    assert "This is a test narrative" in user_msg

@@ -123,6 +123,7 @@ class SchedulerConfig:
 class StorageConfig:
     db_path: str = "data/explorer.db"
     cache_dir: str = "data/.cache"
+    trace_db_path: str = "data/replay.db"
 
 
 @dataclass
@@ -282,6 +283,7 @@ def load_config(path: str | Path) -> Config:
         cfg.storage = StorageConfig(
             db_path=st.get("db_path", cfg.storage.db_path),
             cache_dir=st.get("cache_dir", cfg.storage.cache_dir),
+            trace_db_path=st.get("trace_db_path", cfg.storage.trace_db_path),
         )
 
     return cfg

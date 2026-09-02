@@ -52,6 +52,9 @@ def normalize_id(provider: str, native_id: str) -> str:
         "pubmed": "pmid",
         "arxiv": "arxiv",
     }.get(provider, provider)
+    existing_prefix, separator, existing_native = native_id.partition(":")
+    if separator and existing_prefix.lower() == prefix.lower():
+        return f"{prefix}:{existing_native}"
     return f"{prefix}:{native_id}"
 
 

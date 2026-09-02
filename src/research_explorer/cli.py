@@ -19,6 +19,9 @@ app = typer.Typer(
 mcp_app = typer.Typer(help="Manage MCP servers.", no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp")
 
+replay_app = typer.Typer(help="Inspect and replay recorded evaluation runs.", no_args_is_help=True)
+app.add_typer(replay_app, name="replay")
+
 
 @app.command()
 def explore(
@@ -37,7 +40,7 @@ def explore(
 
     from research_explorer.orchestrator.runner import Orchestrator
 
-    async def _run() -> str:
+    async def _run() -> tuple[str, str | None]:
         orch = Orchestrator(cfg)
         try:
             await orch.run(seed_paper_id, seed_query)
@@ -114,6 +117,120 @@ def config(
     typer.echo(f"Providers: {cfg.providers.active} (default: {cfg.providers.default})")
     typer.echo(f"Budget: {cfg.budget.type}={cfg.budget.max_fetches}")
     typer.echo(f"Quality weights: S={cfg.quality.w_self} P={cfg.quality.w_peers} J={cfg.quality.w_virgin} R={cfg.quality.w_structural}")
+
+
+@replay_app.command("list")
+def replay_list(
+    db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),
+) -> None:
+    """List recorded runs."""
+    from research_explorer.replay.trace import RunTraceStore
+
+    store = RunTraceStore(db)
+    runs = store.list_runs()
+    store.close()
+    if not runs:
+        typer.echo("No runs recorded.")
+        return
+    for r in runs:
+        q = f"  Q={r['best_quality']:.4f}" if r["best_quality"] is not None else ""
+        typer.echo(
+            f"{r['run_id']}  [{r['status']}]  {r['seed_paper_id']}{q}  "
+            f"{r['event_count']} events  {r['evaluation_count']} evals  {r['started_at']}"
+        )
+
+
+@replay_app.command("show")
+def replay_show(
+    run_id: str = typer.Argument(help="Run ID"),
+    db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),
+    timeline: bool = typer.Option(False, "--timeline", help="Print the full event timeline"),
+    evaluations: bool = typer.Option(False, "--evaluations", help="Print detailed evaluation records"),
+) -> None:
+    """Show a recorded run's summary, timeline, and/or evaluations."""
+    from research_explorer.replay.trace import RunTraceStore
+
+    store = RunTraceStore(db)
+    run = store.get_run(run_id)
+    if run is None:
+        typer.echo(f"Run not found: {run_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(
+        f"Run {run['run_id']} [{run['status']}]  seed={run['seed_paper_id']}  "
+        f"query={run['seed_query']!r}"
+    )
+    typer.echo(
+        f"started={run['started_at']}  completed={run['completed_at']}  "
+        f"best_Q={run['best_quality']}  events={run['event_count']}"
+    )
+    if timeline:
+        typer.echo("\n=== Timeline ===")
+        for ev in store.list_events(run_id):
+            payload = "  ".join(f"{k}={v}" for k, v in ev["payload"].items())
+            typer.echo(f"[{ev['seq']}] {ev['type']:<24} {payload}")
+    if evaluations:
+        typer.echo("\n=== Evaluations ===")
+        for rec in store.list_evaluations(run_id):
+            typer.echo(
+                f"oleada={rec.oleada} agent={rec.agent_id} Q={rec.q:.4f} "
+                f"S={rec.self_assessment.score:.4f} P={rec.peers.aggregated_score:.4f} "
+                f"J={rec.virgin_judge.score:.4f} R={rec.structural.r:.4f}"
+            )
+            typer.echo(f"  self: {rec.self_assessment.reasoning}")
+            for v in rec.peers.votes:
+                typer.echo(f"  peer {v.voter_id}: {v.score:.4f} -- {v.reasoning}")
+            typer.echo(f"  virgin coverage: {rec.virgin_judge.coverage}")
+            typer.echo(f"  virgin gaps: {rec.virgin_judge.gaps}")
+    store.close()
+
+
+@replay_app.command("export")
+def replay_export(
+    run_id: str = typer.Argument(help="Run ID"),
+    out_dir: str = typer.Option("replay_out", "--out", help="Destination directory"),
+    db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),
+) -> None:
+    """Export the run's narrative snapshot(s) to disk (safe filenames only)."""
+    from research_explorer.replay.trace import RunTraceStore
+
+    store = RunTraceStore(db)
+    artifacts = store.list_artifacts(run_id)
+    narratives = [a for a in artifacts if a["kind"] == "narrative"]
+    if not narratives:
+        typer.echo(f"No narrative snapshots for run {run_id}", err=True)
+        raise typer.Exit(1)
+    for a in narratives:
+        target = store.export_artifact(a["artifact_id"], out_dir)
+        typer.echo(f"Exported {a['name']} -> {target}")
+    store.close()
+
+
+@replay_app.command("serve")
+def replay_serve(
+    db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host"),
+    port: int = typer.Option(8000, "--port", help="Bind port"),
+    run_id: str = typer.Option(None, "--run-id", help="Validate and bind to a specific run"),
+) -> None:
+    """Serve the replay web UI (FastAPI)."""
+    import uvicorn
+
+    from research_explorer.replay.trace import RunTraceStore
+
+    if run_id is not None:
+        store = RunTraceStore(db)
+        run = store.get_run(run_id)
+        store.close()
+        if run is None:
+            typer.echo(f"Run not found: {run_id}", err=True)
+            raise typer.Exit(1)
+        typer.echo(f"Replay UI on http://{host}:{port}  (db: {db}, run: {run_id})")
+    else:
+        typer.echo(f"Replay UI on http://{host}:{port}  (db: {db})")
+
+    from research_explorer.replay.server import build_app
+
+    uvicorn.run(build_app(db, default_run_id=run_id), host=host, port=port)
 
 
 def main() -> None:

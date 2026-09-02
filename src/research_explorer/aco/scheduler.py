@@ -19,6 +19,7 @@ from research_explorer.evaluation.quality import QualityAssessor
 from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.graph.feromone import AgentPath, PheromoneManager
 from research_explorer.logging_setup import get_logger
+from research_explorer.replay.trace import RunTracer
 
 log = get_logger("scheduler")
 
@@ -40,6 +41,7 @@ class Scheduler:
         self.oleada_count = 0
         self._total_fetches = 0
         self.history: list[dict] = []
+        self.tracer: RunTracer | None = None
 
     async def run_oleada(self) -> None:
         """Run one oleada: activate K agents, each takes a turn of k fetches."""
@@ -56,6 +58,12 @@ class Scheduler:
             oleada=self.oleada_count,
             active=[a.state.id for a in k_agents],
         )
+        if self.tracer is not None:
+            self.tracer.emit(
+                "oleada_start",
+                oleada=self.oleada_count,
+                active=[a.state.id for a in k_agents],
+            )
 
         # Each agent takes its turn (sequentially within the oleada for peer voting)
         agent_paths: list[AgentPath] = []
@@ -66,37 +74,105 @@ class Scheduler:
                 caste=agent.state.caste,
                 turn=agent.state.turn_count,
             )
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "agent_turn_start",
+                    agent=agent.state.id,
+                    caste=agent.state.caste,
+                    oleada=self.oleada_count,
+                    turn=agent.state.turn_count,
+                )
 
             edges = await agent.take_turn(self.cfg.aco.k_per_turn)
 
             # Fetch the papers added this turn for peer voting
             new_papers = self._get_new_papers(agent, edges)
 
-            # Assess quality -- returns (Q, breakdown)
-            old_q = agent.state.quality
-            q_score, breakdown = await self.assessor.assess(
-                agent, k_agents, self.colony.seed_query, new_papers
-            )
-            agent.state.quality = q_score
-            agent.state.delta_q = agent.state.quality - old_q
+            if not edges:
+                agent.state.delta_q = 0.0
+                log.info(
+                    "evaluation_skipped",
+                    agent=agent.state.id,
+                    oleada=self.oleada_count,
+                    turn=agent.state.turn_count,
+                    reason="no_new_evidence",
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "evaluation_skipped",
+                        agent_id=agent.state.id,
+                        oleada=self.oleada_count,
+                        turn=agent.state.turn_count,
+                        reason="no_new_evidence",
+                    )
+            else:
+                # Assess quality -- returns a detailed record retaining rationales
+                record = await self.assessor.assess_detail(
+                    agent, k_agents, self.colony.seed_query, new_papers,
+                    oleada=self.oleada_count,
+                )
+                q_score = record.q
+                breakdown = record.breakdown
+                agent.state.quality = q_score
+                agent.state.delta_q = record.delta_q
+                if self.tracer is not None:
+                    self.tracer.record_evaluation(record)
+                    self.tracer.record_artifact(
+                        f"narrative_{agent.state.id}_t{agent.state.turn_count}.md",
+                        "narrative",
+                        agent.state.narrative,
+                    )
             agent_paths.append(
                 AgentPath(edges=edges, delta_q=agent.state.delta_q, state=agent.state)
             )
             self._total_fetches += len(edges)
 
-            log.info(
-                "agent_turn_complete",
-                agent=agent.state.id,
-                Q=agent.state.quality,
-                S=breakdown["S"],
-                P=breakdown["P"],
-                J=breakdown["J"],
-                R=breakdown["R"],
-                delta_q=agent.state.delta_q,
-                fetches=len(edges),
-                budget=agent.state.budget,
-                frontier=len(self.colony.shared_frontier),
-            )
+            if edges:
+                log.info(
+                    "agent_turn_complete",
+                    agent=agent.state.id,
+                    Q=agent.state.quality,
+                    S=breakdown["S"],
+                    P=breakdown["P"],
+                    J=breakdown["J"],
+                    R=breakdown["R"],
+                    delta_q=agent.state.delta_q,
+                    fetches=len(edges),
+                    budget=agent.state.budget,
+                    frontier=len(self.colony.shared_frontier),
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "agent_turn_complete",
+                        agent=agent.state.id,
+                        oleada=self.oleada_count,
+                        Q=round(record.q, 4),
+                        S=round(breakdown["S"], 4),
+                        P=round(breakdown["P"], 4),
+                        J=round(breakdown["J"], 4),
+                        R=round(breakdown["R"], 4),
+                        delta_q=round(record.delta_q, 4),
+                        fetches=len(edges),
+                        budget=agent.state.budget,
+                        frontier=len(self.colony.shared_frontier),
+                    )
+            else:
+                log.info(
+                    "agent_turn_skipped",
+                    agent=agent.state.id,
+                    fetches=0,
+                    budget=agent.state.budget,
+                    frontier=len(self.colony.shared_frontier),
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "agent_turn_skipped",
+                        agent=agent.state.id,
+                        oleada=self.oleada_count,
+                        fetches=0,
+                        budget=agent.state.budget,
+                        frontier=len(self.colony.shared_frontier),
+                    )
 
         # Update pheromone (per-agent private trails)
         best_path = max(agent_paths, key=lambda p: p.delta_q) if agent_paths else None
@@ -111,7 +187,15 @@ class Scheduler:
         )
 
         # Track best agent (snapshot narrative at peak Q)
+        prev_best = self.colony.best_quality
         self.colony.update_best(self.oleada_count)
+        if self.tracer is not None and self.colony.best_quality > prev_best:
+            self.tracer.emit(
+                "new_best",
+                agent=self.colony.best_snapshot_agent,
+                Q=round(self.colony.best_quality, 4),
+                oleada=self.oleada_count,
+            )
 
         elapsed = time.monotonic() - oleada_start_time
         ranking = sorted(
@@ -129,6 +213,16 @@ class Scheduler:
             elapsed=elapsed,
             ranking=ranking,
         )
+        if self.tracer is not None:
+            self.tracer.emit(
+                "oleada_complete",
+                oleada=self.oleada_count,
+                best_Q=round(self.colony.best_quality, 4),
+                total_fetches=self._total_fetches,
+                max_fetches=self.cfg.budget.max_fetches,
+                elapsed=round(elapsed, 1),
+                ranking=ranking,
+            )
 
         self.history.append(
             {

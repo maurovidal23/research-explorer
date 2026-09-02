@@ -6,7 +6,7 @@
       "name": "NaN",
       "options": {
         "baseURL": "https://api.nan.builders/v1",
-        "apiKey": "{file:.nan-api-key}"
+        "apiKey": "{env:NAN_API_KEY}"
       },
       "models": {
         "deepseek-v4-flash-0731": {
@@ -138,11 +138,11 @@
       }
     }
   },
-  "model": "nan/deepseek-v4-flash-0731",
-  "small_model": "nan/deepseek-v4-flash-0731",
+  "model": "nan/mimo-v2.5",
+  "small_model": "nan/deepseek-v4-flash",
   "agent": {
     "build": {
-      "model": "nan/deepseek-v4-flash-0731"
+      "model": "nan/mimo-v2.5"
     }
   },
   "compaction": {
@@ -171,7 +171,7 @@
   },
   "permission": {
     "edit": "allow",
-    "bash": "ask"
+    "bash": "allow"
   },
   "mcp": {
     "kindly-web-search": {

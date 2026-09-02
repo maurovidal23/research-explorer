@@ -14,8 +14,9 @@ from research_explorer.evaluation.peer_vote import PeerVoting
 from research_explorer.evaluation.self_assess import SelfAssessment
 from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.evaluation.virgin_judge import VirginJudge
-from research_explorer.graph.models import Paper
+from research_explorer.graph.models import Paper, normalize_id
 from research_explorer.logging_setup import get_logger
+from research_explorer.replay.models import DetailedEvaluation
 
 log = get_logger("eval.quality")
 
@@ -50,25 +51,56 @@ class QualityAssessor:
             (Q, breakdown) where Q is in [0, 1] and breakdown is
             {"S": s, "P": p, "J": j, "R": r}.
         """
+        detail = await self.assess_detail(agent, active_agents, seed_query, new_papers)
+        return detail.q, detail.breakdown
+
+    async def assess_detail(
+        self,
+        agent: ExplorerAgent,
+        active_agents: list[ExplorerAgent],
+        seed_query: str,
+        new_papers: list[Paper] | None = None,
+        oleada: int = 0,
+    ) -> DetailedEvaluation:
+        """Compute Q and return the full DetailedEvaluation record.
+
+        Retains self reasoning, every individual peer vote with reasoning, the
+        virgin judge's coverage/gaps, and the structural component breakdown.
+        """
         q = self.cfg.quality
+        old_quality = agent.state.quality
 
         # Run S, P, J concurrently; R is synchronous
-        s_task = self.self_assess.score(agent.state.narrative, seed_query)
-        p_task = self.peer_vote.vote(agent, active_agents, seed_query, new_papers)
-        j_task = self.virgin_judge.judge(agent.state.narrative, seed_query)
-        r = self.structural.compute(agent.state)
+        s_task = self.self_assess.score_detail(agent.state.narrative, seed_query)
+        p_task = self.peer_vote.vote_detail(agent, active_agents, seed_query, new_papers)
+        j_task = self.virgin_judge.judge_detail(agent.state.narrative, seed_query)
+        structural = self.structural.compute_detail(agent.state)
 
         s, p, j = await asyncio.gather(s_task, p_task, j_task)
+        weights = {"S": q.w_self, "P": q.w_peers, "J": q.w_virgin, "R": q.w_structural}
 
-        score = q.w_self * s + q.w_peers * p + q.w_virgin * j + q.w_structural * r
+        score = q.w_self * s.score + q.w_peers * p.aggregated_score + q.w_virgin * j.score + q.w_structural * structural.r
         log.debug(
             "quality_computed",
             agent=agent.state.id,
-            S=s,
-            P=p,
-            J=j,
-            R=r,
+            S=s.score,
+            P=p.aggregated_score,
+            J=j.score,
+            R=structural.r,
             Q=score,
         )
         clamped = max(0.0, min(1.0, score))
-        return clamped, {"S": s, "P": p, "J": j, "R": r}
+        return DetailedEvaluation(
+            agent_id=agent.state.id,
+            oleada=oleada,
+            turn=agent.state.turn_count,
+            q=clamped,
+            old_quality=old_quality,
+            delta_q=clamped - old_quality,
+            weights=weights,
+            self_assessment=s,
+            peers=p,
+            virgin_judge=j,
+            structural=structural,
+            new_papers=[normalize_id(p.provider, p.id) for p in (new_papers or [])],
+        )

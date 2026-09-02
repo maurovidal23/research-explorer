@@ -40,13 +40,14 @@ from research_explorer.agents.prompts import (
     integrate,
     integrate_and_extract,
 )
-from research_explorer.agents.state import AgentState
+from research_explorer.agents.state import AgentState, normalize_narrative
 from research_explorer.config import Config
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.models import Paper, PaperSummary, normalize_id, parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
+from research_explorer.replay.trace import RunTracer
 
 log = get_logger("agent")
 
@@ -57,6 +58,25 @@ def _sigmoid(x: float) -> float:
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
     return math.exp(x) / (1.0 + math.exp(x))
+
+
+_STOP_WORDS = frozenset({"a", "an", "the", "of", "for", "and", "in", "on", "to", "with", "by", "from"})
+
+
+def _tokenize_title(title: str) -> set[str]:
+    return {w for w in re.split(r"\W+", title.lower()) if w and w not in _STOP_WORDS}
+
+
+def _titles_match(expected: str, actual: str, threshold: float = 0.3) -> bool:
+    if not expected or not actual:
+        return True
+    exp_tokens = _tokenize_title(expected)
+    act_tokens = _tokenize_title(actual)
+    if not exp_tokens or not act_tokens:
+        return True
+    overlap = exp_tokens & act_tokens
+    union = exp_tokens | act_tokens
+    return len(overlap) / len(union) >= threshold
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -164,6 +184,7 @@ class ExplorerAgent:
         self.seed_embedding = seed_embedding
         self._shared_visited = shared_visited if shared_visited is not None else set()
         self._frontier = shared_frontier if shared_frontier is not None else SharedFrontier()
+        self.tracer: RunTracer | None = None
 
     async def take_turn(self, k: int) -> list[tuple[str, str, str]]:
         """Execute one turn: fetch k papers, integrate narratives.
@@ -187,37 +208,52 @@ class ExplorerAgent:
             if self.state.budget <= 0:
                 break
 
-            # 1. Pick best paper from shared frontier (exclude shared_visited)
             next_id = self._frontier.best(exclude=self._shared_visited)
             if next_id is None:
                 log.debug("agent_no_candidates", agent=self.state.id, pos=self.state.pos)
                 break
 
-            # 2. Look up source and mode for the edge
             src, mode = self._frontier.sources.get(next_id, (self.state.pos, "ref"))
 
-            # 3. Claim it immediately so other agents don't pick it
+            expected_summary = self.graph.get_paper_summary(next_id)
+            expected_title = expected_summary.title if expected_summary else ""
             self._shared_visited.add(next_id)
 
-            # 4. Fetch the paper
             paper = await self._fetch_paper(next_id)
             if paper is None:
+                self._shared_visited.discard(next_id)
                 self._frontier.remove(next_id)
                 continue
 
-            # 5. Integrate into narrative (and extract refs for full-text papers)
+            if not _titles_match(expected_title, paper.title):
+                log.warning(
+                    "id_title_mismatch",
+                    paper_id=next_id,
+                    expected_title=expected_title,
+                    actual_title=paper.title,
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "id_title_mismatch",
+                        paper_id=next_id,
+                        expected_title=expected_title,
+                        actual_title=paper.title,
+                        reason="id_title_mismatch",
+                    )
+                self._shared_visited.discard(next_id)
+                self._frontier.remove(next_id)
+                continue
+
+            self.graph.cache_paper(paper)
             narrative, extracted = await self._integrate(paper)
             self.state.narrative = narrative
 
-            # 6. Update state
             self.state.visit(next_id, mode)
             self._frontier.remove(next_id)
             edges.append((src, next_id, mode))
 
-            # 7. Discover the new paper's neighbors (private graph + shared frontier)
             await self._discover_neighbors(next_id, paper, extracted)
 
-            # 8. Evaluate new refs with LLM (only the new ones)
             await self._evaluate_new_refs()
 
             log.info(
@@ -229,6 +265,17 @@ class ExplorerAgent:
                 budget=self.state.budget,
                 frontier=len(self._frontier),
             )
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "agent_step",
+                    agent=self.state.id,
+                    mode=mode,
+                    paper_id=next_id,
+                    title=paper.title,
+                    year=paper.year,
+                    budget=self.state.budget,
+                    frontier=len(self._frontier),
+                )
 
         self.state.turn_count += 1
         return edges
@@ -420,7 +467,6 @@ class ExplorerAgent:
                 return None
             paper.fulltext, paper.ref_entries = ft
 
-        self.graph.cache_paper(paper)
         return paper
 
     async def _integrate(self, paper: Paper) -> tuple[str, list[PaperSummary]]:
@@ -445,7 +491,7 @@ class ExplorerAgent:
             parsed = _parse_json_response(raw)
             if parsed is None:
                 return self.state.narrative, []
-            narrative = parsed.get("narrative") or self.state.narrative
+            narrative = normalize_narrative(parsed.get("narrative"), self.state.narrative)
             extracted = self._parse_extracted_refs(parsed.get("references") or [])
 
             analysis = parsed.get("paper_analysis")
@@ -466,7 +512,7 @@ class ExplorerAgent:
         except Exception as e:
             log.warning("integrate_failed", agent=self.state.id, error=str(e))
             return self.state.narrative, []
-        return narrative, []
+        return normalize_narrative(narrative, self.state.narrative), []
 
     def _parse_extracted_refs(self, refs: list) -> list[PaperSummary]:
         """Turn the LLM's extracted reference list into PaperSummary candidates.
@@ -534,6 +580,7 @@ class ExplorerAgent:
             if paper is None:
                 self.state.set_local_neighbors(paper_id, [], [])
                 return
+            self.graph.cache_paper(paper)
 
         # Full-text papers (arXiv): extract references from the bibliography.
         # _fetch_paper already attached fulltext + ref_entries. The seed is read

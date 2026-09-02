@@ -28,6 +28,12 @@ def test_normalize_id() -> None:
     assert normalize_id("pubmed", "22595786") == "pmid:22595786"
 
 
+def test_normalize_id_is_idempotent() -> None:
+    assert normalize_id("arxiv", "arxiv:1905.07697") == "arxiv:1905.07697"
+    assert normalize_id("arxiv", "arXiv:1905.07697") == "arxiv:1905.07697"
+    assert normalize_id("semantic_scholar", "s2:abc") == "s2:abc"
+
+
 def test_parse_normalized_id() -> None:
     provider, native = parse_normalized_id("s2:abc")
     assert provider == "semantic_scholar"
