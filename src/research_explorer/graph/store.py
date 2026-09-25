@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -17,11 +18,16 @@ from research_explorer.logging_setup import get_logger
 
 log = get_logger("graph")
 
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     doi TEXT,
+    arxiv_id TEXT,
     title TEXT,
     year INTEGER,
     authors TEXT,
@@ -55,6 +61,25 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
 CREATE INDEX IF NOT EXISTS idx_pheromone_src ON pheromone(src);
+
+CREATE TABLE IF NOT EXISTS paper_aliases (
+    alias TEXT PRIMARY KEY,
+    canonical_id TEXT NOT NULL,
+    provider TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_aliases_canonical ON paper_aliases(canonical_id);
+
+CREATE TABLE IF NOT EXISTS edge_provenance (
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    created_at TEXT,
+    PRIMARY KEY (src, dst, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_edge_provenance_src ON edge_provenance(src);
+CREATE INDEX IF NOT EXISTS idx_edge_provenance_dst ON edge_provenance(dst);
 """
 
 
@@ -77,7 +102,18 @@ class GraphStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent additive migrations; preserves pre-existing databases."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(papers)")}
+        if "arxiv_id" not in cols:
+            self._conn.execute("ALTER TABLE papers ADD COLUMN arxiv_id TEXT")
+        if "integrated" not in cols:
+            self._conn.execute(
+                "ALTER TABLE papers ADD COLUMN integrated INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -87,15 +123,20 @@ class GraphStore:
     def cache_paper(self, paper: Paper) -> None:
         """Insert or replace a paper in the store."""
         nid = normalize_id(paper.provider, paper.id)
+        existing = self._conn.execute(
+            "SELECT integrated FROM papers WHERE id = ?", (nid,)
+        ).fetchone()
+        integrated = int(bool(existing and existing["integrated"]))
         self._conn.execute(
             """INSERT OR REPLACE INTO papers
-               (id, provider, doi, title, year, authors, citation_count,
-                abstract, embedding, fetched_at, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, provider, doi, arxiv_id, title, year, authors, citation_count,
+                abstract, embedding, fetched_at, metadata_json, integrated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 nid,
                 paper.provider,
                 paper.doi,
+                paper.arxiv_id,
                 paper.title,
                 paper.year,
                 json.dumps(paper.authors),
@@ -110,23 +151,18 @@ class GraphStore:
                         "tldr": paper.tldr,
                     }
                 ),
+                integrated,
             ),
         )
         # Store edges for references
         for ref in paper.references:
             ref_nid = normalize_id(ref.provider, ref.id)
-            self._conn.execute(
-                "INSERT OR IGNORE INTO edges (src, dst) VALUES (?, ?)",
-                (nid, ref_nid),
-            )
+            self.record_edge(nid, ref_nid, paper.provider, "references")
             # Also cache the reference summary if not present
             self._cache_summary_if_missing(ref)
         for cit in paper.citations:
             cit_nid = normalize_id(cit.provider, cit.id)
-            self._conn.execute(
-                "INSERT OR IGNORE INTO edges (src, dst) VALUES (?, ?)",
-                (cit_nid, nid),
-            )
+            self.record_edge(cit_nid, nid, paper.provider, "cited_by")
             self._cache_summary_if_missing(cit)
         self._conn.commit()
 
@@ -134,30 +170,132 @@ class GraphStore:
         nid = normalize_id(summary.provider, summary.id)
         row = self._conn.execute("SELECT id FROM papers WHERE id = ?", (nid,)).fetchone()
         if row is None:
-            self._conn.execute(
-                """INSERT OR IGNORE INTO papers
-                   (id, provider, doi, title, year, authors, citation_count,
-                    abstract, embedding, fetched_at, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    nid,
-                    summary.provider,
-                    summary.doi,
-                    summary.title,
-                    summary.year,
-                    json.dumps(summary.authors),
-                    summary.citation_count,
-                    summary.abstract,
-                    None,
-                    None,
-                    "{}",
-                ),
-            )
+            self._insert_summary_row(nid, summary)
+
+    def _insert_summary_row(self, nid: str, summary: PaperSummary) -> None:
+        self._conn.execute(
+            """INSERT OR IGNORE INTO papers
+               (id, provider, doi, arxiv_id, title, year, authors, citation_count,
+                abstract, embedding, fetched_at, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                nid,
+                summary.provider,
+                summary.doi,
+                summary.arxiv_id,
+                summary.title,
+                summary.year,
+                json.dumps(summary.authors),
+                summary.citation_count,
+                summary.abstract,
+                None,
+                None,
+                "{}",
+            ),
+        )
 
     def cache_summary(self, summary: PaperSummary) -> None:
         """Cache a paper summary (node metadata) if not already present."""
         self._cache_summary_if_missing(summary)
         self._conn.commit()
+
+    def cache_summary_for_nid(self, nid: str, summary: PaperSummary) -> None:
+        """Cache a summary under an exact canonical node id (insert-if-missing)."""
+        row = self._conn.execute("SELECT id FROM papers WHERE id = ?", (nid,)).fetchone()
+        if row is not None:
+            return
+        self._insert_summary_row(nid, summary)
+        self._conn.commit()
+
+    # ---- Aliases / canonical identity ------------------------------------
+
+    def add_alias(self, alias: str, canonical_id: str, provider: str | None = None) -> None:
+        """Map a provider-specific alias to a canonical node id (first mapping wins)."""
+        if not alias or not canonical_id or alias == canonical_id:
+            return
+        existing = self.get_canonical_id(alias)
+        if existing is not None:
+            return
+        self._conn.execute(
+            "INSERT OR IGNORE INTO paper_aliases (alias, canonical_id, provider, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (alias, canonical_id, provider, _utcnow()),
+        )
+        self._conn.commit()
+
+    def get_canonical_id(self, alias: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT canonical_id FROM paper_aliases WHERE alias = ?", (alias,)
+        ).fetchone()
+        return row["canonical_id"] if row else None
+
+    def get_aliases(self, canonical_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT alias FROM paper_aliases WHERE canonical_id = ? ORDER BY alias",
+            (canonical_id,),
+        ).fetchall()
+        return [r["alias"] for r in rows]
+
+    def canonical_id(self, nid: str) -> str:
+        """Resolve a node id through the alias table (identity if unmapped)."""
+        current = nid
+        seen: set[str] = set()
+        while current not in seen:
+            seen.add(current)
+            nxt = self.get_canonical_id(current)
+            if nxt is None or nxt == current:
+                break
+            current = nxt
+        return current
+
+    # ---- Edge provenance ---------------------------------------------------
+
+    def record_edge(self, src: str, dst: str, provider: str, direction: str) -> None:
+        """Insert an edge (src cites dst) with provider provenance.
+
+        direction: 'references' (learned from src's bibliography) or
+        'cited_by' (learned from dst's incoming-citation list).
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO edges (src, dst) VALUES (?, ?)", (src, dst)
+        )
+        self._conn.execute(
+            """INSERT OR IGNORE INTO edge_provenance (src, dst, direction, provider, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (src, dst, direction, provider, _utcnow()),
+        )
+
+    def get_edge_provenance(self, src: str | None = None, dst: str | None = None) -> list[dict]:
+        query = "SELECT src, dst, direction, provider, created_at FROM edge_provenance"
+        conditions, params = [], []
+        if src is not None:
+            conditions.append("src = ?")
+            params.append(src)
+        if dst is not None:
+            conditions.append("dst = ?")
+            params.append(dst)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY src, dst, direction"
+        rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- Integration status ------------------------------------------------
+
+    def mark_integrated(self, nid: str) -> None:
+        """Flag a node whose readable content was actually integrated (evidence credit)."""
+        self._conn.execute(
+            "INSERT INTO papers (id, provider, integrated) VALUES (?, 'unknown', 1)"
+            " ON CONFLICT(id) DO UPDATE SET integrated = 1",
+            (nid,),
+        )
+        self._conn.commit()
+
+    def is_integrated(self, nid: str) -> bool:
+        row = self._conn.execute(
+            "SELECT integrated FROM papers WHERE id = ?", (nid,)
+        ).fetchone()
+        return bool(row and row["integrated"])
 
     def get_paper(self, nid: str) -> Paper | None:
         """Retrieve a cached paper by normalized ID."""
@@ -188,6 +326,7 @@ class GraphStore:
         return PaperSummary(
             id=row["id"],
             doi=row["doi"],
+            arxiv_id=row["arxiv_id"],
             title=row["title"] or "",
             year=row["year"],
             authors=json.loads(row["authors"]) if row["authors"] else [],
@@ -202,6 +341,7 @@ class GraphStore:
         return Paper(
             id=row["id"],
             doi=row["doi"],
+            arxiv_id=row["arxiv_id"],
             title=row["title"] or "",
             year=row["year"],
             authors=json.loads(row["authors"]) if row["authors"] else [],
@@ -250,13 +390,12 @@ class GraphStore:
 
     def cache_embedding(self, text: str, embedding: list[float]) -> None:
         import hashlib
-        from datetime import datetime, timezone
 
         h = hashlib.sha256(text.encode()).hexdigest()
         self._conn.execute(
             """INSERT OR REPLACE INTO embeddings (text_hash, embedding, created_at)
                VALUES (?, ?, ?)""",
-            (h, _pack_embedding(embedding), datetime.now(timezone.utc).isoformat()),
+            (h, _pack_embedding(embedding), _utcnow()),
         )
         self._conn.commit()
 

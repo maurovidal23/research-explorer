@@ -29,11 +29,22 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import random
 import re
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from research_explorer.aco.frontier import SharedFrontier
+from research_explorer.aco.transition import (
+    Candidate,
+    EtaComponents,
+    Selection,
+    caste_direction_weights,
+    combine_eta,
+    mode_direction_modifier,
+    select_candidate,
+)
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import (
     evaluate_references,
@@ -48,6 +59,9 @@ from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
 from research_explorer.replay.trace import RunTracer
+
+if TYPE_CHECKING:
+    from research_explorer.resolution.traversal import ExpansionResult, NeighborExpander
 
 log = get_logger("agent")
 
@@ -156,6 +170,22 @@ def _recover_partial_json(text: str) -> dict | None:
     return result
 
 
+_PROVIDER_CONFIDENCE = {
+    "openalex": 0.95,
+    "semantic_scholar": 0.9,
+    "pubmed": 0.85,
+    "arxiv": 0.8,
+}
+
+
+def _provider_confidence_base(provider: str) -> float:
+    return _PROVIDER_CONFIDENCE.get(provider, 0.4)
+
+
+def _mode_dir_modifier(mode: str, ref_weight: float, cites_weight: float) -> float:
+    return mode_direction_modifier(mode, ref_weight, cites_weight)
+
+
 class ExplorerAgent:
     """An ACO agent that explores the citation graph and builds a narrative."""
 
@@ -172,6 +202,8 @@ class ExplorerAgent:
         providers: dict[str, ResilientProvider] | None = None,
         shared_visited: set[str] | None = None,
         shared_frontier: SharedFrontier | None = None,
+        expander: NeighborExpander | None = None,
+        rng: random.Random | None = None,
     ):
         self.state = state
         self.graph = graph
@@ -184,7 +216,11 @@ class ExplorerAgent:
         self.seed_embedding = seed_embedding
         self._shared_visited = shared_visited if shared_visited is not None else set()
         self._frontier = shared_frontier if shared_frontier is not None else SharedFrontier()
+        self.expander = expander
         self.tracer: RunTracer | None = None
+        self.rng = rng if rng is not None else random.Random()
+        self._eta_cache: dict[str, EtaComponents] = {}
+        self._llm_priority: dict[str, float] = {}
 
     async def take_turn(self, k: int) -> list[tuple[str, str, str]]:
         """Execute one turn: fetch k papers, integrate narratives.
@@ -208,19 +244,30 @@ class ExplorerAgent:
             if self.state.budget <= 0:
                 break
 
-            next_id = self._frontier.best(exclude=self._shared_visited)
-            if next_id is None:
+            selection = await self._select_candidate()
+            if selection is None:
                 log.debug("agent_no_candidates", agent=self.state.id, pos=self.state.pos)
                 break
 
-            src, mode = self._frontier.sources.get(next_id, (self.state.pos, "ref"))
+            next_id = selection.chosen
+            src, mode = selection.src, selection.mode
 
             expected_summary = self.graph.get_paper_summary(next_id)
             expected_title = expected_summary.title if expected_summary else ""
             self._shared_visited.add(next_id)
 
             paper = await self._fetch_paper(next_id)
+
+            owned = self._frontier.claim_for(next_id, self.state.id)
+            if not owned:
+                self._shared_visited.discard(next_id)
+                self._frontier.release(next_id, self.state.id)
+                continue
+
             if paper is None:
+                if await self._metadata_transit(next_id, src, mode):
+                    self._frontier.release(next_id, self.state.id)
+                    continue
                 self._shared_visited.discard(next_id)
                 self._frontier.remove(next_id)
                 continue
@@ -244,9 +291,21 @@ class ExplorerAgent:
                 self._frontier.remove(next_id)
                 continue
 
+            if getattr(self, "expander", None) is not None and not (
+                paper.fulltext or paper.abstract
+            ):
+                if await self._metadata_transit(next_id, src, mode, paper=paper):
+                    self._frontier.release(next_id, self.state.id)
+                    continue
+                self._shared_visited.discard(next_id)
+                self._frontier.remove(next_id)
+                continue
+
             self.graph.cache_paper(paper)
             narrative, extracted = await self._integrate(paper)
             self.state.narrative = narrative
+            if paper.fulltext or paper.abstract:
+                self.graph.mark_integrated(next_id)
 
             self.state.visit(next_id, mode)
             self._frontier.remove(next_id)
@@ -279,6 +338,195 @@ class ExplorerAgent:
 
         self.state.turn_count += 1
         return edges
+
+    def _direction_weights(self) -> tuple[float, float]:
+        """Caste-adjusted (ref_weight, cites_weight) for this agent."""
+        return caste_direction_weights(
+            self.state.caste,
+            self.cfg.direction.ref_weight,
+            self.cfg.direction.cites_weight,
+        )
+
+    async def _select_candidate(self) -> Selection | None:
+        """Pick the next candidate via tau^alpha * eta^beta transition weights.
+
+        Builds a ``Candidate`` per eligible frontier node (not visited, not
+        claimed), computes tau from the agent's private pheromone and the
+        caste-adjusted direction modifier, then draws via ``select_candidate``.
+        The chosen node is claimed so no concurrent agent duplicates the work.
+        """
+        eligible = self._frontier.eligible(exclude=self._shared_visited)
+        if not eligible:
+            return None
+
+        ref_w, cites_w = self._direction_weights()
+        candidates_list: list[Candidate] = []
+        for pid in eligible:
+            src, mode = self._frontier.sources.get(pid, (self.state.pos, "ref"))
+            components = await self._eta_components(pid)
+            tau = self.state.get_pheromone(src, pid, mode)
+            dm = _mode_dir_modifier(mode, ref_w, cites_w)
+            candidates_list.append(
+                Candidate(pid=pid, src=src, mode=mode, tau=tau, eta=components.value, dir_modifier=dm)
+            )
+
+        guard = 0
+        max_guard = max(1, len(candidates_list) + 1)
+        while candidates_list and guard < max_guard:
+            guard += 1
+            selection = select_candidate(
+                candidates_list,
+                self.cfg.aco.alpha,
+                self.cfg.aco.beta,
+                self.cfg.aco.epsilon,
+                self.rng,
+            )
+            if selection is None:
+                return None
+            if self._frontier.claim_for(selection.chosen, self.state.id):
+                self._emit_candidate_selected(selection)
+                return selection
+            candidates_list = [c for c in candidates_list if c.pid != selection.chosen]
+
+        return None
+
+    def _emit_candidate_selected(self, selection: Selection) -> None:
+        if self.tracer is None:
+            return
+        record = getattr(self.tracer, "record_candidate_selected", None)
+        if record is None:
+            return
+        from research_explorer.replay.models import CandidateSelection
+
+        component = self._eta_cache.get(selection.chosen)
+        record(
+            CandidateSelection(
+                agent_id=self.state.id,
+                paper_id=selection.chosen,
+                src=selection.src,
+                mode=selection.mode,
+                caste=self.state.caste,
+                dir_modifier=selection.dir_modifier,
+                tau=selection.tau,
+                alpha=selection.alpha,
+                beta=selection.beta,
+                eta=component.value if component else selection.eta,
+                final_weight=selection.final_weight,
+                probability=selection.chosen_probability,
+                epsilon_branch=selection.epsilon_branch,
+                chosen=True,
+                rationale=self._selection_rationale(selection),
+            )
+        )
+
+    def _selection_rationale(self, selection: Selection) -> str:
+        branch = "epsilon" if selection.epsilon_branch else "weighted"
+        tau_term = max(1e-12, selection.tau) ** selection.alpha if selection.tau > 0 else 0.0
+        eta_term = max(0.0, selection.eta) ** selection.beta
+        return (
+            f"caste={self.state.caste} mode={selection.mode} "
+            f"tau^alpha={tau_term:.4f} eta^beta={eta_term:.4f} "
+            f"dir={selection.dir_modifier:.4f} branch={branch}"
+        )
+
+    def _provider_confidence(self, summary: PaperSummary | None, provider: str | None = None) -> float:
+        if summary is None:
+            prov = provider or parse_normalized_id(self.state.pos)[0]
+            return max(0.0, min(1.0, _provider_confidence_base(prov) - 0.2))
+        prov = provider or summary.provider
+        conf = _provider_confidence_base(prov)
+        if summary.doi or summary.arxiv_id:
+            conf += 0.05
+        if summary.abstract:
+            conf += 0.05
+        if not summary.title:
+            conf -= 0.2
+        return max(0.0, min(1.0, conf))
+
+    async def _eta_components(
+        self, paper_id: str, embedding: list[float] | None = None,
+        llm_priority: float | None = None,
+    ) -> EtaComponents:
+        """Compute (and cache) the eta decomposition for a frontier candidate."""
+        cached = self._eta_cache.get(paper_id)
+        if cached is not None:
+            return cached
+
+        summary = self.graph.get_paper_summary(paper_id)
+        h = self.cfg.heuristica
+        weights = {
+            "w_sim": h.w_sim,
+            "w_citas": h.w_citas,
+            "w_recencia": h.w_recencia,
+            "w_confidence": h.w_confidence,
+            "w_llm": h.w_llm,
+        }
+
+        if summary is None:
+            prov = parse_normalized_id(paper_id)[0]
+            value = combine_eta(0.5, 0.5, 0.5, self._provider_confidence(None, prov), 0.0,
+                                h.w_sim, h.w_citas, h.w_recencia, h.w_confidence, h.w_llm, h.eta_llm)
+            eta = EtaComponents(sim=0.5, citations=0.5, recency=0.5,
+                                confidence=self._provider_confidence(None, prov), llm=0.0,
+                                weights=weights, value=value)
+            self._cache_eta(paper_id, eta)
+            return eta
+
+        sim = 0.5
+        if self.seed_embedding is not None:
+            emb = embedding
+            if emb is None:
+                emb = self.graph.get_paper_embedding(paper_id)
+            if emb is None:
+                text = f"{summary.title} {summary.abstract or ''}"
+                try:
+                    emb = await self.embedding.embed(text)
+                    self.graph.set_paper_embedding(paper_id, emb)
+                except Exception:
+                    emb = None
+            if emb is not None:
+                sim = (_cosine_sim(self.seed_embedding, emb) + 1.0) / 2.0
+                sim = max(0.0, min(1.0, sim))
+
+        citations_val = _sigmoid(math.log1p(summary.citation_count or 0) / 5.0)
+        year = summary.year or 2000
+        recency = max(0.0, min(1.0, (year - 1950) / 75.0))
+        conf = self._provider_confidence(summary)
+        llm_val = (
+            llm_priority if llm_priority is not None
+            else self._llm_priority.get(paper_id, 0.0)
+        )
+        value = combine_eta(sim, citations_val, recency, conf, llm_val,
+                            h.w_sim, h.w_citas, h.w_recencia, h.w_confidence, h.w_llm, h.eta_llm)
+        eta = EtaComponents(sim=sim, citations=citations_val, recency=recency,
+                            confidence=conf, llm=llm_val, weights=weights, value=value)
+        self._cache_eta(paper_id, eta)
+        return eta
+
+    def _cache_eta(self, paper_id: str, eta: EtaComponents) -> None:
+        self._eta_cache[paper_id] = eta
+        if self.tracer is None:
+            return
+        record = getattr(self.tracer, "record_candidate_score", None)
+        if record is None:
+            return
+        from research_explorer.replay.models import CandidateScore
+
+        src, mode = self._frontier.sources.get(paper_id, ("", "ref"))
+        prov = parse_normalized_id(paper_id)[0]
+        record(
+            CandidateScore(
+                paper_id=paper_id,
+                agent_id=self.state.id,
+                provider=prov,
+                components=eta.components(),
+                weights=dict(eta.weights),
+                eta=eta.value,
+                llm_used=bool(getattr(self.cfg.heuristica, "eta_llm", False)),
+                source=src,
+                mode=mode,
+            )
+        )
 
     async def _evaluate_new_refs(self) -> None:
         """Evaluate unevaluated frontier papers with a batch LLM call.
@@ -333,12 +581,13 @@ class ExplorerAgent:
             score = s.get("score", 0.0)
             pid = id_map.get(raw_id, raw_id)
             if pid and isinstance(score, (int, float)):
-                self._frontier.set_score(pid, float(score))
+                self._llm_priority[pid] = float(score)
+                self._eta_cache.pop(pid, None)
 
-        still_unevaluated = self._frontier.unevaluated()
-        for pid in still_unevaluated:
-            eta = await self._heuristic(pid)
-            self._frontier.set_score(pid, eta)
+        for pid in new_refs:
+            if pid not in self._frontier.scores:
+                eta = await self._heuristic(pid)
+                self._frontier.set_score(pid, eta)
 
     def _parse_eval_response(self, raw: str) -> list[dict]:
         """Parse the LLM's reference evaluation response."""
@@ -391,38 +640,12 @@ class ExplorerAgent:
         return result
 
     async def _heuristic(
-        self, paper_id: str, embedding: list[float] | None = None
+        self, paper_id: str, embedding: list[float] | None = None,
+        llm_priority: float | None = None,
     ) -> float:
-        """Compute eta(v) -- relevance heuristic, cached in the graph store."""
-        summary = self.graph.get_paper_summary(paper_id)
-        if summary is None:
-            return 0.5
-
-        sim = 0.5
-        if self.seed_embedding is not None:
-            if embedding is not None:
-                sim = _cosine_sim(self.seed_embedding, embedding)
-            else:
-                emb = self.graph.get_paper_embedding(paper_id)
-                if emb is None:
-                    text = f"{summary.title} {summary.abstract or ''}"
-                    try:
-                        emb = await self.embedding.embed(text)
-                        self.graph.set_paper_embedding(paper_id, emb)
-                    except Exception:
-                        emb = None
-                if emb is not None:
-                    sim = _cosine_sim(self.seed_embedding, emb)
-
-        citations = summary.citation_count or 0
-        norm_citas = _sigmoid(math.log1p(citations) / 5.0)
-
-        year = summary.year or 2000
-        recency = max(0.0, min(1.0, (year - 1950) / 75.0))
-
-        h = self.cfg.heuristica
-        value = h.w_sim * sim + h.w_citas * norm_citas + h.w_recencia * recency
-        return _sigmoid(value)
+        """Compute eta(v) -- the combined relevance heuristic, cached per node."""
+        components = await self._eta_components(paper_id, embedding=embedding, llm_priority=llm_priority)
+        return components.value
 
     def _provider_for(self, paper_id: str) -> ResilientProvider:
         """Pick the provider for a normalized ID by its prefix; fall back to default."""
@@ -558,6 +781,57 @@ class ExplorerAgent:
                 ))
         return summaries
 
+    async def _metadata_transit(
+        self, paper_id: str, src: str, mode: str, paper: Paper | None = None
+    ) -> bool:
+        """Traverse a metadata-only node: expand it without integrating content.
+
+        Metadata-only nodes stay expandable (neighbors are discovered through
+        the provider expander) but receive no narrative/evaluation evidence
+        credit: the fetch slot is consumed, no visit is recorded, no traversal
+        edge is returned, and the node is not marked integrated.
+        """
+        expander = getattr(self, "expander", None)
+        if expander is None:
+            return False
+        summary = self.graph.get_paper_summary(paper_id)
+        if summary is None and paper is None:
+            return False
+        if self.tracer is not None:
+            provider = (
+                summary.provider
+                if summary is not None
+                else (paper.provider if paper is not None else "unknown")
+            )
+            self.tracer.emit(
+                "metadata_transit",
+                paper_id=paper_id,
+                src=src,
+                mode=mode,
+                provider=provider,
+                reason="full_text_unavailable" if paper is None else "metadata_only",
+            )
+        result = await expander.expand(paper_id, paper=paper, tracer=self.tracer)
+        self._add_expanded_to_frontier(paper_id, result)
+        self.state.set_local_neighbors(
+            paper_id, result.outgoing.node_ids, result.incoming.node_ids
+        )
+        self.state.record_transit(paper_id)
+        self._frontier.remove(paper_id)
+        return True
+
+    def _add_expanded_to_frontier(self, paper_id: str, result: ExpansionResult) -> None:
+        if result.outgoing.node_ids:
+            self._frontier.add(
+                result.outgoing.node_ids, source=paper_id, mode="ref",
+                exclude=self._shared_visited,
+            )
+        if result.incoming.node_ids:
+            self._frontier.add(
+                result.incoming.node_ids, source=paper_id, mode="cites",
+                exclude=self._shared_visited,
+            )
+
     async def _discover_neighbors(
         self,
         paper_id: str,
@@ -566,13 +840,17 @@ class ExplorerAgent:
     ) -> None:
         """Read a paper and record its neighbors in the agent's private graph.
 
-        - Native refs (S2/OpenAlex/PubMed): use paper.references / paper.citations.
-        - Full-text (arXiv): use the LLM-extracted references (outgoing only).
-        Fetchable neighbors (arxiv_id/doi) enter the frontier; the rest are kept
-        only in the private graph for structure. Neighbor summaries are cached in
-        the shared store so embeddings/heuristics work.
+        With an expander attached, both directions come from provider-verified
+        canonical expansion (OpenAlex primary, Semantic Scholar fallback) plus
+        LLM-extracted bibliography entries. Without one, the legacy native-list
+        path is used.
         """
         if self.state.is_discovered(paper_id):
+            return
+
+        expander = getattr(self, "expander", None)
+        if expander is not None:
+            await self._discover_via_expander(paper_id, paper, extracted, expander)
             return
 
         if paper is None:
@@ -625,6 +903,46 @@ class ExplorerAgent:
             refs=len(ref_ids),
             cits=len(cit_ids),
             frontier_added=len(ref_frontier) + len(cit_frontier),
+        )
+
+    async def _discover_via_expander(
+        self,
+        paper_id: str,
+        paper: Paper | None,
+        extracted: list[PaperSummary] | None,
+        expander: NeighborExpander,
+    ) -> None:
+        """Canonical neighbor discovery via the resolution expander."""
+        if paper is None:
+            paper = await self._fetch_paper(paper_id)
+            if paper is not None:
+                self.graph.cache_paper(paper)
+        if (
+            extracted is None
+            and paper is not None
+            and not paper.references
+            and not paper.citations
+            and paper.ref_entries
+        ):
+            narrative, extracted = await self._integrate(paper)
+            self.state.narrative = narrative
+        if extracted is None:
+            extracted = []
+
+        result = await expander.expand(
+            paper_id, paper=paper, extracted=extracted, tracer=self.tracer
+        )
+        self._add_expanded_to_frontier(paper_id, result)
+        self.state.set_local_neighbors(
+            paper_id, result.outgoing.node_ids, result.incoming.node_ids
+        )
+        log.info(
+            "discovered_neighbors",
+            agent=self.state.id,
+            paper=paper_id,
+            refs=len(result.outgoing.node_ids),
+            cits=len(result.incoming.node_ids),
+            frontier_added=len(result.outgoing.node_ids) + len(result.incoming.node_ids),
         )
 
     def _neighbor_summaries(

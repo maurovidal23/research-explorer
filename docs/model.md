@@ -85,6 +85,8 @@ $$
 - $G_{\text{exp}}$ — subgrafo revelado.
 - $\eta : V \to [0,1]$ — caché de relevancia (juez virgen), **una vez por nodo, compartida
   por toda la colonia**.
+- $\Gamma$ — conjunto de **reclamaciones** (claims) sobre la frontera: nodos que un agente
+  está fetcheando en ese momento (bloqueo solo de la ventana concurrente).
 
 > **Propiedad de persistencia ligera:** como $\eta$ y $\tau$ son globales, el estado
 > serializado por agente se reduce a IDs + texto narrativo + escalares, lo que hace viable
@@ -92,68 +94,91 @@ $$
 
 ---
 
-## 3. Heurística local $\eta(v)$ — juez virgen
+## 3. Heurística local $\eta(v)$ — componentes normalizados
 
-Estima la relevancia de un candidato $v$ **antes** de fetchearlo a fondo, usando solo
-metadatos disponibles en la lista de referencias del padre:
+Estima la relevancia de un candidato $v$ **antes** de fetchearlo a fondo, usando
+metadatos disponibles en la lista de referencias del padre. Se descompone en
+**componentes normalizados** cada uno en $[0,1]$:
 
 $$
-\eta(v) = \sigma\!\left( w_s \cdot \mathrm{sim}_{\text{emb}}(v, q) \;+\; w_c \cdot
-\mathrm{normCitas}(v) \;+\; w_y \cdot \mathrm{recencia}(v) \right)
+\eta(v) = \sigma\!\left( w_s \cdot \mathrm{sim}(v) \;+\; w_c \cdot \mathrm{cit}(v)
+\;+\; w_y \cdot \mathrm{rec}(v) \;+\; w_{conf} \cdot \mathrm{conf}(v)
+\;+\; w_{llm} \cdot \mathrm{llm}(v) \right)
 $$
 
 con $\sigma$ la sigmoide y:
-- $\mathrm{sim}_{\text{emb}}(v, q)$ — similitud coseno entre el embedding (título/abstract
-  corto) de $v$ y la consulta semilla $q$.
-- $\mathrm{normCitas}(v) \in [0,1]$ — citas normalizadas (señal de seminalidad).
-- $\mathrm{recencia}(v) \in [0,1]$ — factor de año.
+- $\mathrm{sim}(v)$ — similitud coseno normalizada $(\cos+1)/2$ entre el embedding
+  (título/abstract corto) de $v$ y la consulta semilla $q$.
+- $\mathrm{cit}(v) \in [0,1]$ — citas normalizadas $\sigma(\ln(1+\text{citas})/5)$
+  (señal de seminalidad).
+- $\mathrm{rec}(v) \in [0,1]$ — factor de año $(y-1950)/75$ recortado.
+- $\mathrm{conf}(v) \in [0,1]$ — confianza de proveedor/verificación: base
+  determinista por proveedor (openalex 0.95, semantic_scholar 0.90, pubmed 0.85,
+  arxiv 0.80, resto 0.40) ajustada por evidencia (DOI/arXiv, abstract,
+  ausencia de título).
+- $\mathrm{llm}(v)$ — prioridad LLM opcional (solo se incluye cuando `eta_llm = true`;
+  la puntuación del lote de evaluación de referencias). Contribuye con peso $w_{llm}$.
 
-**Optimización de coste:** por defecto $\eta$ es **pura embedding** (sin LLM), pues se
-evalúa para cada candidato de cada agente. El **LLM virgen se reserva para $Q$** (evaluación
-de contexto, menos frecuente). El modo `η-LLM` (juez virgen como $\eta$) es un *toggle* del
-config.
+**Optimización de coste:** por defecto $\eta$ es **pura** (sin término LLM), pues
+se evalúa para cada candidato de cada agente. El **LLM se usa opcionalmente como
+prioridad** cuando se activa `eta_llm` (toggle del config). El modo $\eta$ es
+siempre cacheado globalmente.
 
-**Caché:** $\eta(v)$ se calcula una sola vez por nodo y se comparte globalmente.
+**Caché:** $\eta(v)$ se calcula una vez por nodo y se comparte globalmente; sus
+componentes se registran en el evento de replay `candidate_score`.
 
 ---
 
 ## 4. Probabilidad de transición bidireccional
 
-Se descompone en dos sorteos jerárquicos: **dirección** y **arista**.
+Se compone de: **peso de dirección** (ajustado por casta) y **peso de arista**
+$\tau^\alpha \cdot \eta^\beta$.
 
-### 4.1 Elección de dirección
-
-$$
-p(d \mid u) = \frac{w_d(u)}{w_{\text{ref}}(u) + w_{\text{cites}}(u)}, \qquad d \in
-\{\text{ref}, \text{cites}\}
-$$
-
-donde $w_d(u)$ es configurable. Variantes:
-- **Constante:** $w_d(u) = \theta_d$ (p.ej. $\theta_{\text{ref}}=0.7,\;
-  \theta_{\text{cites}}=0.3$).
-- **Por fase global:** $w_d(u) = \theta_d(t)$, favoreciendo `ref` al inicio (fundamentos)
-  y `cites` después (impacto).
-- **Por casta:** $w_d$ fijo por agente según su casta $c \in \{\text{fundaciones},
-  \text{impacto}, \text{mixto}\}$ (§13).
-
-### 4.2 Elección de arista dentro de la dirección
+### 4.1 Peso de dirección por modo
 
 $$
-p(v \mid u, d) = \frac{\tau_d(u,v)^{\alpha}\, \eta(v)^{\beta}}
-{\displaystyle\sum_{w \in \mathcal{C}_d(u) \setminus V_a} \tau_d(u,w)^{\alpha}\,
-\eta(w)^{\beta}}
+p(d \mid u) = \frac{w_d^{\text{casta}}(u)}{w_{\text{ref}}^{\text{casta}}(u) + w_{\text{cites}}^{\text{casta}}(u)}, \qquad d \in \{\text{ref}, \text{cites}\}
 $$
 
-- $\alpha$ — peso de la feromona (explotación colectiva).
-- $\beta$ — peso de la heurística local (atractivo individual).
-- $V_a$ se excluye (**tabú**) para forzar cobertura y evitar ciclos. Si
-  $\mathcal{C}_d(u) \setminus V_a = \emptyset$, el agente retrocede o finaliza su turno.
+donde $w_d^{\text{casta}}$ es la línea base del config ($\theta$), ajustada por casta:
+- **fundaciones**: desplaza el peso hacia `ref` (fundamentos).
+- **impacto**: desplaza el peso hacia `cites` (impacto).
+- **mixto**: usa la línea base del config (equilibrada).
 
-### 4.3 Exploración $\varepsilon$-greedy
+Los pesos se normalizan a suma 1; el modificador de dirección de un candidato se
+aplica como factor en su peso (§4.2).
 
-Con probabilidad $\varepsilon$, elegir $v$ solo por $\eta$ (uniforme sobre
-$\mathcal{C}_d(u) \setminus V_a$), ignorando la feromona. Previene el bloqueo por feromona y
-garantiza exploración.
+### 4.2 Peso de arista dentro del modo
+
+$$
+\mathrm{weight}(v) = \tau^{\alpha}_{\text{modo}}(u,v) \cdot \eta(v)^{\beta} \cdot d^{\text{casta}}_{\text{modo}(v)}
+$$
+
+y la probabilidad de selección se normaliza sobre la frontera elegible:
+
+$$
+p(v) = \frac{\mathrm{weight}(v)}{\sum_{w \in \mathcal{C} \setminus V_a^{\text{claim}}} \mathrm{weight}(w)}
+$$
+
+- $\tau_{\text{modo}}(u,v)$ — **feromona privada** del agente en la arista
+  $(u \to v)$ segun el modo de descubrimiento, depositada por él y posteriormente
+  usada **por él** (los agentes no comparten feromona).
+- $V_a^{\text{claim}}$ — nodos visitados **o reclamados** por otro agente.
+
+### 4.3 Exploración $\varepsilon$-greedy e RNG inyectable
+
+Con probabilidad $\varepsilon$, se elige un candidato **uniformemente** sobre la
+frontera elegible (exploración pura, ignorando $\tau$ y $\eta$). El RNG es
+**inyectable y determinista** (semilla por agente en la colonia), de modo que una
+ejecución con la misma semilla es reproducible.
+
+### 4.4 Reclamación (claims) sin borrado global
+
+La frontera es compartida por la colonia. Para evitar que dos agentes fetcheen el
+mismo candidato a la vez, el agente **reclama** (claim) el nodo durante el fetch y
+lo **libera** al terminar. Reclamar solo bloquea la ventana concurrente: no borra
+el nodo ni los caminos ya descubiertos que cuelgan de él, de modo que las rutas
+reutilizables se conservan.
 
 ---
 
@@ -283,7 +308,7 @@ $$
 $$
 
 - $\mathrm{EV}(F_a) = \sum_{v \in F_a} p(\text{pos}_a \to v)\, \eta(v)$ — valor esperado de
-  la frontera.
+  la frontera (nodos reclamados excluidos).
 - $b_a$ — recompensa el presupuesto restante (evita inanición).
 
 El scheduler extrae los $K$ agentes de mayor prioridad, los ejecuta un turno, los persiste,
@@ -291,15 +316,27 @@ recalcula prioridades y repite. Es **multitarea cooperativa con prioridad** que 
 el cómputo en los linajes más prometedores. $K$ es un parámetro (el límite de 3 es un
 perfil).
 
+El recuento de trabajo de proveedor es **consistente**: cada unidad de presupuesto consumida
+se contabiliza como trabajo de fetch, incluidos los **tránsitos de nodo solo-metadatos** y
+la expansión de vecinos del proveedor ($\Delta_{\text{turno}} = \text{visitas} +
+\text{tránsitos}$ por agente), de modo que el presupuesto y la convergencia no subestiman
+el trabajo de expansión.
+
 ---
 
 ## 9. Criterios de convergencia
 
 Parada cuando **cualquiera** (configurable):
-- **Presupuesto:** $\sum_a b_a = 0$ o $\sum \text{fetches} = B$.
+- **Presupuesto:** $\sum_a b_a = 0$ o $\sum \text{fetches} = B$ (incluye trabajo de
+  expansión de proveedor y tránsitos de nodos solo-metadatos).
 - **Meseta:** $Q_{\text{best}}(t) - Q_{\text{best}}(t-T) < \varepsilon$ durante $T$ oleadas.
 - **Concentración de feromona:** $\max_e \tau(e) / \overline{\tau(e)} > \theta$.
 - **Tiempo** wall-clock.
+
+Los nodos de frontera **solo-metadatos** (resolubles vía expansión del proveedor, sin
+contenido legible) cuentan como candidatos y su expansión se contabiliza como trabajo de
+proveedor, de modo que una colonia atascada en metadatos agota su presupuesto y converge
+en lugar de girar indefinidamente sin avanzar.
 
 Al converger: $a^* = \arg\max_a Q_a$; emitir $N_{a^*}$.
 
@@ -309,30 +346,32 @@ Al converger: $a^* = \arg\max_a Q_a$; emitir $N_{a^*}$.
 
 ```
 Entrada: semilla s, consulta q, presupuesto B, parámetros (N, K, k, α, β, ρ, ε, w, λ,
-         τ_min, τ_max)
+         τ_min, τ_max, pesos η, pesos de dirección)
 Salida:  narrativa N_{a*}
 
 1.  Inicializar colonia A = {a_1..a_N} en s, N_a = ∅, V_a = {s}, b_a = B/N
-2.  Revelar C(s) vía MCP; G_exp = {s}; τ_d(e) = τ_0 ∀e,d; η(s) calculado
+2.  Revelar C(s) vía proveedor; G_exp = {s}; τ_d(e) = τ_0 ∀e,d; η(s) calculado
 3.  Mientras no converja (§9):
 4.      A_activos ← top-K agentes por priority(a) (§8)
 5.      Para cada a ∈ A_activos (turno):
 6.          Para i = 1..k y b_a > 0:
-7.              u ← pos_a
-8.              Con prob. ε: v ~ Uniforme(C(u)\V_a por η)
-9.              Si no:   d ~ p(d|u); v ~ p(v|u,d)        (§4)
-10.             Fetchear v vía MCP (si no en M); actualizar M, G_exp, η(v)
-11.             V_a ← V_a ∪ {v}; pos_a ← v; b_a ← b_a - 1
-12.             N_a ← Integrate_LLM(N_a, v)              (§7)
-13.         Fin-para
-14.         Calcular S_a, P_a (voto de otros activos), J_a (virgen), R_a  (§5)
-15.         Q_a ← Σ w_i · componente_i ;  ΔQ_a ← Q_a - Q_a_previo
-16.         Persistir σ_a; liberar slot
-17.     Fin-para
-18.     Actualizar τ: evaporar, depositar por ΔQ, elitismo, clip [τ_min,τ_max]  (§6)
-19.     Recalcular priority(a) ∀a dormido
-20. Fin-mientras
-21. a* ← argmax_a Q_a ;  devolver N_{a*}
+7.              Frontera elegible ← C_u \ (V_a ∪ claims)
+8.              Con prob. ε: v ~ Uniforme(elegibles)                (§4.3)
+9.              Si no:   v ~ p(v) ∝ τ^α · η^β · d_castaa         (§4)
+10.             reclamar v (claim); bajar/soltar al terminar         (§4.4)
+11.             Fetchear v vía proveedor (si no en M); actualizar M, G_exp, η(v)
+12.             Si v es solo-metadatos: expandir y continuar (sin crédito)
+13.             V_a ← V_a ∪ {v}; pos_a ← v; b_a ← b_a - 1
+14.             N_a ← Integrate_LLM(N_a, v)              (§7)
+15.         Fin-para
+16.         Calcular S_a, P_a (voto de otros activos), J_a (virgen), R_a  (§5)
+17.         Q_a ← Σ w_i · componente_i ;  ΔQ_a ← Q_a - Q_a_previo
+18.         Persistir σ_a; liberar slot
+19.     Fin-para
+20.     Actualizar τ: evaporar, depositar por ΔQ, elitismo, clip [τ_min,τ_max]  (§6)
+21.     Recalcular priority(a) ∀a dormido
+22. Fin-mientras
+23. a* ← argmax_a Q_a ;  devolver N_{a*}
 ```
 
 ---
@@ -352,8 +391,10 @@ Salida:  narrativa N_{a*}
 | $w_1..w_4$ | Pesos de $Q$ (S,P,J,R) | p.ej. 0.25 |
 | $\mu_1..\mu_4$ | Pesos de $R$ | p.ej. 0.25 |
 | $\theta_{\text{ref}}, \theta_{\text{cites}}$ | Pesos de dirección | 0.7 / 0.3 |
+| $w_s, w_c, w_y, w_{conf}, w_{llm}$ | Pesos de $\eta$ (sim, citas, recencia, confianza, LLM) | 0.6 / 0.2 / 0.2 / 0.1 / 0.2 |
+| $\text{eta\_llm}$ | Usar prioridad LLM en $\eta$ | false |
 | $\lambda$ | Elitismo | 0.5–1 |
-| $\tau_0, \tau_{\min}, \tau_{\max}$ | Cotas MMAS | 1, 0.1, 10 |
+| $\tau_0, \tau_{\min}, \tau_{\max}$ | Cotas MMAS (inicial, mín, máx) | 1, 0.1, 10 |
 | $\gamma, \delta$ | Scheduler (EV, presupuesto) | 0.5, 0.3 |
 
 ---
@@ -379,11 +420,19 @@ Escala linealmente con $K$ y $k$.
 ## 13. Extensiones
 
 - **Castas:** asignar a cada agente una casta $c \in \{\text{fundaciones}, \text{impacto},
-  \text{mixto}\}$ que fija $w_d(u)$. La colonia cubre ambas direcciones por especialización;
-  el ganador emerge de la casta que mejor capturó el contexto. Aumenta la diversidad
-  (término $\mathrm{Div}_a$) sin coste extra.
+  \text{mixto}\}$ que fija los pesos de dirección $w_d^{\text{casta}}$ (§4.1):
+  `fundaciones` desplaza hacia `ref`, `impacto` hacia `cites`, `mixto` usa la línea base
+  equilibrada. La colonia cubre ambas direcciones por especialización; el ganador emerge de
+  la casta que mejor capturó el contexto. Aumenta la diversidad (término $\mathrm{Div}_a$)
+  sin coste extra.
+- **Reclamación (claims) y feromona privada:** los agentes reclaman nodos de la frontera
+  compartida para evitar trabajo duplicado concurrente (§4.4) y se refuerzan sobre su propia
+  feromona privada, sin borrar rutas reutilizables.
+- **Replay de candidatos:** cada candidato puntuado emite `candidate_score` (todos los
+  componentes/ponderaciones y $\eta$) y cada selección `candidate_selected` ($\tau$,
+  $\alpha/\beta$, modificador de dirección/casta, peso y probabilidad finales, rama
+  $\varepsilon$ y elección), dotando a la traza de la regla exacta que escogió cada salto.
 - **Voto ponderado por reputación:** §5.1, los agentes de mayor $Q$ pesan más en $P_a$.
-- **Fase direccional global:** $\theta_d(t)$ varía con el progreso (fundamentos → impacto).
 - **Reanudación:** $\Sigma$ y $\{\sigma_a\}$ son serializables → ejecuciones
   pausables/reanudables.
 
@@ -418,3 +467,5 @@ Escala linealmente con $K$ y $k$.
 | $\Delta Q_a(t)$ | Señal de mejora por turno |
 | $K, k, N$ | Concurrencia, fetches/turno, tamaño colonia |
 | $\alpha,\beta,\rho,\varepsilon$ | Feromona, heurística, evaporación, exploración |
+| $\Gamma$ | Reclamaciones (claims) sobre la frontera compartida |
+| $w_{conf}, w_{llm}, \text{eta\_llm}$ | Confianza de proveedor y prioridad LLM en $\eta$ |

@@ -101,11 +101,24 @@ class AgentState(BaseModel):
         default_factory=dict,
         description="Per-paper structured analysis: paper_id -> {summary, key_concepts, methods, findings, relevance, limitations, key_references}",
     )
+    metadata_transits: list[str] = Field(
+        default_factory=list,
+        description="Papers traversed as metadata-only (no readable content integrated, no evidence credit)",
+    )
+    fetch_work: int = Field(
+        default=0,
+        description="Cumulative budget-consuming provider work units (fetches + metadata transits)",
+    )
+    delta_work: int = Field(
+        default=0,
+        description="Provider work units consumed by the most recent turn",
+    )
 
     def start_turn(self) -> None:
         """Reset per-turn accumulators."""
         self.path = []
         self.delta_q = 0.0
+        self.delta_work = 0
 
     def visit(self, paper_id: str, mode: str) -> None:
         """Record a visit."""
@@ -114,6 +127,15 @@ class AgentState(BaseModel):
         self.path.append((paper_id, mode))
         self.full_path.append((paper_id, mode))
         self.budget -= 1
+        self.fetch_work += 1
+        self.delta_work += 1
+
+    def record_transit(self, paper_id: str) -> None:
+        """Record a metadata-only transit: budget consumed, no visit/evidence credit."""
+        self.metadata_transits.append(paper_id)
+        self.budget -= 1
+        self.fetch_work += 1
+        self.delta_work += 1
 
     def add_to_frontier(
         self, paper_ids: list[str], source: str = "", mode: str = "ref"

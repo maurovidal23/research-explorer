@@ -8,6 +8,7 @@ per-agent (reading the seed) during initialization.
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from collections import Counter
 from typing import Literal
@@ -21,6 +22,7 @@ from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
+from research_explorer.resolution.traversal import build_neighbor_expander
 
 log = get_logger("colony")
 
@@ -38,6 +40,7 @@ class Colony:
         provider: ResilientProvider,
         config: Config,
         providers: dict[str, ResilientProvider] | None = None,
+        colony_seed: int | None = None,
     ):
         self.graph = graph
         self.llm = llm
@@ -45,6 +48,8 @@ class Colony:
         self.provider = provider
         self.providers = providers or {provider.name: provider}
         self.cfg = config
+        self.colony_seed = colony_seed
+        self.expander = build_neighbor_expander(config, self.providers, graph)
         self.agents: list[ExplorerAgent] = []
         self.seed_id: str = ""
         self.seed_query: str = ""
@@ -101,6 +106,8 @@ class Colony:
                 seed_embedding=self.seed_embedding,
                 shared_visited=self.shared_visited,
                 shared_frontier=self.shared_frontier,
+                expander=self.expander,
+                rng=self._agent_rng(i),
             )
             self.agents.append(agent)
 
@@ -124,6 +131,12 @@ class Colony:
         """Distribute the global budget across the colony."""
         total = self.cfg.budget.max_fetches
         return max(1, total // self.cfg.aco.colony_size)
+
+    def _agent_rng(self, i: int) -> random.Random:
+        """Return a deterministic per-agent RNG when a colony seed is set."""
+        if self.colony_seed is not None:
+            return random.Random(self.colony_seed + i)
+        return random.Random()
 
     def _assign_castes(self, n: int) -> list[str]:
         """Assign castes to agents for diversity.

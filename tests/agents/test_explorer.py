@@ -195,18 +195,30 @@ async def test_take_turn_rejects_mismatched_title() -> None:
     emitted = []
     e._frontier = SimpleNamespace(
         best=lambda exclude=None: "arxiv:1901.03228" if not exclude or "arxiv:1901.03228" not in exclude else None,
+        eligible=lambda exclude=None: ["arxiv:1901.03228"],
         sources={"arxiv:1901.03228": ("arxiv:seed", "ref")},
         remove=removed.append,
         unevaluated=lambda: [],
         set_score=lambda nid, s: None,
+        claim_for=lambda nid, agent: True,
+        release=lambda nid, agent: None,
+        is_claimed=lambda nid: False,
+        claims={},
     )
     e.llm = None
     e.embedding = None
     e.cfg = SimpleNamespace(
-        aco=SimpleNamespace(k_per_turn=1),
+        aco=SimpleNamespace(k_per_turn=1, alpha=1.0, beta=3.0, epsilon=0.1),
         llm=SimpleNamespace(explorer_model="test", temperature=0.3, max_tokens=2000),
-        heuristica=SimpleNamespace(w_sim=0.5, w_citas=0.3, w_recencia=0.2),
+        heuristica=SimpleNamespace(
+            w_sim=0.5, w_citas=0.3, w_recencia=0.2, w_confidence=0.1, w_llm=0.0, eta_llm=False
+        ),
+        direction=SimpleNamespace(ref_weight=0.7, cites_weight=0.3),
     )
+    import random as _random
+    e.rng = _random.Random(0)
+    e._eta_cache = {}
+    e._llm_priority = {}
     e.tracer = SimpleNamespace(emit=lambda event_type, **payload: emitted.append((event_type, payload)))
     e._frontier.add = lambda *a, **kw: None
     e._frontier.best_frontier = lambda exclude=None: None
@@ -244,3 +256,123 @@ async def test_take_turn_rejects_mismatched_title() -> None:
             },
         )
     ]
+
+
+def _transit_explorer(expander) -> ExplorerAgent:
+    from research_explorer.aco.frontier import SharedFrontier
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.expander = expander
+    e.state = AgentState(id="test-agent", pos="openalex:seed", budget=3, turn_count=1)
+    e._shared_visited = {"openalex:Wmeta"}
+    e._frontier = SharedFrontier()
+    e._frontier.add(["openalex:Wmeta"], source="openalex:seed", mode="ref")
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: None)
+    return e
+
+
+class _StubExpander:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    async def expand(self, node_id, paper=None, extracted=None, tracer=None):
+        from types import SimpleNamespace as Ns
+
+        self.calls.append((node_id, paper))
+        empty = Ns(node_ids=[], provider=None, fallback_used=False,
+                   discovered=0, rejected=0)
+        return Ns(node_id=node_id, incoming=Ns(**vars(empty), direction="incoming"),
+                  outgoing=Ns(**vars(empty), direction="outgoing"))
+
+
+async def test_metadata_transit_on_fetch_failure_uses_cached_summary() -> None:
+    e = _transit_explorer(_StubExpander())
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: PaperSummary(
+            id="Wmeta", title="Metadata only", provider="openalex", doi="10.1/meta"
+        ) if nid == "openalex:Wmeta" else None,
+    )
+    emitted: list[tuple] = []
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: emitted.append((event_type, payload)))
+
+    ok = await e._metadata_transit("openalex:Wmeta", "openalex:seed", "ref")
+
+    assert ok is True
+    assert e.state.budget == 2
+    assert "openalex:Wmeta" in e.state.metadata_transits
+    assert e.state.full_path == []
+    assert e.expander.calls[0][0] == "openalex:Wmeta"
+    assert e.expander.calls[0][1] is None
+    assert emitted[0][0] == "metadata_transit"
+    payload = emitted[0][1]
+    assert payload["paper_id"] == "openalex:Wmeta"
+    assert payload["reason"] == "full_text_unavailable"
+    assert payload["provider"] == "openalex"
+
+
+async def test_metadata_transit_fetched_paper_without_content() -> None:
+    e = _transit_explorer(_StubExpander())
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: PaperSummary(
+            id="Wmeta", title="Metadata only", provider="openalex", doi="10.1/meta"
+        ) if nid == "openalex:Wmeta" else None,
+    )
+    emitted: list[tuple] = []
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: emitted.append((event_type, payload)))
+
+    paper = Paper(id="Wmeta", title="Metadata only", provider="openalex",
+                  doi="10.1/meta", fulltext=None, abstract=None)
+    ok = await e._metadata_transit("openalex:Wmeta", "openalex:seed", "ref", paper=paper)
+
+    assert ok is True
+    assert e.state.budget == 2
+    assert e.state.full_path == []
+    assert e.expander.calls[0][1] is paper
+    assert emitted[0][1]["reason"] == "metadata_only"
+    assert emitted[0][1]["mode"] == "ref"
+    assert emitted[0][1]["src"] == "openalex:seed"
+
+
+async def test_metadata_transit_returns_false_without_expander_or_summary() -> None:
+    e = _transit_explorer(None)
+    e.graph = SimpleNamespace(get_paper_summary=lambda nid: None)
+
+    ok = await e._metadata_transit("openalex:Wmissing", "openalex:seed", "ref")
+
+    assert ok is False
+    assert e.state.budget == 3
+
+
+async def test_metadata_transit_adds_expanded_neighbors_to_frontier() -> None:
+    from types import SimpleNamespace as Ns
+
+    class RecordingExpander(_StubExpander):
+        async def expand(self, node_id, paper=None, extracted=None, tracer=None):
+            await super().expand(node_id, paper, extracted, tracer)
+            return Ns(
+                node_id=node_id,
+                incoming=Ns(direction="incoming", provider="openalex",
+                            fallback_used=False, discovered=1, rejected=0,
+                            node_ids=["openalex:Wcit1"]),
+                outgoing=Ns(direction="outgoing", provider="openalex",
+                            fallback_used=False, discovered=1, rejected=0,
+                            node_ids=["openalex:Wref1"]),
+            )
+
+    e = _transit_explorer(RecordingExpander())
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: PaperSummary(
+            id="Wmeta", title="Metadata only", provider="openalex", doi="10.1/meta"
+        ) if nid == "openalex:Wmeta" else None,
+    )
+
+    ok = await e._metadata_transit("openalex:Wmeta", "openalex:seed", "ref")
+
+    assert ok is True
+    assert {"openalex:Wcit1", "openalex:Wref1"} <= set(e._frontier.papers)
+    assert e._frontier.sources["openalex:Wcit1"] == ("openalex:Wmeta", "cites")
+    assert e._frontier.sources["openalex:Wref1"] == ("openalex:Wmeta", "ref")
+    refs, cits = e.state.local_neighbors("openalex:Wmeta")
+    assert set(refs) == {"openalex:Wref1"}
+    assert set(cits) == {"openalex:Wcit1"}
+    assert "openalex:Wmeta" not in e._frontier.papers

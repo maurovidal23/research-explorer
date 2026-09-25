@@ -13,6 +13,7 @@ class PaperSummary(BaseModel):
 
     id: str = Field(description="Native provider ID (e.g. S2 paperId, OpenAlex W-id, PMID)")
     doi: str | None = None
+    arxiv_id: str | None = None
     title: str
     year: int | None = None
     authors: list[str] = Field(default_factory=list)

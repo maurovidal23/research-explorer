@@ -125,7 +125,7 @@ class Scheduler:
             agent_paths.append(
                 AgentPath(edges=edges, delta_q=agent.state.delta_q, state=agent.state)
             )
-            self._total_fetches += len(edges)
+            self._total_fetches += max(0, agent.state.delta_work)
 
             if edges:
                 log.info(

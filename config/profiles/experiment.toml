@@ -28,7 +28,6 @@ epsilon = 0.15
 tau_min = 0.1
 tau_max = 10.0
 lambda_elite = 0.5
-tau_init = 1.0
 
 [quality]
 w_self = 0.25
@@ -40,13 +39,11 @@ peer_aggregation = "median"
 [direction]
 ref_weight = 0.8
 cites_weight = 0.2
-phase_directional = false
 
 [heuristica]
 w_sim = 0.6
 w_citas = 0.2
 w_recencia = 0.2
-use_rerank = false
 eta_llm = false
 
 [providers]

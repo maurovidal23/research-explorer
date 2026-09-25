@@ -26,7 +26,6 @@ epsilon = 0.1             # epsilon-greedy exploration
 tau_min = 0.1            # MMAS lower bound
 tau_max = 10.0           # MMAS upper bound
 lambda_elite = 0.5       # elitism deposit weight
-tau_init = 1.0           # initial pheromone
 
 [quality]
 w_self = 0.25
@@ -38,14 +37,14 @@ peer_aggregation = "median"   # "median" | "reputation"
 [direction]
 ref_weight = 0.7          # favor fundamentals (references)
 cites_weight = 0.3       # impact (citants)
-phase_directional = false
 
 [heuristica]
 w_sim = 0.6              # embedding similarity weight
 w_citas = 0.2            # citation count weight
 w_recencia = 0.2         # recency weight
-use_rerank = true        # use NaN reranker to refine candidate ranking
-eta_llm = false          # use pure embedding for eta (cheap); true = LLM virgin (costly)
+w_confidence = 0.1       # provider/verification confidence weight
+w_llm = 0.2              # LLM-priority weight (used only when eta_llm = true)
+eta_llm = false          # false = pure components (cheap); true = include LLM priority
 
 [providers]
 default = "arxiv"
@@ -91,6 +90,20 @@ theta = 5.0
 [scheduler]
 gamma = 0.5              # frontier expected-value weight
 delta = 0.3             # remaining-budget weight
+
+[resolution]
+enabled = false           # opt-in: canonical cross-provider expansion of graph traversal
+primary = "openalex"      # primary source for incoming cited-by + outgoing referenced-works
+fallbacks = ["semantic_scholar"]   # fallback/enrichment when the primary yields nothing
+incoming_enabled = true
+outgoing_enabled = true
+incoming_limit = 50       # max verified incoming neighbors per node
+outgoing_limit = 50       # max verified outgoing neighbors per node
+title_search_limit = 5    # candidates fetched per title-only verification
+min_title_similarity = 0.82
+min_author_overlap = 0.34
+min_confidence = 0.75
+year_tolerance = 2
 
 [storage]
 db_path = "data/explorer.db"

@@ -109,6 +109,26 @@ class OpenAlexProvider(ResilientProvider):
             return []
         return [self._parse_summary(w) for w in data.get("results", [])]
 
+    async def get_works_batch(self, openalex_ids: list[str], limit: int = 50) -> list[PaperSummary]:
+        """Fetch metadata for a batch of OpenAlex IDs in a single request."""
+        ids: list[str] = []
+        for raw in openalex_ids[:limit]:
+            wid = raw.replace("https://openalex.org/", "")
+            if wid and wid not in ids:
+                ids.append(wid)
+        if not ids:
+            return []
+        data = await self.get_json(
+            "/works",
+            filter=f"ids.openalex:{'|'.join(ids)}",
+            per_page=len(ids),
+            select=SUMMARY_SELECT,
+            mailto="research@example.com",
+        )
+        if not data or not isinstance(data, dict):
+            return []
+        return [self._parse_summary(w) for w in data.get("results", [])]
+
     async def get_abstract(self, paper_id: str) -> str | None:
         oid = self._format_id(paper_id, "auto")
         data = await self.get_json(

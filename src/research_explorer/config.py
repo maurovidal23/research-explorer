@@ -55,7 +55,6 @@ class ACOConfig:
     tau_min: float = 0.1
     tau_max: float = 10.0
     lambda_elite: float = 0.5
-    tau_init: float = 1.0
 
 
 @dataclass
@@ -71,7 +70,6 @@ class QualityConfig:
 class DirectionConfig:
     ref_weight: float = 0.7
     cites_weight: float = 0.3
-    phase_directional: bool = False  # si True, varía pesos por fase global
 
 
 @dataclass
@@ -79,8 +77,9 @@ class HeuristicaConfig:
     w_sim: float = 0.6
     w_citas: float = 0.2
     w_recencia: float = 0.2
-    use_rerank: bool = True
-    eta_llm: bool = False  # si True, usa LLM virgen para η (costoso)
+    w_confidence: float = 0.1
+    w_llm: float = 0.2
+    eta_llm: bool = False  # si True, incluye la prioridad LLM en η (costoso)
 
 
 @dataclass
@@ -97,6 +96,22 @@ class ProvidersConfig:
     default: str = "semantic_scholar"
     active: list[str] = field(default_factory=lambda: ["semantic_scholar", "openalex", "pubmed", "arxiv"])
     entries: dict[str, ProviderEntry] = field(default_factory=dict)
+
+
+@dataclass
+class ResolutionConfig:
+    enabled: bool = False
+    primary: str = "openalex"
+    fallbacks: list[str] = field(default_factory=lambda: ["semantic_scholar"])
+    incoming_enabled: bool = True
+    outgoing_enabled: bool = True
+    incoming_limit: int = 50
+    outgoing_limit: int = 50
+    title_search_limit: int = 5
+    min_title_similarity: float = 0.82
+    min_author_overlap: float = 0.34
+    min_confidence: float = 0.75
+    year_tolerance: int = 2
 
 
 @dataclass
@@ -134,6 +149,7 @@ class Config:
     direction: DirectionConfig = field(default_factory=DirectionConfig)
     heuristica: HeuristicaConfig = field(default_factory=HeuristicaConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
+    resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
@@ -214,7 +230,6 @@ def load_config(path: str | Path) -> Config:
             tau_min=aco.get("tau_min", cfg.aco.tau_min),
             tau_max=aco.get("tau_max", cfg.aco.tau_max),
             lambda_elite=aco.get("lambda_elite", cfg.aco.lambda_elite),
-            tau_init=aco.get("tau_init", cfg.aco.tau_init),
         )
 
     if "quality" in data:
@@ -232,7 +247,6 @@ def load_config(path: str | Path) -> Config:
         cfg.direction = DirectionConfig(
             ref_weight=d.get("ref_weight", cfg.direction.ref_weight),
             cites_weight=d.get("cites_weight", cfg.direction.cites_weight),
-            phase_directional=d.get("phase_directional", cfg.direction.phase_directional),
         )
 
     if "heuristica" in data:
@@ -241,7 +255,8 @@ def load_config(path: str | Path) -> Config:
             w_sim=h.get("w_sim", cfg.heuristica.w_sim),
             w_citas=h.get("w_citas", cfg.heuristica.w_citas),
             w_recencia=h.get("w_recencia", cfg.heuristica.w_recencia),
-            use_rerank=h.get("use_rerank", cfg.heuristica.use_rerank),
+            w_confidence=h.get("w_confidence", cfg.heuristica.w_confidence),
+            w_llm=h.get("w_llm", cfg.heuristica.w_llm),
             eta_llm=h.get("eta_llm", cfg.heuristica.eta_llm),
         )
 
@@ -253,6 +268,23 @@ def load_config(path: str | Path) -> Config:
             entries=_load_provider_entries(
                 {k: v for k, v in p.items() if k not in ("default", "active")}
             ),
+        )
+
+    if "resolution" in data:
+        r = data["resolution"]
+        cfg.resolution = ResolutionConfig(
+            enabled=r.get("enabled", cfg.resolution.enabled),
+            primary=r.get("primary", cfg.resolution.primary),
+            fallbacks=r.get("fallbacks", cfg.resolution.fallbacks),
+            incoming_enabled=r.get("incoming_enabled", cfg.resolution.incoming_enabled),
+            outgoing_enabled=r.get("outgoing_enabled", cfg.resolution.outgoing_enabled),
+            incoming_limit=r.get("incoming_limit", cfg.resolution.incoming_limit),
+            outgoing_limit=r.get("outgoing_limit", cfg.resolution.outgoing_limit),
+            title_search_limit=r.get("title_search_limit", cfg.resolution.title_search_limit),
+            min_title_similarity=r.get("min_title_similarity", cfg.resolution.min_title_similarity),
+            min_author_overlap=r.get("min_author_overlap", cfg.resolution.min_author_overlap),
+            min_confidence=r.get("min_confidence", cfg.resolution.min_confidence),
+            year_tolerance=r.get("year_tolerance", cfg.resolution.year_tolerance),
         )
 
     if "budget" in data:

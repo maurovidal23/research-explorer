@@ -18,7 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from research_explorer.logging_setup import get_logger
-from research_explorer.replay.models import DetailedEvaluation
+from research_explorer.replay.models import (
+    CandidateScore,
+    CandidateSelection,
+    DetailedEvaluation,
+)
 
 log = get_logger("replay.trace")
 
@@ -334,3 +338,9 @@ class RunTracer:
         artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
         self.emit("artifact_saved", artifact_id=artifact_id, name=name, kind=kind)
         return artifact_id
+
+    def record_candidate_score(self, score: CandidateScore) -> int:
+        return self.emit("candidate_score", **score.model_dump_payload())
+
+    def record_candidate_selected(self, selection: CandidateSelection) -> int:
+        return self.emit("candidate_selected", **selection.model_dump_payload())

@@ -1,8 +1,11 @@
 """Shared frontier — the colony-wide pool of candidate papers.
 
-All agents pick from the same shared frontier (best-first search by LLM score).
-This prevents agents from blocking each other when they discover the same seed
-neighbors. The shared_visited set ensures no two agents explore the same paper.
+All agents pick from the same shared frontier. To avoid two agents fetching
+the same candidate concurrently, a frontier node carries a claim/lease: an
+agent claims a node for the duration of its fetch and releases it afterwards.
+Claiming a node only blocks it during the concurrent window — it does not
+remove the node from the frontier and it does not erase the already-discovered
+neighbor paths that hang off it, so reusable paths survive.
 
 Private per agent: narrative, pheromone, local graph edges (for structural metrics).
 Shared across colony: frontier (candidates), visited set (claimed papers).
@@ -15,11 +18,12 @@ from dataclasses import dataclass, field
 
 @dataclass
 class SharedFrontier:
-    """Colony-wide pool of candidate papers with LLM evaluation scores."""
+    """Colony-wide pool of candidate papers with transition-relevant factors."""
 
     papers: list[str] = field(default_factory=list)
     scores: dict[str, float] = field(default_factory=dict)
     sources: dict[str, tuple[str, str]] = field(default_factory=dict)
+    claims: dict[str, str | None] = field(default_factory=dict)
 
     def add(
         self,
@@ -40,26 +44,57 @@ class SharedFrontier:
             self.papers.remove(paper_id)
         self.scores.pop(paper_id, None)
         self.sources.pop(paper_id, None)
+        self.claims.pop(paper_id, None)
 
     def set_score(self, paper_id: str, score: float) -> None:
-        """Set the LLM evaluation score for a frontier paper."""
+        """Set the eta value for a frontier paper."""
         if paper_id in self.papers:
             self.scores[paper_id] = score
 
     def unevaluated(self) -> list[str]:
-        """Return frontier papers that haven't been LLM-evaluated yet."""
+        """Return frontier papers that haven't been eta-evaluated yet."""
         return [pid for pid in self.papers if pid not in self.scores]
 
-    def best(self, exclude: set[str] | None = None) -> str | None:
-        """Return the highest-scored paper, excluding the given set."""
-        if not self.papers:
-            return None
+    # ---- Claims -----------------------------------------------------------
+
+    def claim_for(self, paper_id: str, agent: str) -> bool:
+        """Claim ``paper_id`` for ``agent``. Returns True if acquired."""
+        if paper_id not in self.papers:
+            return False
+        owner = self.claims.get(paper_id)
+        if owner is None or owner == agent:
+            self.claims[paper_id] = agent
+            return True
+        return False
+
+    def release(self, paper_id: str, agent: str) -> None:
+        """Release a claim held by ``agent`` (no-op otherwise)."""
+        if self.claims.get(paper_id) == agent:
+            del self.claims[paper_id]
+
+    def is_claimed(self, paper_id: str) -> bool:
+        return paper_id in self.claims
+
+    def claimed_by(self, paper_id: str) -> str | None:
+        return self.claims.get(paper_id)
+
+    def eligible(self, exclude: set[str] | None = None) -> list[str]:
+        """Frontier papers that are neither visited nor claimed."""
         exclude = exclude or set()
+        return [
+            pid
+            for pid in self.papers
+            if pid not in exclude and not self.is_claimed(pid)
+        ]
+
+    def best(self, exclude: set[str] | None = None) -> str | None:
+        """Return the highest-eta paper among eligible candidates."""
+        eligible = self.eligible(exclude)
+        if not eligible:
+            return None
         best_id: str | None = None
         best_score = -1.0
-        for pid in self.papers:
-            if pid in exclude:
-                continue
+        for pid in eligible:
             score = self.scores.get(pid, 0.0)
             if score > best_score:
                 best_score = score

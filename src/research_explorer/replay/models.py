@@ -88,3 +88,63 @@ class DetailedEvaluation(BaseModel):
             "J": self.virgin_judge.score,
             "R": self.structural.r,
         }
+
+
+class CandidateScore(BaseModel):
+    """The eta decomposition recorded when a frontier candidate is scored.
+
+    Retains every normalized component plus the weights that combined them into
+    the eta value, so the frontier ranking is fully auditable. This is the
+    payload persisted by the ``candidate_score`` trace event (computed once per
+    candidate and reused across agents via the shared frontier).
+    """
+
+    paper_id: str
+    agent_id: str
+    provider: str = Field(default="", description="Provider that resolved/served the node")
+    components: dict[str, float] = Field(
+        default_factory=dict,
+        description="Normalized components: sim, citations, recency, confidence, llm",
+    )
+    weights: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-component weights used (w_sim, w_citas, w_recencia, w_confidence, w_llm)",
+    )
+    eta: float = Field(default=0.0, description="Final combined eta value in [0, 1]")
+    llm_used: bool = Field(default=False, description="Whether the LLM priority component was active")
+    source: str = Field(default="", description="Node that revealed this candidate (src)")
+    mode: str = Field(default="", description="Discovery mode: ref | cites")
+    timestamp: str = Field(default_factory=utc_now)
+
+    def model_dump_payload(self) -> dict:
+        return self.model_dump(mode="json")
+
+
+class CandidateSelection(BaseModel):
+    """The full transition score for a chosen frontier candidate.
+
+    Retains tau, alpha/beta, the direction/caste modifier, the final weight and
+    its normalized probability, the epsilon branch taken, and the source of the
+    node — so the exact rule that picked the next move is reproducible. This is
+    the payload persisted by the ``candidate_selected`` trace event.
+    """
+
+    agent_id: str
+    paper_id: str
+    src: str = Field(default="", description="Node that revealed the candidate")
+    mode: str = Field(default="", description="Discovery mode: ref | cites")
+    caste: str = Field(default="mixto")
+    dir_modifier: float = Field(default=0.0, description="Reference/cited-by weight for this mode")
+    tau: float = Field(default=0.0, description="Private pheromone on (src, paper, mode)")
+    alpha: float = Field(default=0.0)
+    beta: float = Field(default=0.0)
+    eta: float = Field(default=0.0, description="Combined heuristic for the candidate")
+    final_weight: float = Field(default=0.0, description="tau^alpha * eta^beta * dir_modifier")
+    probability: float = Field(default=0.0, description="final_weight / sum(weights)")
+    epsilon_branch: bool = Field(default=False)
+    chosen: bool = Field(default=True, description="Whether this candidate was actually picked")
+    rationale: str = Field(default="", description="Concise human-readable rationale")
+    timestamp: str = Field(default_factory=utc_now)
+
+    def model_dump_payload(self) -> dict:
+        return self.model_dump(mode="json")
