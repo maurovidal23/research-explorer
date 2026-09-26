@@ -168,7 +168,7 @@ class Orchestrator:
             normalized=seed_ref.value,
             provider=seed_provider.name,
         )
-        seed_paper = await seed_provider.get_paper(seed_ref.value)
+        seed_paper = await seed_provider.get_paper(seed_ref.fetch_value)
         if seed_paper is None:
             raise RuntimeError(f"Could not fetch seed paper: {seed_paper_id}")
         self.graph.cache_paper(seed_paper)

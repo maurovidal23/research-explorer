@@ -91,6 +91,7 @@ class ArxivProvider(ResilientProvider):
             cache_ttl=86400,
             cache_dir=cache_dir,
             api_key=None,
+            extra_headers={"Accept": "application/atom+xml"},
         )
         self.html_client = httpx.AsyncClient(
             base_url="https://arxiv.org",

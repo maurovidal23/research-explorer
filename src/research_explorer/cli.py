@@ -89,6 +89,7 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         GraphEvidenceGateway,
         GreedyPolicy,
         KernelOptions,
+        LLMReferenceMapper,
         LLMResearchAgent,
         LLMRubricEvaluator,
         ResearchKernel,
@@ -121,7 +122,24 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         max_concurrent=cfg.llm.max_concurrent,
         rpm=cfg.llm.rpm,
     )
-    gateway = GraphEvidenceGateway(graph, providers, seed_provider.name)
+    doi_provider = next(
+        (name for name in ("openalex", "semantic_scholar") if name in providers),
+        None,
+    )
+    reference_mapper = LLMReferenceMapper(
+        llm,
+        model=cfg.llm.explorer_model,
+        max_tokens=rk.output_reserve,
+        doi_provider=doi_provider,
+    )
+    gateway = GraphEvidenceGateway(
+        graph,
+        providers,
+        seed_provider.name,
+        reference_mapper=reference_mapper,
+        fulltext_max_chars=cfg.llm.fulltext_max_chars,
+        question=question,
+    )
     policy = GreedyPolicy(seed=rk.seed)
     agent = LLMResearchAgent(llm, model=cfg.llm.explorer_model, max_tokens=rk.output_reserve)
     rubric = (
@@ -151,7 +169,7 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
     )
     objective = ResearchObjective(
         run_id=uuid.uuid4().hex[:12],
-        seed_paper_id=seed_ref.value,
+        seed_paper_id=seed_ref.fetch_value,
         question=question,
         budget=BudgetState(
             max_fetches=rk.max_fetches,

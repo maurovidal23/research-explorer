@@ -2,7 +2,9 @@
 
 from research_explorer.research.agent import (
     AgentOutputError,
+    LLMReferenceMapper,
     LLMResearchAgent,
+    ReferenceMapper,
     ResearchAgent,
     parse_agent_brief,
 )
@@ -64,11 +66,13 @@ __all__ = [
     "GraphEvidenceGateway",
     "GreedyPolicy",
     "KernelOptions",
+    "LLMReferenceMapper",
     "LLMResearchAgent",
     "LLMRubricEvaluator",
     "OpenQuestion",
     "OpenQuestionStatus",
     "ProviderOutcome",
+    "ReferenceMapper",
     "ResearchAction",
     "ResearchAgent",
     "ResearchEvaluation",

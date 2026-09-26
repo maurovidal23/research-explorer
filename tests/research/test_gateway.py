@@ -16,6 +16,7 @@ from research_explorer.research.models import ProviderOutcome
 
 class FakeProvider:
     name = "openalex"
+    supports_fulltext = False
 
     def __init__(self, *, result: Paper | None = None, error: Exception | None = None) -> None:
         self.result = result
@@ -40,6 +41,37 @@ class FakeProvider:
 
     async def aclose(self) -> None:
         return None
+
+
+class FulltextProvider(FakeProvider):
+    name = "arxiv"
+    supports_fulltext = True
+
+    async def get_fulltext_and_refs(
+        self, native_id: str, max_chars: int, ref_limit: int
+    ) -> tuple[str, list[str]]:
+        return "full paper content", ["Reference with arXiv:2301.00002"]
+
+
+class FakeReferenceMapper:
+    async def map_references(
+        self, paper: Paper, question: str, limit: int
+    ) -> list[PaperSummary]:
+        assert paper.fulltext == "full paper content"
+        assert paper.ref_entries == ["Reference with arXiv:2301.00002"]
+        assert question == "research question"
+        return [
+            PaperSummary(
+                id="2301.00002", title="Mapped reference", provider="arxiv"
+            )
+        ]
+
+
+class FailingReferenceMapper:
+    async def map_references(
+        self, paper: Paper, question: str, limit: int
+    ) -> list[PaperSummary]:
+        raise ValueError("truncated JSON")
 
 
 @pytest.fixture
@@ -104,3 +136,41 @@ async def test_paper_exists_reads_graph_store(graph: GraphStore) -> None:
     assert gateway.paper_exists("openalex:missing") is False
     graph.cache_paper(_paper())
     assert gateway.paper_exists("openalex:W1") is True
+
+
+async def test_fulltext_bibliography_builds_arxiv_candidates(
+    graph: GraphStore,
+) -> None:
+    paper = Paper(id="2301.00001", provider="arxiv", title="Seed")
+    provider = FulltextProvider(result=paper)
+    gateway = GraphEvidenceGateway(
+        graph,
+        {"arxiv": provider},
+        "arxiv",
+        reference_mapper=FakeReferenceMapper(),
+        question="research question",
+    )
+    acquisition = await gateway.acquire("arxiv:2301.00001", turn=1)
+    assert acquisition.outcome is ProviderOutcome.SUCCESS
+    assert acquisition.content == "full paper content"
+    assert [candidate.paper_id for candidate in acquisition.candidates] == [
+        "arxiv:2301.00002"
+    ]
+
+
+async def test_explicit_arxiv_id_survives_mapping_failure(
+    graph: GraphStore,
+) -> None:
+    paper = Paper(id="2301.00001", provider="arxiv", title="Seed")
+    provider = FulltextProvider(result=paper)
+    gateway = GraphEvidenceGateway(
+        graph,
+        {"arxiv": provider},
+        "arxiv",
+        reference_mapper=FailingReferenceMapper(),
+    )
+    acquisition = await gateway.acquire("arxiv:2301.00001", turn=1)
+    assert acquisition.outcome is ProviderOutcome.SUCCESS
+    assert [candidate.paper_id for candidate in acquisition.candidates] == [
+        "arxiv:2301.00002"
+    ]

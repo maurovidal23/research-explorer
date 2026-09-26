@@ -28,6 +28,14 @@ def test_detect_arxiv_new_style_with_version() -> None:
     ref = detect_seed("arXiv:2301.00001v2")
     assert ref.kind is SeedKind.ARXIV
     assert ref.value == "2301.00001"
+    assert ref.fetch_value == "2301.00001v2"
+
+
+def test_detect_arxiv_url_preserves_version_for_fetch() -> None:
+    ref = detect_seed("https://arxiv.org/pdf/2301.00001v3.pdf")
+    assert ref.kind is SeedKind.ARXIV
+    assert ref.value == "2301.00001"
+    assert ref.fetch_value == "2301.00001v3"
 
 
 def test_detect_native_id() -> None:

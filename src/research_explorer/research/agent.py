@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from research_explorer.agents.llm_client import LLMClient
+from research_explorer.graph.models import Paper, PaperSummary
 from research_explorer.research.context import PromptBundle
 from research_explorer.research.models import (
     AgentBrief,
@@ -30,6 +31,12 @@ class ResearchAgent(Protocol):
     async def propose_brief(
         self, objective: ResearchObjective, state: ResearchState, prompt: PromptBundle
     ) -> AgentBrief: ...
+
+
+class ReferenceMapper(Protocol):
+    async def map_references(
+        self, paper: Paper, question: str, limit: int
+    ) -> list[PaperSummary]: ...
 
 
 def parse_agent_brief(raw: Any) -> AgentBrief:
@@ -107,3 +114,101 @@ class LLMResearchAgent:
         except Exception as exc:  # transport/decoding failures are contained by the caller
             raise AgentOutputError(str(exc)) from exc
         return parse_agent_brief(raw)
+
+
+class LLMReferenceMapper:
+    def __init__(
+        self,
+        llm: LLMClient,
+        model: str = "qwen3.6",
+        max_tokens: int = 2000,
+        doi_provider: str | None = None,
+    ) -> None:
+        self.llm = llm
+        self.model = model
+        self.max_tokens = max_tokens
+        self.doi_provider = doi_provider
+
+    async def map_references(
+        self, paper: Paper, question: str, limit: int
+    ) -> list[PaperSummary]:
+        bibliography = paper.ref_entries[:limit]
+        if not bibliography:
+            return []
+        raw = await self.llm.chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract only real works present in the supplied bibliography. "
+                        "Return a JSON object with a references array. Each item may contain "
+                        "title, authors, year, arxiv_id, and doi. Never invent identifiers."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Research question: {question}\n"
+                        f"Source paper: {paper.title}\n"
+                        f"Bibliography:\n" + "\n".join(bibliography)
+                    ),
+                },
+            ],
+            model=self.model,
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+        )
+        entries = raw.get("references") if isinstance(raw, dict) else None
+        if not isinstance(entries, list):
+            return []
+        summaries: list[PaperSummary] = []
+        for entry in entries:
+            summary = self._parse_reference(entry)
+            if summary is not None:
+                summaries.append(summary)
+            if len(summaries) >= limit:
+                break
+        return summaries
+
+    def _parse_reference(self, entry: Any) -> PaperSummary | None:
+        if not isinstance(entry, dict):
+            return None
+        title = entry.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return None
+        authors = entry.get("authors")
+        if isinstance(authors, str):
+            authors = [part.strip() for part in authors.split(",") if part.strip()]
+        if not isinstance(authors, list):
+            authors = []
+        authors = [author for author in authors if isinstance(author, str)]
+        year = entry.get("year")
+        if isinstance(year, str) and year.isdigit():
+            year = int(year)
+        if not isinstance(year, int):
+            year = None
+        arxiv_id = entry.get("arxiv_id")
+        if isinstance(arxiv_id, str) and arxiv_id.strip():
+            native = arxiv_id.strip()
+            if native.lower().startswith("arxiv:"):
+                native = native.split(":", 1)[1]
+            return PaperSummary(
+                id=native,
+                arxiv_id=native,
+                title=title.strip(),
+                year=year,
+                authors=authors,
+                provider="arxiv",
+            )
+        doi = entry.get("doi")
+        if self.doi_provider and isinstance(doi, str) and doi.strip():
+            native = doi.strip()
+            return PaperSummary(
+                id=native,
+                doi=native,
+                title=title.strip(),
+                year=year,
+                authors=authors,
+                provider=self.doi_provider,
+            )
+        return None

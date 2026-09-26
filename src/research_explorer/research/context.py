@@ -115,6 +115,7 @@ def build_agent_prompt(
     selected_paper_id: str,
     selected_title: str,
     *,
+    selected_content: str = "",
     input_target: int = 6000,
     output_reserve: int = 1500,
     max_claims: int = 20,
@@ -141,13 +142,18 @@ def build_agent_prompt(
     if len(evidence_ids) > 50:
         omitted_ids.extend(evidence_ids[50:])
 
+    content_limit = max(1000, input_target * 2)
     context_block = {
         "research_question": objective.question,
         "scope": objective.scope,
         "thesis": state.notebook.thesis,
         "claims": claims,
         "open_questions": questions,
-        "selected_source": {"paper_id": selected_paper_id, "title": selected_title},
+        "selected_source": {
+            "paper_id": selected_paper_id,
+            "title": selected_title,
+            "content": selected_content[:content_limit],
+        },
         "evidence_papers": evidence_ids[:50],
         "planned_actions": [a.model_dump(mode="json") for a in state.notebook.planned_actions],
     }

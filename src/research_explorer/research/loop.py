@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider, TransientProviderError
 from research_explorer.providers.routing import provider_by_name
 from research_explorer.redaction import redact_secrets
-from research_explorer.research.agent import AgentOutputError, ResearchAgent
+from research_explorer.research.agent import AgentOutputError, ReferenceMapper, ResearchAgent
 from research_explorer.research.answer import build_final_answer
 from research_explorer.research.context import approx_tokens, build_agent_prompt
 from research_explorer.research.evaluator import CompositeEvaluator
@@ -48,6 +49,12 @@ from research_explorer.research.store import ResearchStore
 
 log = get_logger("research.kernel")
 
+_ARXIV_BIB_ID = re.compile(
+    r"arxiv\s*:?\s*([a-z-]+(?:\.[a-z-]+)?/\d{7}(?:v\d+)?|\d{4}\.\d{4,5}(?:v\d+)?)",
+    re.IGNORECASE,
+)
+_DOI_BIB_ID = re.compile(r"(?:doi\s*:?\s*|https?://doi\.org/)(10\.\d{4,9}/\S+)", re.IGNORECASE)
+
 
 @dataclass
 class KernelOptions:
@@ -70,6 +77,7 @@ class Acquisition:
     provider: str = ""
     title: str = ""
     abstract: str = ""
+    content: str = ""
     evidence: EvidenceRef | None = None
     candidates: list[CandidateAction] = field(default_factory=list)
 
@@ -99,11 +107,17 @@ class GraphEvidenceGateway:
         default_provider_name: str,
         *,
         ref_limit: int = 20,
+        reference_mapper: ReferenceMapper | None = None,
+        fulltext_max_chars: int = 100000,
+        question: str = "",
     ) -> None:
         self.graph = graph
         self.providers = providers
         self.default_provider_name = default_provider_name
         self.ref_limit = ref_limit
+        self.reference_mapper = reference_mapper
+        self.fulltext_max_chars = fulltext_max_chars
+        self.question = question
 
     def _provider_for(self, paper_id: str) -> ResilientProvider:
         provider_name, _ = parse_normalized_id(paper_id)
@@ -136,6 +150,56 @@ class GraphEvidenceGateway:
         if paper is None:
             return Acquisition(paper_id, ProviderOutcome.ABSENT, provider=provider.name)
 
+        extracted: list[PaperSummary] = []
+        if (
+            not paper.references
+            and not paper.citations
+            and getattr(provider, "supports_fulltext", False)
+        ):
+            try:
+                async with provider.strict_outcomes():
+                    fulltext = await provider.get_fulltext_and_refs(
+                        native,
+                        max_chars=self.fulltext_max_chars,
+                        ref_limit=self.ref_limit,
+                    )
+            except TransientProviderError as exc:
+                return Acquisition(
+                    paper_id, ProviderOutcome.TRANSIENT, provider=exc.provider
+                )
+            except Exception as exc:
+                log.warning(
+                    "kernel_fulltext_error", paper_id=paper_id, error=str(exc)
+                )
+                return Acquisition(
+                    paper_id, ProviderOutcome.TRANSIENT, provider=provider.name
+                )
+            if fulltext is not None:
+                paper.fulltext, paper.ref_entries = fulltext
+                extracted = self._explicit_bibliography_references(paper.ref_entries)
+                if self.reference_mapper is not None:
+                    try:
+                        mapped = await self.reference_mapper.map_references(
+                            paper, self.question, self.ref_limit
+                        )
+                        by_id = {
+                            normalize_id(summary.provider, summary.id): summary
+                            for summary in extracted
+                        }
+                        by_id.update(
+                            {
+                                normalize_id(summary.provider, summary.id): summary
+                                for summary in mapped
+                            }
+                        )
+                        extracted = list(by_id.values())
+                    except Exception as exc:
+                        log.warning(
+                            "kernel_reference_mapping_failed",
+                            paper_id=paper_id,
+                            error=str(exc),
+                        )
+
         self.graph.cache_paper(paper)
         nid = normalize_id(paper.provider, paper.id)
         evidence = EvidenceRef(
@@ -149,14 +213,54 @@ class GraphEvidenceGateway:
             provider=provider.name,
             title=paper.title,
             abstract=paper.abstract or "",
+            content=paper.fulltext or paper.abstract or "",
             evidence=evidence,
-            candidates=self._candidates(paper),
+            candidates=self._candidates(paper, extracted),
         )
 
-    def _candidates(self, paper: Paper) -> list[CandidateAction]:
+    def _explicit_bibliography_references(
+        self, entries: list[str]
+    ) -> list[PaperSummary]:
+        summaries: list[PaperSummary] = []
+        doi_provider = next(
+            (name for name in ("openalex", "semantic_scholar") if name in self.providers),
+            None,
+        )
+        seen: set[str] = set()
+        for entry in entries[: self.ref_limit]:
+            arxiv_match = _ARXIV_BIB_ID.search(entry)
+            if arxiv_match is not None:
+                native = arxiv_match.group(1).rstrip(".,;)")
+                paper_id = normalize_id("arxiv", native)
+                if paper_id not in seen:
+                    seen.add(paper_id)
+                    summaries.append(
+                        PaperSummary(id=native, title=entry, provider="arxiv")
+                    )
+                continue
+            doi_match = _DOI_BIB_ID.search(entry)
+            if doi_match is not None and doi_provider is not None:
+                native = doi_match.group(1).rstrip(".,;)")
+                paper_id = normalize_id(doi_provider, native)
+                if paper_id not in seen:
+                    seen.add(paper_id)
+                    summaries.append(
+                        PaperSummary(
+                            id=native,
+                            doi=native,
+                            title=entry,
+                            provider=doi_provider,
+                        )
+                    )
+        return summaries
+
+    def _candidates(
+        self, paper: Paper, extracted: list[PaperSummary] | None = None
+    ) -> list[CandidateAction]:
         nid = normalize_id(paper.provider, paper.id)
         candidates: list[CandidateAction] = []
-        for summary in list(paper.references)[: self.ref_limit]:
+        references = list(paper.references) or list(extracted or [])
+        for summary in references[: self.ref_limit]:
             candidates.append(self._candidate(summary, nid, "ref"))
         for summary in list(paper.citations)[: self.ref_limit]:
             candidates.append(self._candidate(summary, nid, "cites"))
@@ -334,6 +438,7 @@ class ResearchKernel:
                 state,
                 acquisition.paper_id,
                 acquisition.title,
+                selected_content=acquisition.content or acquisition.abstract,
                 input_target=opts.context_input_target,
                 output_reserve=opts.output_reserve,
             )

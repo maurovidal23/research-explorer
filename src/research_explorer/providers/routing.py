@@ -10,6 +10,7 @@ unrelated provider or construct an unused one.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -37,10 +38,20 @@ class SeedRef:
     kind: SeedKind
     value: str
     raw: str
+    fetch_value: str
 
 
 DOI_CAPABLE = ("openalex", "semantic_scholar")
 ARXIV_CAPABLE = ("arxiv",)
+
+_ARXIV_FETCH_PREFIX = re.compile(
+    r"^(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/|^arxiv:", re.IGNORECASE
+)
+
+
+def _arxiv_fetch_value(raw: str) -> str:
+    value = _ARXIV_FETCH_PREFIX.sub("", re.sub(r"\s+", "", raw), count=1)
+    return value.removesuffix(".pdf")
 
 
 def detect_seed(seed: str) -> SeedRef:
@@ -48,11 +59,12 @@ def detect_seed(seed: str) -> SeedRef:
     raw = seed.strip()
     doi = normalize_doi(raw)
     if is_valid_doi(doi):
-        return SeedRef(SeedKind.DOI, doi, raw)
-    arxiv = normalize_arxiv(raw)
+        return SeedRef(SeedKind.DOI, doi, raw, doi)
+    arxiv_fetch = _arxiv_fetch_value(raw)
+    arxiv = normalize_arxiv(arxiv_fetch)
     if is_valid_arxiv(arxiv):
-        return SeedRef(SeedKind.ARXIV, arxiv, raw)
-    return SeedRef(SeedKind.NATIVE, raw, raw)
+        return SeedRef(SeedKind.ARXIV, arxiv, raw, arxiv_fetch)
+    return SeedRef(SeedKind.NATIVE, raw, raw, raw)
 
 
 def _first_enabled(
