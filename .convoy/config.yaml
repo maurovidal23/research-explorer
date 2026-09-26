@@ -1,0 +1,56 @@
+version: 1
+
+defaults:
+  model: nan/deepseek-v4-flash
+
+pipelines:
+  reliability-full-cycle:
+    description: "Implement entirely with NaN DeepSeek, then evaluate independently with NaN GLM 5.3 Flash and OpenAI GPT-5.6 Sol low until the verified score reaches 90."
+    steps:
+      - agent: implementer
+        model: nan/deepseek-v4-flash
+        advisor: false
+        reports: none
+      - agent: patterns
+        model: nan/deepseek-v4-flash
+        advisor: false
+      - agent: security
+        model: nan/deepseek-v4-flash
+        advisor: false
+      - agent: design
+        model: nan/deepseek-v4-flash
+        advisor: false
+      - agent: tests
+        model: nan/deepseek-v4-flash
+        advisor: false
+        reports: none
+      - goal:
+          target: 90
+          maxIterations: 5
+          plateau: 3
+          improve:
+            briefStep: fix
+            steps:
+              - agent: goal-fixer
+                name: fix
+                model: nan/deepseek-v4-flash
+                advisor: false
+                reports: none
+                diff: true
+                prdHistory: true
+          measure:
+            steps:
+              - parallel:
+                  - agent: quality-scorer
+                    name: score
+                    models: [nan/glm5.3-flash, openai/gpt-5.6-sol#low]
+                    reports: none
+                    diff: true
+                    prdHistory: true
+              - agent: quality-score-report
+                name: score-report
+                model: openai/gpt-5.6-sol#low
+                reports: [score]
+                verify: true
+                diff: true
+                prdHistory: true
