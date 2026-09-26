@@ -15,6 +15,7 @@ from research_explorer.research.loop import (
 )
 from research_explorer.research.models import (
     AgentBrief,
+    BudgetState,
     CandidateAction,
     ClaimMutation,
     ClaimStatus,
@@ -23,7 +24,6 @@ from research_explorer.research.models import (
     ProviderOutcome,
     ResearchObjective,
 )
-from research_explorer.research.models import BudgetState
 from research_explorer.research.policy import GreedyPolicy
 from research_explorer.research.store import ResearchStore
 

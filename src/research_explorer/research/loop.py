@@ -599,8 +599,9 @@ class ResearchKernel:
         output_refs: list[str] | None = None,
         tokens: int | None = None,
         fetches: int | None = None,
+        seconds: float | None = None,
     ) -> ResearchEvent:
-        return self.store.append_event(
+        event = self.store.append_event(
             state.objective.run_id,
             type,
             state=state,
@@ -610,7 +611,24 @@ class ResearchKernel:
             output_refs=output_refs,
             tokens=tokens,
             fetches=fetches,
+            seconds=seconds,
         )
+        outcome = None
+        if payload:
+            outcome = payload.get("classification") or payload.get("terminal_reason")
+        log.debug(
+            "research_event",
+            run_id=state.objective.run_id,
+            seq=event.seq,
+            turn=turn,
+            actor=event.actor,
+            event_type=type,
+            outcome=outcome,
+            tokens=tokens,
+            fetches=fetches,
+            seconds=seconds,
+        )
+        return event
 
 
 def paper_exists_from_graph(graph: GraphStore) -> Callable[[str], bool]:

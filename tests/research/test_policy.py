@@ -50,14 +50,14 @@ async def test_tie_break_is_seed_deterministic() -> None:
     second = await policy_b.select_actions(state, _candidates(), budget, SlotState())
     assert [a.paper_id for a in first] == [a.paper_id for a in second]
     # c is top; the remaining tie (a, b) is resolved consistently.
-    assert [a.paper_id for a in first][0] == "c"
+    assert next(a.paper_id for a in first) == "c"
 
 
 async def test_reason_codes_recorded_for_all_candidates() -> None:
     policy = GreedyPolicy(seed=0)
     await policy.select_actions(
         _state(visited=["c"]),
-        _candidates() + [CandidateAction(paper_id="d", score=0.0)],
+        [*_candidates(), CandidateAction(paper_id="d", score=0.0)],
         BudgetState(max_fetches=5),
         SlotState(),
     )

@@ -80,6 +80,7 @@ class GreedyPolicy:
             else:
                 reasons[candidate.paper_id] = "eligible"
                 eligible.append(candidate)
+        self.last_reasons = reasons
 
         rank = self._tie_rank(eligible)
         ordered = sorted(
