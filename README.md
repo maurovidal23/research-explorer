@@ -93,6 +93,15 @@ Configuración para Claude Desktop:
 Ver [`docs/model.md`](docs/model.md) para la formalización completa del modelo ACO
 multi-agente bidireccional.
 
+## Próxima arquitectura
+
+- [`docs/specs/research-control-system.md`](docs/specs/research-control-system.md) —
+  arquitectura objetivo, memoria, evaluación, optimización y replay.
+- [`docs/specs/research-kernel-mvp.md`](docs/specs/research-kernel-mvp.md) — primer corte
+  vertical implementable y sus criterios de aceptación.
+- [`docs/specs/research-experiment.md`](docs/specs/research-experiment.md) — protocolo para
+  comparar agentes, memoria y políticas bajo presupuestos equivalentes.
+
 ## Licencia
 
 MIT
