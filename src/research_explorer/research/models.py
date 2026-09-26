@@ -199,6 +199,10 @@ class RubricResult(BaseModel):
     contradictions: list[str] = Field(default_factory=list)
     recommended_questions: list[str] = Field(default_factory=list)
     error: str | None = None
+    # Raw judge output, carried to the controller so it can persist it as the
+    # evaluation's raw artifact. Excluded from state serialization to avoid
+    # duplicating the artifact inline; ``raw_artifact_ref`` is the durable link.
+    raw: str | None = Field(default=None, exclude=True)
 
 
 class ResearchEvaluation(BaseModel):

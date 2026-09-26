@@ -76,6 +76,17 @@ def test_arxiv_without_arxiv_provider_raises() -> None:
         route_seed_provider("2301.00001", providers)
 
 
+def test_arxiv_ignores_doi_seed_routing_order() -> None:
+    providers = _providers("openalex", "semantic_scholar", "arxiv")
+    provider, ref = route_seed_provider(
+        "2301.00001",
+        providers,
+        explicit_order=["openalex", "semantic_scholar"],
+    )
+    assert provider.name == "arxiv"
+    assert ref.kind is SeedKind.ARXIV
+
+
 def test_native_seed_uses_first_enabled() -> None:
     providers = _providers("pubmed", "arxiv")
     provider, ref = route_seed_provider("22595786", providers)

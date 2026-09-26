@@ -8,10 +8,12 @@ aborts the research run.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 
 from research_explorer.agents.llm_client import LLMClient
+from research_explorer.redaction import redact_secrets
 from research_explorer.research.context import RUBRIC_DIMENSIONS, build_evaluation_prompt
 from research_explorer.research.models import (
     ClaimStatus,
@@ -133,12 +135,19 @@ class LLMRubricEvaluator:
                 max_tokens=min(self.max_tokens, prompt.output_reserve or self.max_tokens),
             )
         except Exception as exc:
-            return RubricResult(ok=False, error=str(exc))
+            error = redact_secrets(str(exc))
+            raw_text = json.dumps({"error": error}, sort_keys=True)
+            return RubricResult(ok=False, error=error, raw=raw_text)
+        raw_text = redact_secrets(json.dumps(raw, sort_keys=True, default=str))
         if not isinstance(raw, dict):
-            return RubricResult(ok=False, error="evaluation output was not an object")
+            return RubricResult(
+                ok=False, error="evaluation output was not an object", raw=raw_text
+            )
         raw_scores = raw.get("dimension_scores")
         if not isinstance(raw_scores, dict):
-            return RubricResult(ok=False, error="missing dimension_scores object")
+            return RubricResult(
+                ok=False, error="missing dimension_scores object", raw=raw_text
+            )
         scores: dict[str, float] = {}
         for dimension in RUBRIC_DIMENSIONS:
             value = raw_scores.get(dimension)
@@ -146,7 +155,7 @@ class LLMRubricEvaluator:
                 continue
             scores[dimension] = max(0.0, min(1.0, float(value)))
         if not scores:
-            return RubricResult(ok=False, error="no valid dimension scores")
+            return RubricResult(ok=False, error="no valid dimension scores", raw=raw_text)
 
         def _str_list(value: object) -> list[str]:
             if not isinstance(value, list):
@@ -160,6 +169,7 @@ class LLMRubricEvaluator:
             unsupported_claims=_str_list(raw.get("unsupported_claims")),
             contradictions=_str_list(raw.get("contradictions")),
             recommended_questions=_str_list(raw.get("recommended_questions")),
+            raw=raw_text,
         )
 
 

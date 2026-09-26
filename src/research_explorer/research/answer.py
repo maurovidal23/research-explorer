@@ -28,7 +28,6 @@ def _cite(claim: Claim) -> str:
 def build_final_answer(
     objective: ResearchObjective,
     state: ResearchState,
-    paper_titles: dict[str, str] | None = None,
 ) -> FinalAnswer:
     supported: list[str] = []
     plausible: list[str] = []

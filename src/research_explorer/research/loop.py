@@ -20,6 +20,7 @@ from research_explorer.graph.models import Paper, PaperSummary, normalize_id, pa
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider, TransientProviderError
+from research_explorer.providers.routing import provider_by_name
 from research_explorer.redaction import redact_secrets
 from research_explorer.research.agent import AgentOutputError, ResearchAgent
 from research_explorer.research.answer import build_final_answer
@@ -106,7 +107,9 @@ class GraphEvidenceGateway:
 
     def _provider_for(self, paper_id: str) -> ResilientProvider:
         provider_name, _ = parse_normalized_id(paper_id)
-        return self.providers.get(provider_name) or self.providers[self.default_provider_name]
+        return provider_by_name(
+            self.providers, provider_name, self.default_provider_name
+        )
 
     def paper_exists(self, paper_id: str) -> bool:
         return self.graph.get_paper_summary(paper_id) is not None
@@ -203,7 +206,6 @@ class ResearchKernel:
         self,
         objective: ResearchObjective,
         cancel: asyncio.Event | None = None,
-        paper_titles: dict[str, str] | None = None,
     ) -> FinalAnswer:
         opts = self.options
         run_id = objective.run_id
@@ -259,7 +261,9 @@ class ResearchKernel:
                 turn=budget.turns_used + 1,
                 payload={"action": action.model_dump(mode="json")},
             )
+            fetch_start = time.monotonic()
             acquisition = await self.gateway.acquire(action.paper_id, budget.turns_used + 1)
+            fetch_seconds = time.monotonic() - fetch_start
             budget.fetches_used += 1
 
             if acquisition.outcome is ProviderOutcome.TRANSIENT:
@@ -269,6 +273,7 @@ class ResearchKernel:
                     "provider_failure",
                     turn=budget.turns_used + 1,
                     fetches=1,
+                    seconds=fetch_seconds,
                     payload={
                         "paper_id": action.paper_id,
                         "provider": acquisition.provider,
@@ -291,6 +296,7 @@ class ResearchKernel:
                     "evidence_absent",
                     turn=budget.turns_used + 1,
                     fetches=1,
+                    seconds=fetch_seconds,
                     payload={
                         "paper_id": action.paper_id,
                         "provider": acquisition.provider,
@@ -314,6 +320,7 @@ class ResearchKernel:
                 "evidence_acquired",
                 turn=budget.turns_used + 1,
                 fetches=1,
+                seconds=fetch_seconds,
                 output_refs=[acquisition.paper_id],
                 payload={
                     "paper_id": acquisition.paper_id,
@@ -360,14 +367,30 @@ class ResearchKernel:
             self._apply_brief(state, brief, budget.turns_used + 1)
             budget.turns_used += 1
 
-            if opts.evaluator_enabled:
+            should_evaluate = (
+                opts.evaluator_enabled
+                and opts.eval_interval > 0
+                and budget.turns_used % opts.eval_interval == 0
+            )
+            if should_evaluate:
+                eval_start = time.monotonic()
                 evaluation = await self.evaluator.evaluate(objective, state)
+                eval_seconds = time.monotonic() - eval_start
+                if evaluation.rubric is not None and evaluation.rubric.raw is not None:
+                    evaluation.raw_artifact_ref = self.store.save_artifact(
+                        run_id,
+                        "evaluation_raw.json",
+                        "evaluation_raw",
+                        evaluation.rubric.raw,
+                    )
                 state.latest_evaluation = evaluation
+                await self.policy.observe([action], [evaluation])
                 eval_event = self._emit(
                     state,
                     "evaluation_complete",
                     turn=budget.turns_used,
                     tokens=budget.tokens_used,
+                    seconds=eval_seconds,
                     payload={
                         "overall": round(evaluation.overall, 6),
                         "delta_quality": round(evaluation.delta_quality, 6),
@@ -401,7 +424,7 @@ class ResearchKernel:
                 terminal = "budget_exhausted"
                 break
 
-        answer = self._finish(state, terminal, paper_titles)
+        answer = self._finish(state, terminal)
         return answer
 
     # ---- Mutation application -------------------------------------------
@@ -557,11 +580,9 @@ class ResearchKernel:
 
     # ---- Finalization ----------------------------------------------------
 
-    def _finish(
-        self, state: ResearchState, terminal: str, paper_titles: dict[str, str] | None
-    ) -> FinalAnswer:
+    def _finish(self, state: ResearchState, terminal: str) -> FinalAnswer:
         state.terminal_reason = terminal
-        answer = build_final_answer(state.objective, state, paper_titles)
+        answer = build_final_answer(state.objective, state)
         state.final_answer = answer.render_markdown()
         run_id = state.objective.run_id
         artifact_id = self.store.save_artifact(
@@ -615,7 +636,7 @@ class ResearchKernel:
         outcome = None
         if payload:
             outcome = payload.get("classification") or payload.get("terminal_reason")
-        log.debug(
+        log.info(
             "research_event",
             run_id=state.objective.run_id,
             seq=event.seq,

@@ -519,3 +519,86 @@ async def test_take_turn_records_transient_on_unexpected_fetch_error() -> None:
     assert failures[0]["provider"] == "openalex"
     assert failures[0]["reason"] == "unexpected_error"
     assert failures[0]["classification"] == "transient"
+
+
+async def test_take_turn_generic_exception_clears_shared_visited() -> None:
+    """STAB-3/6: a mid-turn error must not strand the in-flight id as visited."""
+    import random as _random
+
+    class Provider:
+        name = "openalex"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            return Paper(id="W1", title="Title", year=2020, provider="openalex")
+
+    calls: dict[str, list] = {"release_all": []}
+
+    class Frontier:
+        def __init__(self) -> None:
+            self.claims: dict[str, str] = {}
+            self.sources: dict[str, tuple[str, str]] = {
+                "openalex:W1": ("openalex:seed", "ref")
+            }
+
+        def eligible(self, exclude=None, turn=None):
+            return ["openalex:W1"]
+
+        def claim_for(self, nid, agent):
+            self.claims[nid] = agent
+            return True
+
+        def release(self, nid, agent):
+            self.claims.pop(nid, None)
+
+        def release_all(self, agent):
+            calls["release_all"].append(agent)
+            self.claims.clear()
+
+        def remove(self, nid):
+            self.claims.pop(nid, None)
+
+        def is_claimed(self, nid):
+            return nid in self.claims
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.provider = Provider()
+    e.providers = {"openalex": e.provider}
+    e._frontier = Frontier()
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: None,
+        cache_paper=lambda p: None,
+        mark_integrated=lambda nid: None,
+    )
+    e.state = AgentState(id="test-agent", pos="openalex:seed", budget=5, turn_count=1)
+    e.state.mark_discovered("openalex:seed")
+    e.seed_embedding = None
+    e.seed_query = "q"
+    e._shared_visited = set()
+    e._eta_cache = {}
+    e._llm_priority = {}
+    e.rng = _random.Random(0)
+    e.embedding = None
+    e.expander = None
+    e.cfg = SimpleNamespace(
+        aco=SimpleNamespace(k_per_turn=1, alpha=1.0, beta=3.0, epsilon=0.1),
+        heuristica=SimpleNamespace(
+            w_sim=0.5, w_citas=0.3, w_recencia=0.2, w_confidence=0.1,
+            w_llm=0.0, eta_llm=False,
+        ),
+        llm=SimpleNamespace(fulltext_max_chars=1000),
+        direction=SimpleNamespace(ref_weight=0.7, cites_weight=0.3),
+    )
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: None)
+
+    async def _boom(paper):
+        raise RuntimeError("integration exploded")
+
+    e._integrate = _boom
+
+    with pytest.raises(RuntimeError):
+        await e.take_turn(1)
+
+    assert "openalex:W1" not in e._shared_visited
+    assert calls["release_all"] == ["test-agent"]
+    assert not e._frontier.is_claimed("openalex:W1")

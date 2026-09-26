@@ -84,12 +84,13 @@ def route_seed_provider(
         return provider, ref
 
     if ref.kind is SeedKind.ARXIV:
-        order = tuple(explicit_order) if explicit_order else ARXIV_CAPABLE
-        provider = _first_enabled(order, providers)
+        # An arXiv identifier is only served by the arXiv provider; the DOI
+        # routing order must never redirect it to a non-arXiv provider.
+        provider = _first_enabled(ARXIV_CAPABLE, providers)
         if provider is None:
             raise SeedRoutingError(
                 f"No arXiv-capable provider enabled for seed {seed!r}. "
-                f"Enable one of {list(order)} in providers.active."
+                f"Enable one of {list(ARXIV_CAPABLE)} in providers.active."
             )
         return provider, ref
 
@@ -101,3 +102,26 @@ def route_seed_provider(
             "Enable at least one provider in providers.active."
         )
     return provider, ref
+
+
+def provider_by_name(
+    providers: dict[str, ResilientProvider],
+    preferred: str,
+    fallback: str | None = None,
+) -> ResilientProvider:
+    """Return an enabled provider by name without raising a bare ``KeyError``.
+
+    Falls back to ``fallback`` when the preferred provider is disabled, then to
+    any enabled provider. Raises a clear configuration error when none is
+    enabled, so callers never index a missing mapping key.
+    """
+    provider = providers.get(preferred)
+    if provider is not None:
+        return provider
+    if fallback is not None and fallback != preferred:
+        provider = providers.get(fallback)
+        if provider is not None:
+            return provider
+    if not providers:
+        raise SeedRoutingError("No providers enabled for evidence acquisition.")
+    return next(iter(providers.values()))

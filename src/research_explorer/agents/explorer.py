@@ -257,6 +257,7 @@ class ExplorerAgent:
             await self._discover_neighbors(self.state.pos)
             await self._evaluate_new_refs()
 
+        inflight: str | None = None
         try:
             for _ in range(k):
                 if self.state.budget <= 0:
@@ -273,11 +274,13 @@ class ExplorerAgent:
                 expected_summary = self.graph.get_paper_summary(next_id)
                 expected_title = expected_summary.title if expected_summary else ""
                 self._shared_visited.add(next_id)
+                inflight = next_id
 
                 try:
                     paper = await self._fetch_paper(next_id)
                 except TransientProviderError as exc:
                     self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.record_transient_failure(
                         next_id, self.state.id, self.state.turn_count
                     )
@@ -301,14 +304,17 @@ class ExplorerAgent:
                 owned = self._frontier.claim_for(next_id, self.state.id)
                 if not owned:
                     self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.release(next_id, self.state.id)
                     continue
 
                 if paper is None:
                     if await self._metadata_transit(next_id, src, mode):
+                        inflight = None
                         self._frontier.release(next_id, self.state.id)
                         continue
                     self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.record_absence(next_id)
                     continue
 
@@ -328,6 +334,7 @@ class ExplorerAgent:
                             reason="id_title_mismatch",
                         )
                     self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.record_absence(next_id)
                     continue
 
@@ -335,9 +342,11 @@ class ExplorerAgent:
                     paper.fulltext or paper.abstract
                 ):
                     if await self._metadata_transit(next_id, src, mode, paper=paper):
+                        inflight = None
                         self._frontier.release(next_id, self.state.id)
                         continue
                     self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.record_absence(next_id)
                     continue
 
@@ -349,6 +358,7 @@ class ExplorerAgent:
 
                 self.state.visit(next_id, mode)
                 self._frontier.remove(next_id)
+                inflight = None
                 edges.append((src, next_id, mode))
 
                 await self._discover_neighbors(next_id, paper, extracted)
@@ -376,7 +386,10 @@ class ExplorerAgent:
                         frontier=len(self._frontier),
                     )
         finally:
-            # Exception paths must never strand a claim in the shared frontier.
+            # Exception paths must never strand a claim in the shared frontier
+            # or leave an unfinalized id in the shared visited set (STAB-3).
+            if inflight is not None:
+                self._shared_visited.discard(inflight)
             self._frontier.release_all(self.state.id)
 
         self.state.turn_count += 1

@@ -18,6 +18,7 @@ from research_explorer.research.loop import (
 from research_explorer.research.models import (
     AgentBrief,
     BudgetState,
+    CandidateAction,
     ClaimMutation,
     ClaimStatus,
     EvidenceRef,
@@ -60,6 +61,44 @@ class ScriptedGateway:
         return None
 
 
+class ChainGateway:
+    """Each successful acquisition yields exactly one fresh candidate."""
+
+    def __init__(self, length: int) -> None:
+        self.length = length
+        self.acquired: list[str] = []
+
+    async def acquire(self, paper_id: str, turn: int) -> Acquisition:
+        if paper_id in self.acquired:
+            return Acquisition(paper_id, ProviderOutcome.ABSENT, provider="fake")
+        index = len(self.acquired)
+        self.acquired.append(paper_id)
+        candidates = []
+        if index + 1 < self.length:
+            candidates.append(
+                CandidateAction(
+                    paper_id=f"openalex:chain{index + 1}",
+                    source=paper_id,
+                    mode="ref",
+                    score=1.0,
+                )
+            )
+        return Acquisition(
+            paper_id=paper_id,
+            outcome=ProviderOutcome.SUCCESS,
+            provider="fake",
+            title="title",
+            evidence=EvidenceRef(paper_id=paper_id, content_hash="h"),
+            candidates=candidates,
+        )
+
+    def paper_exists(self, paper_id: str) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
+
+
 class RaisingAgent:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -79,6 +118,11 @@ class BriefAgent:
 class _FailingLLM:
     async def chat_json(self, messages, **kwargs):
         raise RuntimeError("judge backend down")
+
+
+class _ScreamingLLM:
+    async def chat_json(self, messages, **kwargs):
+        raise RuntimeError(f"judge backend down token={SENTINEL}")
 
 
 class ZeroEvaluator:
@@ -181,6 +225,30 @@ async def test_convergence_on_quality_plateau(tmp_path) -> None:
         store.close()
 
 
+async def test_eval_interval_skips_unevaluated_turns(tmp_path) -> None:
+    store = ResearchStore(tmp_path / "research.db")
+    gateway = ChainGateway(length=4)
+    try:
+        await _kernel(
+            store,
+            gateway,
+            BriefAgent(AgentBrief()),
+            evaluator=_integrity_evaluator(),
+            evaluator_enabled=True,
+            eval_interval=2,
+            plateau_turns=100,
+        ).run(_objective("run-interval", max_turns=10))
+        events = store.list_events("run-interval")
+        acquired = [e for e in events if e.type == "evidence_acquired"]
+        evaluations = [e for e in events if e.type == "evaluation_complete"]
+        assert len(acquired) == 4
+        # Evaluations happen only on turns 2 and 4, never on every turn.
+        assert len(evaluations) == 2
+        assert [e.turn for e in evaluations] == [2, 4]
+    finally:
+        store.close()
+
+
 async def test_transient_failure_retains_then_releases_after_bounded_attempts(
     tmp_path,
 ) -> None:
@@ -240,6 +308,37 @@ async def test_invalid_evaluator_output_does_not_abort_run(tmp_path) -> None:
         assert completed[0].payload["rubric_ok"] is False
         assert completed[0].payload["integrity_passed"] is True
         assert store.get_run("run-eval-fail")["status"] == "completed"
+    finally:
+        store.close()
+
+
+async def test_evaluator_error_is_redacted_in_state_and_artifacts(tmp_path) -> None:
+    from research_explorer.research.models import canonical_json
+
+    store = ResearchStore(tmp_path / "research.db")
+    gateway = ScriptedGateway({SEED: ProviderOutcome.SUCCESS})
+    evaluator = CompositeEvaluator(
+        integrity=DeterministicIntegrity(paper_exists=lambda pid: True),
+        rubric=LLMRubricEvaluator(_ScreamingLLM()),
+        weights={"integrity": 1.0},
+    )
+    try:
+        await _kernel(
+            store, gateway, BriefAgent(AgentBrief()), evaluator=evaluator,
+            evaluator_enabled=True,
+        ).run(_objective("run-eval-secret"))
+        state = store.reconstruct("run-eval-secret")
+        assert state.latest_evaluation is not None
+        assert state.latest_evaluation.rubric is not None
+        assert SENTINEL not in (state.latest_evaluation.rubric.error or "")
+        assert SENTINEL not in canonical_json(state)
+        assert all(
+            SENTINEL not in str(e.payload)
+            for e in store.list_events("run-eval-secret")
+        )
+        artifact = store.latest_artifact("run-eval-secret", "evaluation_raw")
+        assert artifact is not None
+        assert SENTINEL not in artifact["content"]
     finally:
         store.close()
 

@@ -104,6 +104,15 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         seed_paper_id, providers, cfg.providers.seed_routing
     )
 
+    question = seed_query.strip()
+    if not question:
+        if rk.require_question:
+            raise typer.BadParameter(
+                "A non-empty research question is required; set "
+                "research_kernel.require_question = false to allow a default."
+            )
+        question = f"Explore the research context of {seed_ref.value}."
+
     graph = GraphStore(cfg.storage.db_path)
     store = ResearchStore(cfg.storage.research_db_path)
     llm = LLMClient(
@@ -143,7 +152,7 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
     objective = ResearchObjective(
         run_id=uuid.uuid4().hex[:12],
         seed_paper_id=seed_ref.value,
-        question=seed_query,
+        question=question,
         budget=BudgetState(
             max_fetches=rk.max_fetches,
             max_tokens=rk.max_tokens,
