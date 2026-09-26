@@ -294,14 +294,14 @@ class FinalAnswer(BaseModel):
     citations: list[str] = Field(default_factory=list)
 
     def render_markdown(self) -> str:
-        lines = ["# Research answer\n", f"**Question:** {self.question}\n"]
+        lines = ["# Research answer", "", f"**Question:** {self.question}"]
         self._section(lines, "Supported conclusions", self.supported_conclusions)
         self._section(lines, "Plausible interpretations", self.plausible_interpretations)
         self._section(lines, "Unknowns", self.unknowns)
         self._section(lines, "Contradictions", self.contradictions)
         self._section(lines, "Limitations", self.limitations)
         if self.citations:
-            lines.append("## Citations")
+            lines.extend(["", "## Citations"])
             lines.extend(f"- {cid}" for cid in self.citations)
         return "\n".join(lines).strip() + "\n"
 
@@ -309,5 +309,5 @@ class FinalAnswer(BaseModel):
     def _section(lines: list[str], title: str, items: list[str]) -> None:
         if not items:
             return
-        lines.append(f"\n## {title}")
+        lines.extend(["", f"## {title}"])
         lines.extend(f"- {item}" for item in items)

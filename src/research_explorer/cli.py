@@ -30,7 +30,7 @@ def explore(
     config_path: str = typer.Option(
         "config/default.toml", "--config", "-c", help="Path to config TOML file"
     ),
-    output: str = typer.Option(None, "--output", "-o", help="Write narrative to file"),
+    output: str = typer.Option(None, "--output", "-o", help="Write result to file"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Emit JSON log lines"),
     pipeline: str = typer.Option(
         None, "--pipeline", help="Pipeline mode: aco | research-kernel"
@@ -169,6 +169,9 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         Path(output).write_text(report, encoding="utf-8")
         typer.echo(f"Research answer written to {output}")
     else:
+        typer.echo("\n" + "=" * 80)
+        typer.echo("RESEARCH ANSWER")
+        typer.echo("=" * 80)
         typer.echo(report)
 
 
