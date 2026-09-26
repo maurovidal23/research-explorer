@@ -712,6 +712,9 @@ class ExplorerAgent:
 
         Definitive absence returns ``None``; a transient provider failure raises
         :class:`TransientProviderError` so the caller can retain the candidate.
+        Unexpected provider/transport errors are translated to the same typed
+        transient error rather than degraded to ``None``, which would otherwise
+        masquerade as definitive absence and evict a live candidate.
         """
         provider = self._provider_for(paper_id)
         provider_name, native_id = parse_normalized_id(paper_id)
@@ -726,7 +729,7 @@ class ExplorerAgent:
             raise
         except Exception as e:
             log.warning("fetch_failed", paper_id=paper_id, error=str(e))
-            return None
+            raise TransientProviderError(provider.name, "unexpected_error") from e
 
         if paper is None:
             return None
@@ -744,7 +747,9 @@ class ExplorerAgent:
                 raise
             except Exception as e:
                 log.warning("fulltext_failed", paper_id=paper_id, error=str(e))
-                return None
+                raise TransientProviderError(
+                    provider.name, "fulltext_unexpected_error"
+                ) from e
             if ft is None:
                 log.info("fulltext_unavailable_skip", paper_id=paper_id, provider=provider.name)
                 return None

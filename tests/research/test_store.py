@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from research_explorer.research.models import (
     AgentNotebook,
     ResearchObjective,
@@ -104,5 +106,99 @@ def test_reconstruct_never_calls_providers_or_llm(tmp_path) -> None:
         store.create_run(_objective(), initial_state=state)
         rebuilt = store.reconstruct("run-1")
         assert rebuilt.objective.question == "Why?"
+    finally:
+        store.close()
+
+
+def test_event_costs_and_artifact_refs_round_trip(tmp_path) -> None:
+    store = _store(tmp_path)
+    try:
+        state = store.create_run(_objective())
+        store.append_event(
+            "run-1",
+            "evidence_acquired",
+            state=state,
+            turn=3,
+            tokens=42,
+            fetches=2,
+            seconds=1.25,
+            input_refs=["in-1"],
+            output_refs=["openalex:W1"],
+        )
+        event = store.list_events("run-1")[-1]
+        assert event.tokens == 42
+        assert event.fetches == 2
+        assert event.seconds == 1.25
+        assert event.input_refs == ["in-1"]
+        assert event.output_refs == ["openalex:W1"]
+    finally:
+        store.close()
+
+
+def test_event_payload_and_artifact_redact_secrets(tmp_path) -> None:
+    sentinel = "SENTINEL-SECRET-STORE"
+    store = _store(tmp_path)
+    try:
+        store.create_run(_objective())
+        store.append_event(
+            "run-1",
+            "provider_failure",
+            payload={"url": f"https://api.x.test?api_key={sentinel}"},
+        )
+        event = store.list_events("run-1")[-1]
+        assert sentinel not in str(event.payload)
+
+        artifact_id = store.save_artifact(
+            "run-1", "error.txt", "error", f"boom token={sentinel}"
+        )
+        artifact = store.get_artifact(artifact_id)
+        assert artifact is not None
+        assert sentinel not in artifact["content"]
+    finally:
+        store.close()
+
+
+def test_existing_database_is_additively_migrated(tmp_path) -> None:
+    db = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(str(db))
+    legacy.executescript(
+        """
+        CREATE TABLE research_runs (
+            run_id TEXT PRIMARY KEY, seed_paper_id TEXT NOT NULL,
+            question TEXT NOT NULL, status TEXT DEFAULT 'running',
+            terminal_reason TEXT, objective_json TEXT NOT NULL,
+            config_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE research_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+            seq INTEGER NOT NULL, type TEXT NOT NULL, ts TEXT NOT NULL,
+            actor TEXT DEFAULT 'controller', wave INTEGER, turn INTEGER,
+            payload_json TEXT NOT NULL, state_json TEXT,
+            prev_state_hash TEXT, state_hash TEXT, schema_version TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_research_events_run_seq ON research_events(run_id, seq);
+        """
+    )
+    legacy.execute(
+        "INSERT INTO research_runs VALUES ('run-1', 'openalex:W1', 'Why?', "
+        "'running', NULL, '{}', NULL, 't0', 't0')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = ResearchStore(db)
+    try:
+        columns = {
+            row["name"]
+            for row in store._conn.execute("PRAGMA table_info(research_events)")
+        }
+        assert {"input_refs_json", "output_refs_json", "tokens", "fetches", "seconds"} <= columns
+        store.append_event(
+            "run-1", "run_start", tokens=1, fetches=1, output_refs=["artifact-1"]
+        )
+        event = store.list_events("run-1")[-1]
+        assert event.tokens == 1
+        assert event.fetches == 1
+        assert event.output_refs == ["artifact-1"]
     finally:
         store.close()

@@ -80,3 +80,36 @@ async def test_observe_records_evaluations() -> None:
     evaluation = ResearchEvaluation(overall=0.4)
     await policy.observe([], [evaluation])
     assert policy.observations == [evaluation]
+
+
+async def test_tie_break_is_independent_of_input_order() -> None:
+    forward = [
+        CandidateAction(paper_id="a", score=0.5, source="s"),
+        CandidateAction(paper_id="b", score=0.5, source="s"),
+        CandidateAction(paper_id="c", score=0.5, source="s"),
+    ]
+    budget = BudgetState(max_fetches=5)
+    slots = SlotState(total_slots=3)
+    first = await GreedyPolicy(seed=3, max_actions=3).select_actions(
+        _state(), forward, budget, slots
+    )
+    second = await GreedyPolicy(seed=3, max_actions=3).select_actions(
+        _state(), list(reversed(forward)), budget, slots
+    )
+    assert [a.paper_id for a in first] == [a.paper_id for a in second]
+    assert sorted(a.paper_id for a in first) == ["a", "b", "c"]
+
+
+async def test_selection_records_predicted_value_and_cost() -> None:
+    actions = await GreedyPolicy(seed=0).select_actions(
+        _state(), _candidates(), BudgetState(max_fetches=5), SlotState()
+    )
+    assert actions[0].predicted_value == 0.9
+    assert actions[0].predicted_cost == 1
+
+
+async def test_exhausted_token_budget_blocks_selection() -> None:
+    actions = await GreedyPolicy(seed=0).select_actions(
+        _state(), _candidates(), BudgetState(max_tokens=0), SlotState()
+    )
+    assert actions == []

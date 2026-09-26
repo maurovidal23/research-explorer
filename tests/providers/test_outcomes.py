@@ -124,3 +124,31 @@ def test_transient_error_has_expected_attributes() -> None:
     assert SimpleNamespace(reason=exc.reason, provider=exc.provider) == SimpleNamespace(
         reason="circuit_open", provider="openalex"
     )
+
+
+class _NotFoundProvider(ResilientProvider):
+    """Provider whose transport returns an ordinary 404 (definitive absence)."""
+
+    def __init__(self, cache_dir: str, *, strict: bool = False) -> None:
+        super().__init__(
+            name="probe",
+            base_url="https://api.example.test/v1",
+            cache_dir=cache_dir,
+            strict_transient=strict,
+        )
+
+    async def _attempt_get(self, path: str, **params: object) -> httpx.Response:
+        return httpx.Response(
+            404, request=httpx.Request("GET", f"https://api.example.test/v1{path}")
+        )
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_ordinary_404_is_definitive_absence_not_transient(
+    cache_dir: str, strict: bool
+) -> None:
+    provider = _NotFoundProvider(cache_dir, strict=strict)
+    try:
+        assert await provider.get_json("/paper/missing") is None
+    finally:
+        await provider.aclose()

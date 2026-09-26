@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS research_events (
     wave INTEGER,
     turn INTEGER,
     payload_json TEXT NOT NULL,
+    input_refs_json TEXT NOT NULL DEFAULT '[]',
+    output_refs_json TEXT NOT NULL DEFAULT '[]',
+    tokens INTEGER,
+    fetches INTEGER,
+    seconds REAL,
     state_json TEXT,
     prev_state_hash TEXT,
     state_hash TEXT,
@@ -92,7 +97,27 @@ class ResearchStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent additive migrations; preserves pre-existing databases."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(research_events)")
+        }
+        additions = {
+            "input_refs_json": "TEXT NOT NULL DEFAULT '[]'",
+            "output_refs_json": "TEXT NOT NULL DEFAULT '[]'",
+            "tokens": "INTEGER",
+            "fetches": "INTEGER",
+            "seconds": "REAL",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE research_events ADD COLUMN {name} {ddl}"
+                )
 
     def close(self) -> None:
         self._conn.close()
@@ -345,9 +370,10 @@ class ResearchStore:
         )
         conn.execute(
             """INSERT INTO research_events
-               (run_id, seq, type, ts, actor, wave, turn, payload_json, state_json,
-                prev_state_hash, state_hash, schema_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (run_id, seq, type, ts, actor, wave, turn, payload_json,
+                input_refs_json, output_refs_json, tokens, fetches, seconds,
+                state_json, prev_state_hash, state_hash, schema_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 seq,
@@ -357,6 +383,11 @@ class ResearchStore:
                 wave,
                 turn,
                 canonical_json(event.payload),
+                canonical_json(event.input_refs),
+                canonical_json(event.output_refs),
+                tokens,
+                fetches,
+                seconds,
                 state_json,
                 prev_hash,
                 current_hash,
@@ -383,6 +414,13 @@ class ResearchStore:
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> ResearchEvent:
+        def _load_list(column: str) -> list[str]:
+            try:
+                value = json.loads(row[column])
+            except (json.JSONDecodeError, TypeError):
+                return []
+            return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
         try:
             payload = json.loads(row["payload_json"])
         except json.JSONDecodeError:
@@ -394,7 +432,12 @@ class ResearchStore:
             actor=row["actor"] or "controller",
             wave=row["wave"],
             turn=row["turn"],
+            input_refs=_load_list("input_refs_json"),
+            output_refs=_load_list("output_refs_json"),
             payload=payload,
+            tokens=row["tokens"],
+            fetches=row["fetches"],
+            seconds=row["seconds"],
             previous_state_hash=row["prev_state_hash"],
             current_state_hash=row["state_hash"],
             timestamp=row["ts"],
