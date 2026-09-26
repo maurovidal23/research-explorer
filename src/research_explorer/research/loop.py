@@ -12,11 +12,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from research_explorer.agents.llm_client import LLMClient
 from research_explorer.graph.models import Paper, PaperSummary, normalize_id, parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
@@ -25,7 +24,7 @@ from research_explorer.redaction import redact_secrets
 from research_explorer.research.agent import AgentOutputError, ResearchAgent
 from research_explorer.research.answer import build_final_answer
 from research_explorer.research.context import approx_tokens, build_agent_prompt
-from research_explorer.research.evaluator import CompositeEvaluator, DeterministicIntegrity
+from research_explorer.research.evaluator import CompositeEvaluator
 from research_explorer.research.models import (
     ActionKind,
     AgentBrief,
@@ -629,19 +628,3 @@ class ResearchKernel:
             seconds=seconds,
         )
         return event
-
-
-def paper_exists_from_graph(graph: GraphStore) -> Callable[[str], bool]:
-    return lambda paper_id: graph.get_paper_summary(paper_id) is not None
-
-
-def build_llm_evaluator(llm: LLMClient, model: str, weights: dict[str, float], version: str,
-                        paper_exists: Callable[[str], bool]) -> CompositeEvaluator:
-    from research_explorer.research.evaluator import LLMRubricEvaluator
-
-    return CompositeEvaluator(
-        integrity=DeterministicIntegrity(paper_exists=paper_exists),
-        rubric=LLMRubricEvaluator(llm, model=model),
-        weights=weights,
-        rubric_version=version,
-    )
