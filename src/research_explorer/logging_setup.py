@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import structlog
+
+from research_explorer.redaction import redact_obj
 
 WIDTH = 72
 
@@ -268,6 +270,11 @@ class ACORenderer:
     }
 
 
+def _redact_processor(logger, method_name, event_dict):
+    """Redact secrets from every value, recursing into nested structures."""
+    return redact_obj(event_dict)
+
+
 def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
     """Configure structlog for human-readable or JSON output.
 
@@ -285,14 +292,16 @@ def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
     for noisy in ("httpx", "openai", "openai._base_client", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    shared_processors = [
+    shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        _redact_processor,
     ]
 
+    processors: list[Any]
     if json_logs:
         processors = [*shared_processors, structlog.processors.JSONRenderer()]
     else:

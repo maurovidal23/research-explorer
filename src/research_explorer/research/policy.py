@@ -1,0 +1,115 @@
+"""Replaceable exploration policy interface and the deterministic greedy baseline.
+
+The policy depends only on the research domain models: it never fetches
+providers and never writes evidence. That keeps controller, policy, and
+persistence independently replaceable (e.g. by a future contextual-UCB or ACO
+policy) without touching the provider layer.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Protocol
+
+from research_explorer.research.models import (
+    ActionKind,
+    BudgetState,
+    CandidateAction,
+    ResearchAction,
+    ResearchEvaluation,
+    ResearchState,
+    SlotState,
+)
+
+
+class ExplorationPolicy(Protocol):
+    """Select one or more actions and observe their evaluations."""
+
+    async def select_actions(
+        self,
+        state: ResearchState,
+        candidates: list[CandidateAction],
+        budget: BudgetState,
+        slots: SlotState,
+    ) -> list[ResearchAction]: ...
+
+    async def observe(
+        self,
+        actions: list[ResearchAction],
+        evaluations: list[ResearchEvaluation],
+    ) -> None: ...
+
+
+class GreedyPolicy:
+    """Deterministic greedy selection with explicit, seeded tie-breaking.
+
+    Candidates are ranked by descending score. Exact ties are broken by a
+    per-seed stable shuffle of paper ids, so the same seed always yields the
+    same order. All considered candidates and their reason codes are retained
+    on the instance for the controller to record.
+    """
+
+    def __init__(self, seed: int = 0, max_actions: int = 1) -> None:
+        self.seed = seed
+        self.max_actions = max_actions
+        self.last_considered: list[CandidateAction] = []
+        self.last_reasons: dict[str, str] = {}
+        self.observations: list[ResearchEvaluation] = []
+
+    def _tie_rank(self, candidates: list[CandidateAction]) -> dict[str, int]:
+        ids = sorted({c.paper_id for c in candidates})
+        rng = random.Random(self.seed)
+        rng.shuffle(ids)
+        return {pid: rank for rank, pid in enumerate(ids)}
+
+    async def select_actions(
+        self,
+        state: ResearchState,
+        candidates: list[CandidateAction],
+        budget: BudgetState,
+        slots: SlotState,
+    ) -> list[ResearchAction]:
+        self.last_considered = list(candidates)
+        reasons: dict[str, str] = {}
+        eligible: list[CandidateAction] = []
+        for candidate in candidates:
+            if candidate.paper_id in state.visited:
+                reasons[candidate.paper_id] = "already_visited"
+            elif candidate.score <= 0.0:
+                reasons[candidate.paper_id] = "non_positive_score"
+            else:
+                reasons[candidate.paper_id] = "eligible"
+                eligible.append(candidate)
+        self.last_reasons = reasons
+
+        rank = self._tie_rank(eligible)
+        ordered = sorted(
+            eligible,
+            key=lambda c: (-round(c.score, 9), rank.get(c.paper_id, 0), c.paper_id),
+        )
+
+        capacity = min(
+            self.max_actions,
+            max(slots.available, 0) or self.max_actions,
+            budget.fetches_remaining,
+        )
+        if budget.tokens_remaining <= 0:
+            capacity = 0
+        selected = ordered[:capacity]
+        return [
+            ResearchAction(
+                kind=ActionKind.READ_EVIDENCE,
+                paper_id=candidate.paper_id,
+                reason=candidate.reason or "greedy_top_score",
+                predicted_value=candidate.score,
+                predicted_cost=1,
+            )
+            for candidate in selected
+        ]
+
+    async def observe(
+        self,
+        actions: list[ResearchAction],
+        evaluations: list[ResearchEvaluation],
+    ) -> None:
+        self.observations.extend(evaluations)

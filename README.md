@@ -57,6 +57,18 @@ export OPENALEX_API_KEY="..."  # requerido para OpenAlex
 # Explorar desde un artículo semilla (DOI) con una query descriptiva
 research-explorer explore 10.1038/nrn3241 "origin of extracellular fields in the brain"
 
+# Corto vertical single-agent (research kernel) con un perfil acotado
+research-explorer explore 10.1038/nrn3241 \
+  "How do extracellular fields originate and affect neuronal computation?" \
+  --pipeline research-kernel \
+  --config config/profiles/kernel_quick.toml
+
+# Smoke test manual contra proveedores y LLM reales
+research-explorer explore 10.1038/nrn3241 \
+  "How do extracellular fields originate and affect neuronal computation?" \
+  --pipeline research-kernel \
+  --config config/profiles/kernel_live.toml
+
 # Listar los servidores MCP disponibles
 research-explorer mcp list
 

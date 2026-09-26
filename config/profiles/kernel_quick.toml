@@ -1,0 +1,35 @@
+# Quick profile for the research-kernel vertical slice.
+#
+# The automated end-to-end test injects frozen fake providers/LLMs and uses the
+# same bounded budgets declared here. For a manual live smoke test, point
+# `--config` at config/profiles/kernel_live.toml or raise these budgets.
+pipeline = "research-kernel"
+log_level = "INFO"
+
+[storage]
+db_path = "data/kernel_quick/explorer.db"
+cache_dir = "data/kernel_quick/.cache"
+research_db_path = "data/kernel_quick/research.db"
+
+[providers]
+default = "openalex"
+active = ["openalex", "semantic_scholar"]
+# Explicit seed routing order; empty falls back to openalex -> semantic_scholar.
+seed_routing = ["openalex", "semantic_scholar"]
+
+[research_kernel]
+policy = "greedy"
+seed = 0
+max_fetches = 8
+max_tokens = 30000
+max_time_seconds = 300
+max_turns = 5
+context_input_target = 4000
+output_reserve = 1200
+evaluator_enabled = true
+rubric_version = "v1"
+eval_interval = 1
+transient_retry_attempts = 2
+snapshot_interval = 1
+plateau_turns = 3
+convergence_epsilon = 0.01

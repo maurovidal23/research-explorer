@@ -19,6 +19,7 @@ from research_explorer.evaluation.quality import QualityAssessor
 from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.graph.feromone import AgentPath, PheromoneManager
 from research_explorer.logging_setup import get_logger
+from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer
 
 log = get_logger("scheduler")
@@ -83,7 +84,28 @@ class Scheduler:
                     turn=agent.state.turn_count,
                 )
 
-            edges = await agent.take_turn(self.cfg.aco.k_per_turn)
+            edges = []
+            try:
+                edges = await agent.take_turn(self.cfg.aco.k_per_turn)
+            except Exception as e:
+                # A failed agent turn is contained and recorded; unrelated
+                # turns and the run continue (STAB-6).
+                error = redact_secrets(str(e))
+                log.warning("agent_turn_failed", agent=agent.state.id, error=error)
+                self.colony.shared_frontier.release_all(agent.state.id)
+                agent.state.delta_q = 0.0
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "agent_turn_failed",
+                        agent_id=agent.state.id,
+                        oleada=self.oleada_count,
+                        turn=agent.state.turn_count,
+                        error=error,
+                    )
+                agent_paths.append(
+                    AgentPath(edges=[], delta_q=0.0, state=agent.state)
+                )
+                continue
 
             # Fetch the papers added this turn for peer voting
             new_papers = self._get_new_papers(agent, edges)

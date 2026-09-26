@@ -160,6 +160,8 @@ def candidate_dedup_key(summary: PaperSummary) -> str:
         key = alias_key_for_arxiv(summary.arxiv_id)
         if key:
             return key
+    if not summary.title:
+        return normalize_id(summary.provider, summary.id)
     head = min((surname(a) for a in summary.authors if surname(a)), default="")
     return f"title:{normalize_title(summary.title)}:{head}:{summary.year or ''}"
 
@@ -416,6 +418,24 @@ class IdentityResolver:
                 break
         return evidence
 
+    def _identifier_match(
+        self, entry: BibliographicEntry, candidate: PaperSummary
+    ) -> bool:
+        """True when the candidate carries the same exact DOI/arXiv identifier."""
+        if entry.doi:
+            candidate_doi = candidate.doi
+            if candidate_doi and normalize_doi(candidate_doi) == normalize_doi(entry.doi):
+                return True
+        if entry.arxiv_id:
+            normalized = normalize_arxiv(entry.arxiv_id)
+            candidate_arxiv = candidate.arxiv_id
+            if candidate_arxiv and normalize_arxiv(candidate_arxiv) == normalized:
+                return True
+            candidate_doi = candidate.doi
+            if candidate_doi and normalize_doi(candidate_doi) == f"10.48550/arxiv.{normalized}":
+                return True
+        return False
+
     def _verify(
         self,
         entry: BibliographicEntry,
@@ -439,6 +459,24 @@ class IdentityResolver:
                 score=score,
                 accepted=False,
                 reject_reason=failures[0],
+            )
+        descriptive_checked = (
+            score.title_checked or score.authors_checked or score.year_checked
+        )
+        identifier_match = method in (
+            ResolutionMethod.DOI_LOOKUP,
+            ResolutionMethod.ARXIV_LOOKUP,
+        ) and self._identifier_match(entry, candidate)
+        if not descriptive_checked and identifier_match:
+            # Exact identifier lookup is sufficient evidence on its own,
+            # even when the provider returns no descriptive metadata (STAB-4).
+            score.confidence = 1.0
+            return ResolutionEvidence(
+                method=method,
+                provider=provider_name,
+                candidate=candidate,
+                score=score,
+                accepted=True,
             )
         if score.confidence < self.thresholds.min_confidence:
             return ResolutionEvidence(

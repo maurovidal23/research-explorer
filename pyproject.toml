@@ -59,7 +59,7 @@ packages = ["src/research_explorer"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers --import-mode=importlib"
 pythonpath = ["src"]
 
 [tool.ruff]
@@ -75,7 +75,11 @@ ignore = ["E501"]
 "tests/**" = ["B011"]
 
 [tool.mypy]
-python_version = "3.10"
+# Type checking targets 3.12 because the numpy stubs resolved for >=3.12 use
+# PEP 695 `type` statements that mypy cannot parse when python_version < 3.12.
+# Runtime support remains 3.10+ (see requires-python); mypy runs in its own
+# Python 3.12 CI job.
+python_version = "3.12"
 strict = false
 warn_unused_ignores = true
 warn_redundant_casts = true

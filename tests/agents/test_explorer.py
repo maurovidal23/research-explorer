@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from research_explorer.agents.explorer import ExplorerAgent, _parse_json_response, _titles_match
 from research_explorer.agents.state import AgentState
 from research_explorer.graph.models import Paper, PaperSummary
+from research_explorer.providers.base import TransientProviderError
 
 
 def _explorer(providers: dict[str, object] | None = None) -> ExplorerAgent:
@@ -195,13 +198,15 @@ async def test_take_turn_rejects_mismatched_title() -> None:
     emitted = []
     e._frontier = SimpleNamespace(
         best=lambda exclude=None: "arxiv:1901.03228" if not exclude or "arxiv:1901.03228" not in exclude else None,
-        eligible=lambda exclude=None: ["arxiv:1901.03228"],
+        eligible=lambda exclude=None, turn=None: ["arxiv:1901.03228"],
         sources={"arxiv:1901.03228": ("arxiv:seed", "ref")},
         remove=removed.append,
+        record_absence=removed.append,
         unevaluated=lambda: [],
         set_score=lambda nid, s: None,
         claim_for=lambda nid, agent: True,
         release=lambda nid, agent: None,
+        release_all=lambda agent: None,
         is_claimed=lambda nid: False,
         claims={},
     )
@@ -376,3 +381,224 @@ async def test_metadata_transit_adds_expanded_neighbors_to_frontier() -> None:
     assert set(refs) == {"openalex:Wref1"}
     assert set(cits) == {"openalex:Wcit1"}
     assert "openalex:Wmeta" not in e._frontier.papers
+
+
+async def test_fetch_paper_translates_unexpected_error_to_transient() -> None:
+    """STAB-2/3: an unexpected provider error must not look like absence."""
+
+    class Provider:
+        name = "openalex"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            raise RuntimeError("socket reset token=SENTINEL-SECRET-FETCH")
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.provider = Provider()
+    e.providers = {"openalex": e.provider}
+
+    with pytest.raises(TransientProviderError) as exc_info:
+        await e._fetch_paper("openalex:W1")
+
+    assert exc_info.value.reason == "unexpected_error"
+    assert exc_info.value.provider == "openalex"
+    assert "SENTINEL-SECRET-FETCH" not in str(exc_info.value)
+
+
+async def test_fetch_paper_returns_none_for_definitive_absence() -> None:
+    class Provider:
+        name = "openalex"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            return None
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.provider = Provider()
+    e.providers = {"openalex": e.provider}
+
+    assert await e._fetch_paper("openalex:W1") is None
+
+
+async def test_take_turn_records_transient_on_unexpected_fetch_error() -> None:
+    """STAB-2/3: an unexpected fetch error is retained, never treated as absence."""
+    import random as _random
+
+    class Provider:
+        name = "openalex"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            raise RuntimeError("socket reset")
+
+    calls: dict[str, list] = {
+        "transient": [], "absence": [], "remove": [], "release_all": [],
+    }
+
+    class Frontier:
+        def __init__(self) -> None:
+            self.claims: dict[str, str] = {}
+            self.sources: dict[str, tuple[str, str]] = {
+                "openalex:W1": ("openalex:seed", "ref")
+            }
+
+        def eligible(self, exclude=None, turn=None):
+            return ["openalex:W1"]
+
+        def claim_for(self, nid, agent):
+            self.claims[nid] = agent
+            return True
+
+        def record_transient_failure(self, nid, agent, turn):
+            calls["transient"].append((nid, agent, turn))
+            self.claims.pop(nid, None)
+
+        def record_absence(self, nid):
+            calls["absence"].append(nid)
+
+        def remove(self, nid):
+            calls["remove"].append(nid)
+
+        def release(self, nid, agent):
+            self.claims.pop(nid, None)
+
+        def release_all(self, agent):
+            calls["release_all"].append(agent)
+
+        def attempt_count(self, nid):
+            return 1
+
+        def is_claimed(self, nid):
+            return nid in self.claims
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.provider = Provider()
+    e.providers = {"openalex": e.provider}
+    e._frontier = Frontier()
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: None,
+        cache_paper=lambda p: None,
+    )
+    e.state = AgentState(id="test-agent", pos="openalex:seed", budget=5, turn_count=1)
+    e.state.mark_discovered("openalex:seed")
+    e.seed_embedding = None
+    e.seed_query = "q"
+    e._shared_visited = set()
+    e._eta_cache = {}
+    e._llm_priority = {}
+    e.rng = _random.Random(0)
+    e.embedding = None
+    e.expander = None
+    e.cfg = SimpleNamespace(
+        aco=SimpleNamespace(k_per_turn=1, alpha=1.0, beta=3.0, epsilon=0.1),
+        heuristica=SimpleNamespace(
+            w_sim=0.5, w_citas=0.3, w_recencia=0.2, w_confidence=0.1,
+            w_llm=0.0, eta_llm=False,
+        ),
+        llm=SimpleNamespace(fulltext_max_chars=1000),
+        direction=SimpleNamespace(ref_weight=0.7, cites_weight=0.3),
+    )
+    emitted: list[tuple] = []
+    e.tracer = SimpleNamespace(
+        emit=lambda event_type, **payload: emitted.append((event_type, payload))
+    )
+
+    edges = await e.take_turn(1)
+
+    assert edges == []
+    assert "openalex:W1" not in e._shared_visited
+    assert calls["transient"] and calls["transient"][0][:2] == ("openalex:W1", "test-agent")
+    assert calls["absence"] == []
+    assert calls["remove"] == []
+    assert not e._frontier.is_claimed("openalex:W1")
+    assert calls["release_all"] == ["test-agent"]
+
+    failures = [payload for kind, payload in emitted if kind == "provider_failure"]
+    assert failures
+    assert failures[0]["paper_id"] == "openalex:W1"
+    assert failures[0]["provider"] == "openalex"
+    assert failures[0]["reason"] == "unexpected_error"
+    assert failures[0]["classification"] == "transient"
+
+
+async def test_take_turn_generic_exception_clears_shared_visited() -> None:
+    """STAB-3/6: a mid-turn error must not strand the in-flight id as visited."""
+    import random as _random
+
+    class Provider:
+        name = "openalex"
+        supports_fulltext = False
+
+        async def get_paper(self, paper_id):
+            return Paper(id="W1", title="Title", year=2020, provider="openalex")
+
+    calls: dict[str, list] = {"release_all": []}
+
+    class Frontier:
+        def __init__(self) -> None:
+            self.claims: dict[str, str] = {}
+            self.sources: dict[str, tuple[str, str]] = {
+                "openalex:W1": ("openalex:seed", "ref")
+            }
+
+        def eligible(self, exclude=None, turn=None):
+            return ["openalex:W1"]
+
+        def claim_for(self, nid, agent):
+            self.claims[nid] = agent
+            return True
+
+        def release(self, nid, agent):
+            self.claims.pop(nid, None)
+
+        def release_all(self, agent):
+            calls["release_all"].append(agent)
+            self.claims.clear()
+
+        def remove(self, nid):
+            self.claims.pop(nid, None)
+
+        def is_claimed(self, nid):
+            return nid in self.claims
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.provider = Provider()
+    e.providers = {"openalex": e.provider}
+    e._frontier = Frontier()
+    e.graph = SimpleNamespace(
+        get_paper_summary=lambda nid: None,
+        cache_paper=lambda p: None,
+        mark_integrated=lambda nid: None,
+    )
+    e.state = AgentState(id="test-agent", pos="openalex:seed", budget=5, turn_count=1)
+    e.state.mark_discovered("openalex:seed")
+    e.seed_embedding = None
+    e.seed_query = "q"
+    e._shared_visited = set()
+    e._eta_cache = {}
+    e._llm_priority = {}
+    e.rng = _random.Random(0)
+    e.embedding = None
+    e.expander = None
+    e.cfg = SimpleNamespace(
+        aco=SimpleNamespace(k_per_turn=1, alpha=1.0, beta=3.0, epsilon=0.1),
+        heuristica=SimpleNamespace(
+            w_sim=0.5, w_citas=0.3, w_recencia=0.2, w_confidence=0.1,
+            w_llm=0.0, eta_llm=False,
+        ),
+        llm=SimpleNamespace(fulltext_max_chars=1000),
+        direction=SimpleNamespace(ref_weight=0.7, cites_weight=0.3),
+    )
+    e.tracer = SimpleNamespace(emit=lambda event_type, **payload: None)
+
+    async def _boom(paper):
+        raise RuntimeError("integration exploded")
+
+    e._integrate = _boom
+
+    with pytest.raises(RuntimeError):
+        await e.take_turn(1)
+
+    assert "openalex:W1" not in e._shared_visited
+    assert calls["release_all"] == ["test-agent"]
+    assert not e._frontier.is_claimed("openalex:W1")

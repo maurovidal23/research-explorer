@@ -31,6 +31,7 @@ import json
 import math
 import random
 import re
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -57,7 +58,7 @@ from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.models import Paper, PaperSummary, normalize_id, parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
-from research_explorer.providers.base import ResilientProvider
+from research_explorer.providers.base import ResilientProvider, TransientProviderError
 from research_explorer.replay.trace import RunTracer
 
 if TYPE_CHECKING:
@@ -101,15 +102,29 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / norm)
 
 
+@contextlib.asynccontextmanager
+async def _strict_scope(provider: object) -> AsyncIterator[None]:
+    """Ask a provider to raise transient failures, tolerating duck-typed fakes."""
+    scope = getattr(provider, "strict_outcomes", None)
+    if scope is None:
+        yield
+        return
+    async with scope():
+        yield
+
+
 def _parse_json_response(text: str) -> dict | None:
     """Best-effort parse of an LLM JSON response (strips code fences).
 
-    Handles truncated JSON by extracting the narrative and any complete
-    reference objects that were returned before truncation.
+    Only a top-level JSON object is accepted. Handles truncated JSON by
+    extracting the narrative and any complete reference objects that were
+    returned before truncation.
     """
     cleaned = _JSON_FENCE.sub("", text.strip())
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
     # Try extracting the JSON object span
@@ -117,7 +132,9 @@ def _parse_json_response(text: str) -> dict | None:
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(cleaned[start : end + 1])
+            parsed = json.loads(cleaned[start : end + 1])
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
     # Last resort: recover narrative + complete ref objects from truncated JSON
@@ -240,101 +257,140 @@ class ExplorerAgent:
             await self._discover_neighbors(self.state.pos)
             await self._evaluate_new_refs()
 
-        for _ in range(k):
-            if self.state.budget <= 0:
-                break
+        inflight: str | None = None
+        try:
+            for _ in range(k):
+                if self.state.budget <= 0:
+                    break
 
-            selection = await self._select_candidate()
-            if selection is None:
-                log.debug("agent_no_candidates", agent=self.state.id, pos=self.state.pos)
-                break
+                selection = await self._select_candidate()
+                if selection is None:
+                    log.debug("agent_no_candidates", agent=self.state.id, pos=self.state.pos)
+                    break
 
-            next_id = selection.chosen
-            src, mode = selection.src, selection.mode
+                next_id = selection.chosen
+                src, mode = selection.src, selection.mode
 
-            expected_summary = self.graph.get_paper_summary(next_id)
-            expected_title = expected_summary.title if expected_summary else ""
-            self._shared_visited.add(next_id)
+                expected_summary = self.graph.get_paper_summary(next_id)
+                expected_title = expected_summary.title if expected_summary else ""
+                self._shared_visited.add(next_id)
+                inflight = next_id
 
-            paper = await self._fetch_paper(next_id)
+                try:
+                    paper = await self._fetch_paper(next_id)
+                except TransientProviderError as exc:
+                    self._shared_visited.discard(next_id)
+                    inflight = None
+                    self._frontier.record_transient_failure(
+                        next_id, self.state.id, self.state.turn_count
+                    )
+                    log.warning(
+                        "provider_transient",
+                        paper_id=next_id,
+                        provider=exc.provider,
+                        reason=exc.reason,
+                    )
+                    if self.tracer is not None:
+                        self.tracer.emit(
+                            "provider_failure",
+                            paper_id=next_id,
+                            provider=exc.provider,
+                            reason=exc.reason,
+                            classification="transient",
+                            attempts=self._frontier.attempt_count(next_id),
+                        )
+                    continue
 
-            owned = self._frontier.claim_for(next_id, self.state.id)
-            if not owned:
-                self._shared_visited.discard(next_id)
-                self._frontier.release(next_id, self.state.id)
-                continue
-
-            if paper is None:
-                if await self._metadata_transit(next_id, src, mode):
+                owned = self._frontier.claim_for(next_id, self.state.id)
+                if not owned:
+                    self._shared_visited.discard(next_id)
+                    inflight = None
                     self._frontier.release(next_id, self.state.id)
                     continue
-                self._shared_visited.discard(next_id)
-                self._frontier.remove(next_id)
-                continue
 
-            if not _titles_match(expected_title, paper.title):
-                log.warning(
-                    "id_title_mismatch",
-                    paper_id=next_id,
-                    expected_title=expected_title,
-                    actual_title=paper.title,
-                )
-                if self.tracer is not None:
-                    self.tracer.emit(
+                if paper is None:
+                    if await self._metadata_transit(next_id, src, mode):
+                        inflight = None
+                        self._frontier.release(next_id, self.state.id)
+                        continue
+                    self._shared_visited.discard(next_id)
+                    inflight = None
+                    self._frontier.record_absence(next_id)
+                    continue
+
+                if not _titles_match(expected_title, paper.title):
+                    log.warning(
                         "id_title_mismatch",
                         paper_id=next_id,
                         expected_title=expected_title,
                         actual_title=paper.title,
-                        reason="id_title_mismatch",
                     )
-                self._shared_visited.discard(next_id)
-                self._frontier.remove(next_id)
-                continue
-
-            if getattr(self, "expander", None) is not None and not (
-                paper.fulltext or paper.abstract
-            ):
-                if await self._metadata_transit(next_id, src, mode, paper=paper):
-                    self._frontier.release(next_id, self.state.id)
+                    if self.tracer is not None:
+                        self.tracer.emit(
+                            "id_title_mismatch",
+                            paper_id=next_id,
+                            expected_title=expected_title,
+                            actual_title=paper.title,
+                            reason="id_title_mismatch",
+                        )
+                    self._shared_visited.discard(next_id)
+                    inflight = None
+                    self._frontier.record_absence(next_id)
                     continue
-                self._shared_visited.discard(next_id)
+
+                if getattr(self, "expander", None) is not None and not (
+                    paper.fulltext or paper.abstract
+                ):
+                    if await self._metadata_transit(next_id, src, mode, paper=paper):
+                        inflight = None
+                        self._frontier.release(next_id, self.state.id)
+                        continue
+                    self._shared_visited.discard(next_id)
+                    inflight = None
+                    self._frontier.record_absence(next_id)
+                    continue
+
+                self.graph.cache_paper(paper)
+                narrative, extracted = await self._integrate(paper)
+                self.state.narrative = narrative
+                if paper.fulltext or paper.abstract:
+                    self.graph.mark_integrated(next_id)
+
+                self.state.visit(next_id, mode)
                 self._frontier.remove(next_id)
-                continue
+                inflight = None
+                edges.append((src, next_id, mode))
 
-            self.graph.cache_paper(paper)
-            narrative, extracted = await self._integrate(paper)
-            self.state.narrative = narrative
-            if paper.fulltext or paper.abstract:
-                self.graph.mark_integrated(next_id)
+                await self._discover_neighbors(next_id, paper, extracted)
 
-            self.state.visit(next_id, mode)
-            self._frontier.remove(next_id)
-            edges.append((src, next_id, mode))
+                await self._evaluate_new_refs()
 
-            await self._discover_neighbors(next_id, paper, extracted)
-
-            await self._evaluate_new_refs()
-
-            log.info(
-                "agent_step",
-                agent=self.state.id,
-                mode=mode,
-                title=paper.title[:60],
-                year=paper.year,
-                budget=self.state.budget,
-                frontier=len(self._frontier),
-            )
-            if self.tracer is not None:
-                self.tracer.emit(
+                log.info(
                     "agent_step",
                     agent=self.state.id,
                     mode=mode,
-                    paper_id=next_id,
-                    title=paper.title,
+                    title=paper.title[:60],
                     year=paper.year,
                     budget=self.state.budget,
                     frontier=len(self._frontier),
                 )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "agent_step",
+                        agent=self.state.id,
+                        mode=mode,
+                        paper_id=next_id,
+                        title=paper.title,
+                        year=paper.year,
+                        budget=self.state.budget,
+                        frontier=len(self._frontier),
+                    )
+        finally:
+            # Exception paths must never strand a claim in the shared frontier
+            # or leave an unfinalized id in the shared visited set (STAB-3).
+            if inflight is not None:
+                self._shared_visited.discard(inflight)
+            self._frontier.release_all(self.state.id)
 
         self.state.turn_count += 1
         return edges
@@ -355,7 +411,9 @@ class ExplorerAgent:
         caste-adjusted direction modifier, then draws via ``select_candidate``.
         The chosen node is claimed so no concurrent agent duplicates the work.
         """
-        eligible = self._frontier.eligible(exclude=self._shared_visited)
+        eligible = self._frontier.eligible(
+            exclude=self._shared_visited, turn=self.state.turn_count
+        )
         if not eligible:
             return None
 
@@ -590,22 +648,28 @@ class ExplorerAgent:
                 self._frontier.set_score(pid, eta)
 
     def _parse_eval_response(self, raw: str) -> list[dict]:
-        """Parse the LLM's reference evaluation response."""
+        """Parse the LLM's reference evaluation response.
+
+        Validates that the payload is an object with a list of objects under
+        ``scores``; malformed individual entries are ignored rather than
+        crashing the turn.
+        """
         cleaned = _JSON_FENCE.sub("", raw.strip())
+        obj: object = None
         try:
             obj = json.loads(cleaned)
-            return obj.get("scores", []) if isinstance(obj, dict) else []
         except json.JSONDecodeError:
-            pass
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                obj = json.loads(cleaned[start : end + 1])
-                return obj.get("scores", []) if isinstance(obj, dict) else []
-            except json.JSONDecodeError:
-                pass
-        return []
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                with contextlib.suppress(json.JSONDecodeError):
+                    obj = json.loads(cleaned[start : end + 1])
+        if not isinstance(obj, dict):
+            return []
+        scores = obj.get("scores")
+        if not isinstance(scores, list):
+            return []
+        return [entry for entry in scores if isinstance(entry, dict)]
 
     async def _batch_embeddings(
         self, paper_ids: list[str]
@@ -658,6 +722,12 @@ class ExplorerAgent:
         The shared GraphStore does not persist references or full text, so we
         always go through the provider (which has its own disk cache) to obtain
         a Paper with its native neighbors / full text.
+
+        Definitive absence returns ``None``; a transient provider failure raises
+        :class:`TransientProviderError` so the caller can retain the candidate.
+        Unexpected provider/transport errors are translated to the same typed
+        transient error rather than degraded to ``None``, which would otherwise
+        masquerade as definitive absence and evict a live candidate.
         """
         provider = self._provider_for(paper_id)
         provider_name, native_id = parse_normalized_id(paper_id)
@@ -666,10 +736,13 @@ class ExplorerAgent:
         )
 
         try:
-            paper = await provider.get_paper(native)
+            async with _strict_scope(provider):
+                paper = await provider.get_paper(native)
+        except TransientProviderError:
+            raise
         except Exception as e:
             log.warning("fetch_failed", paper_id=paper_id, error=str(e))
-            return None
+            raise TransientProviderError(provider.name, "unexpected_error") from e
 
         if paper is None:
             return None
@@ -679,12 +752,17 @@ class ExplorerAgent:
         # only if both are unavailable (rare), in which case we skip the paper.
         if not paper.references and not paper.citations and getattr(provider, "supports_fulltext", False):
             try:
-                ft = await provider.get_fulltext_and_refs(
-                native, max_chars=self.cfg.llm.fulltext_max_chars, ref_limit=50
-            )
+                async with _strict_scope(provider):
+                    ft = await provider.get_fulltext_and_refs(
+                        native, max_chars=self.cfg.llm.fulltext_max_chars, ref_limit=50
+                    )
+            except TransientProviderError:
+                raise
             except Exception as e:
                 log.warning("fulltext_failed", paper_id=paper_id, error=str(e))
-                return None
+                raise TransientProviderError(
+                    provider.name, "fulltext_unexpected_error"
+                ) from e
             if ft is None:
                 log.info("fulltext_unavailable_skip", paper_id=paper_id, provider=provider.name)
                 return None

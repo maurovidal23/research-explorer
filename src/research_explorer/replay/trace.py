@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from research_explorer.logging_setup import get_logger
+from research_explorer.redaction import redact_obj, redact_secrets
 from research_explorer.replay.models import (
     CandidateScore,
     CandidateSelection,
@@ -169,7 +170,7 @@ class RunTraceStore:
 
     def append_event(self, run_id: str, type: str, payload: dict | None = None) -> int:
         """Append an event with the next per-run sequence number."""
-        payload = payload or {}
+        payload = redact_obj(payload or {})
         row = self._conn.execute(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE run_id = ?", (run_id,)
         ).fetchone()
@@ -262,7 +263,14 @@ class RunTraceStore:
         self._conn.execute(
             """INSERT INTO artifacts (artifact_id, run_id, name, kind, content, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (artifact_id, run_id, safe_filename(name), kind, content, utc_now()),
+            (
+                artifact_id,
+                run_id,
+                safe_filename(name),
+                kind,
+                redact_secrets(content),
+                utc_now(),
+            ),
         )
         self._conn.commit()
         return artifact_id

@@ -15,10 +15,12 @@ The layering (outer to inner):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
@@ -35,6 +37,7 @@ from tenacity import (
 )
 
 from research_explorer.logging_setup import get_logger
+from research_explorer.redaction import redact_secrets
 
 log = get_logger("providers")
 
@@ -44,9 +47,32 @@ class RetryableHTTPError(Exception):
 
     def __init__(self, status: int, url: str, retry_after: str | None = None):
         self.status = status
-        self.url = url
+        self.url = redact_secrets(url)
         self.retry_after = retry_after
-        super().__init__(f"{status} {url}")
+        super().__init__(f"{status} {self.url}")
+
+
+class TransientProviderError(Exception):
+    """Typed transient failure: circuit open or retries exhausted.
+
+    Callers that must distinguish temporary failure from definitive absence
+    (e.g. the research kernel frontier) depend on this being raised rather than
+    silently degraded to ``None``/``[]``. It never contains raw credentials.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        reason: str,
+        url: str | None = None,
+        status: int | None = None,
+    ):
+        self.provider = provider
+        self.reason = reason
+        self.url = redact_secrets(url) if url else None
+        self.status = status
+        detail = self.url or provider
+        super().__init__(f"transient provider failure ({reason}) for {detail}")
 
 
 RETRYABLE = (
@@ -58,14 +84,18 @@ RETRYABLE = (
 
 
 def _raise_for_retryable(response: httpx.Response) -> None:
-    """Raise RetryableHTTPError on 429/5xx; let 4xx fall through to raise_for_status."""
+    """Raise RetryableHTTPError on 429/5xx.
+
+    Ordinary 4xx responses are returned to the caller so ``get_json`` can map
+    them to definitive absence without ever counting toward the circuit
+    breaker (see STAB-2).
+    """
     if response.status_code == 429 or 500 <= response.status_code < 600:
         raise RetryableHTTPError(
             response.status_code,
             str(response.url),
             response.headers.get("retry-after"),
         )
-    response.raise_for_status()
 
 
 def _wait_retry_after(retry_state) -> float:
@@ -123,17 +153,19 @@ class ResilientProvider:
         cache_dir: str = "data/.cache",
         api_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        strict_transient: bool = False,
     ):
         self.name = name
         self.base_url = base_url
         self.cache_ttl = cache_ttl
+        self.strict_transient = strict_transient
 
         self.limiter = AsyncLimiter(rate, period)
         self.sem = asyncio.Semaphore(concurrency)
         self.breaker = aiobreaker.CircuitBreaker(
             fail_max=5,
             timeout_duration=timedelta(seconds=60),
-            exclude=[RetryableHTTPError],
+            exclude=[httpx.HTTPStatusError],
         )
 
         cache_path = f"{cache_dir}/{name}"
@@ -165,7 +197,12 @@ class ResilientProvider:
 
     async def _log_request(self, request: httpx.Request) -> None:
         request.extensions["t0"] = time.perf_counter()
-        log.debug("http.request", provider=self.name, method=request.method, url=str(request.url))
+        log.debug(
+            "http.request",
+            provider=self.name,
+            method=request.method,
+            url=redact_secrets(str(request.url)),
+        )
 
     async def _log_response(self, response: httpx.Response) -> None:
         t0 = response.request.extensions.get("t0")
@@ -191,11 +228,24 @@ class ResilientProvider:
             _raise_for_retryable(resp)
             return resp
 
+    @contextlib.asynccontextmanager
+    async def strict_outcomes(self) -> AsyncIterator[None]:
+        """Temporarily raise TransientProviderError instead of degrading to None."""
+        previous = self.strict_transient
+        self.strict_transient = True
+        try:
+            yield
+        finally:
+            self.strict_transient = previous
+
     async def get_json(self, path: str, **params: Any) -> dict | list | None:
         """GET path with caching, circuit breaker, retry, rate limit, and concurrency control.
 
-        Returns cached response on hit. Returns None if the circuit is open
-        or the request ultimately fails (graceful degradation).
+        Returns cached response on hit. On a definitive non-200 response (an
+        ordinary 4xx) returns None. On a transient failure — circuit open,
+        retry-exhausted 429/5xx, timeout, or network error — returns None when
+        ``strict_transient`` is False (backwards-compatible graceful
+        degradation) and raises :class:`TransientProviderError` when it is True.
         """
         key = self._cache_key(path, params)
         hit = self.cache.get(key)
@@ -204,11 +254,23 @@ class ResilientProvider:
 
         try:
             resp = await self.breaker.call(self._attempt_get, path, **params)
-        except aiobreaker.CircuitBreakerError:
-            log.warning("circuit_open", provider=self.name, path=path)
+        except aiobreaker.CircuitBreakerError as exc:
+            if self.strict_transient:
+                raise TransientProviderError(self.name, "circuit_open", path) from exc
+            log.warning("circuit_open", provider=self.name, path=redact_secrets(path))
             return None
-        except RETRYABLE:
-            log.warning("request_failed", provider=self.name, path=path)
+        except RETRYABLE as exc:
+            if self.strict_transient:
+                url = getattr(exc, "url", None) or path
+                raise TransientProviderError(
+                    self.name,
+                    "retry_exhausted",
+                    url,
+                    status=getattr(exc, "status", None),
+                ) from exc
+            log.warning(
+                "request_failed", provider=self.name, path=redact_secrets(path)
+            )
             return None
 
         if resp.status_code == 200:

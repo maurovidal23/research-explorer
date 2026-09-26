@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 import time
 
 from research_explorer.aco.colony import Colony
@@ -23,12 +22,12 @@ from research_explorer.graph.models import normalize_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import configure_logging, get_logger
 from research_explorer.providers.base import ResilientProvider
-from research_explorer.providers.factory import build_all_providers, build_provider
+from research_explorer.providers.factory import build_all_providers
+from research_explorer.providers.routing import SeedRef, route_seed_provider
+from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer, RunTraceStore
 
 log = get_logger("orchestrator")
-
-_ARXIV_ID = re.compile(r"^(arxiv:)?\d{4}\.\d{4,5}(v\d+)?$", re.IGNORECASE)
 
 
 class Orchestrator:
@@ -61,11 +60,14 @@ class Orchestrator:
             self.graph, embedder=self.llm.embed
         )
 
-        # Provider registry: all active providers, for cross-provider fetching
+        # Provider registry: all active providers, for cross-provider fetching.
+        # Never construct a fallback provider that is not enabled.
         self.providers: dict[str, ResilientProvider] = build_all_providers(config)
+        if not self.providers:
+            raise ValueError("No providers enabled; set providers.active in the config.")
         self.provider: ResilientProvider = self.providers.get(
-            config.providers.default, build_provider(config.providers.default, config)
-        )
+            config.providers.default
+        ) or next(iter(self.providers.values()))
 
         # Colony + scheduler
         self.colony = Colony(
@@ -84,11 +86,11 @@ class Orchestrator:
         self.trace = RunTraceStore(config.storage.trace_db_path)
         self.tracer: RunTracer | None = None
 
-    def _provider_for_seed(self, seed_paper_id: str) -> ResilientProvider:
-        """Route the seed to the right provider (arXiv IDs -> arXiv provider)."""
-        if "arxiv" in self.providers and _ARXIV_ID.match(seed_paper_id):
-            return self.providers["arxiv"]
-        return self.provider
+    def _provider_for_seed(self, seed_paper_id: str) -> tuple[ResilientProvider, SeedRef]:
+        """Route the seed to a enabled, capable provider (see providers.routing)."""
+        return route_seed_provider(
+            seed_paper_id, self.providers, self.cfg.providers.seed_routing
+        )
 
     async def run(self, seed_paper_id: str, seed_query: str) -> str:
         """Run the full exploration and return the winning narrative.
@@ -102,6 +104,8 @@ class Orchestrator:
         """
         start_time = time.monotonic()
         self._elapsed = 0.0
+
+        seed_provider, seed_ref = self._provider_for_seed(seed_paper_id)
 
         run_id = self.trace.create_run(
             seed_paper_id,
@@ -120,10 +124,20 @@ class Orchestrator:
             max_fetches=self.cfg.budget.max_fetches,
         )
         try:
-            return await self._run_impl(seed_paper_id, seed_query, start_time, run_id, self.tracer)
+            return await self._run_impl(
+                seed_paper_id,
+                seed_query,
+                start_time,
+                run_id,
+                self.tracer,
+                seed_provider,
+                seed_ref,
+            )
         except Exception as e:
             if self.tracer is not None:
-                self.tracer.record_artifact("run_error.txt", "error", str(e))
+                self.tracer.record_artifact(
+                    "run_error.txt", "error", redact_secrets(str(e))
+                )
             self.trace.finish_run(run_id, "failed")
             raise
 
@@ -134,6 +148,8 @@ class Orchestrator:
         start_time: float,
         run_id: str,
         tracer: RunTracer,
+        seed_provider: ResilientProvider,
+        seed_ref: SeedRef,
     ) -> str:
         tracer.emit(
             "orchestrator_start",
@@ -145,8 +161,14 @@ class Orchestrator:
         )
 
         # 1. Fetch the seed paper and cache it
-        seed_provider = self._provider_for_seed(seed_paper_id)
-        seed_paper = await seed_provider.get_paper(seed_paper_id)
+        tracer.emit(
+            "seed_routed",
+            seed=seed_paper_id,
+            kind=seed_ref.kind.value,
+            normalized=seed_ref.value,
+            provider=seed_provider.name,
+        )
+        seed_paper = await seed_provider.get_paper(seed_ref.fetch_value)
         if seed_paper is None:
             raise RuntimeError(f"Could not fetch seed paper: {seed_paper_id}")
         self.graph.cache_paper(seed_paper)

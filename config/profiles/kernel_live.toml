@@ -1,0 +1,36 @@
+# Live profile for the research-kernel vertical slice.
+#
+# Manual smoke testing only: this profile talks to real academic providers and
+# the configured LLM endpoint, so it needs network access and API keys. The
+# automated end-to-end tests use bounded frozen fakes instead; see
+# config/profiles/kernel_quick.toml.
+pipeline = "research-kernel"
+log_level = "INFO"
+
+[storage]
+db_path = "data/kernel_live/explorer.db"
+cache_dir = "data/kernel_live/.cache"
+research_db_path = "data/kernel_live/research.db"
+
+[providers]
+default = "openalex"
+active = ["openalex", "semantic_scholar"]
+# Explicit DOI seed routing order; empty falls back to openalex -> semantic_scholar.
+seed_routing = ["openalex", "semantic_scholar"]
+
+[research_kernel]
+policy = "greedy"
+seed = 0
+max_fetches = 40
+max_tokens = 200000
+max_time_seconds = 1800
+max_turns = 20
+context_input_target = 12000
+output_reserve = 6000
+evaluator_enabled = true
+rubric_version = "v1"
+eval_interval = 1
+transient_retry_attempts = 3
+snapshot_interval = 1
+plateau_turns = 5
+convergence_epsilon = 0.01

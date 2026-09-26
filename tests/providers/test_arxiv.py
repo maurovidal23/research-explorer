@@ -131,6 +131,14 @@ async def test_get_references_and_citations_are_empty() -> None:
     assert await p.get_citations("2301.00001") == []
 
 
+async def test_atom_client_requests_atom_xml(tmp_path) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+    try:
+        assert p.client.headers["accept"] == "application/atom+xml"
+    finally:
+        await p.aclose()
+
+
 # ---- Full-text + bibliography parsing (no network) --------------------------
 
 _HTML = """<html><head><title>X</title><style>a{}</style></head><body>
