@@ -21,7 +21,7 @@ _NAME_RE = re.compile(rf"(?i)^{_NAME}$")
 
 _SECRET_RE = re.compile(
     rf"(?i)(?P<pre>[?&;\"'\s=:,{{]|^)(?P<name>{_NAME})(?P<mid>\s*[\"']?\s*[:=]\s*[\"']?)"
-    rf"(?P<val>[^&\s,;\"'}}\]]+)"
+    rf"(?P<val>(?:(?:bearer|basic|token|digest)\s+)?[^&\s,;\"'}}\]]+)"
 )
 
 

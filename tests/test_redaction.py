@@ -40,11 +40,31 @@ def test_redact_obj_recurses_into_lists_and_dicts() -> None:
     assert SENTINEL not in str(redacted)
 
 
+def test_redacts_authorization_bearer_credential() -> None:
+    for text in (
+        f"Authorization: Bearer {SENTINEL}",
+        f"headers={{'authorization': 'Basic {SENTINEL}'}}",
+    ):
+        redacted = redact_secrets(text)
+        assert SENTINEL not in redacted
+        assert REDACTED in redacted
+
+
 def test_logging_processor_redacts_event_values() -> None:
     event = {"event": "http.request", "url": f"https://x.test?api_key={SENTINEL}"}
     processed = _redact_processor(None, "info", event)
     assert SENTINEL not in processed["url"]
     assert REDACTED in processed["url"]
+
+
+def test_logging_processor_redacts_nested_event_values() -> None:
+    event = {
+        "event": "provider_failure",
+        "context": {"url": f"https://x.test?token={SENTINEL}"},
+        "items": [{"api_key": SENTINEL}, f"authorization: Bearer {SENTINEL}"],
+    }
+    processed = _redact_processor(None, "warning", event)
+    assert SENTINEL not in str(processed)
 
 
 def test_trace_events_and_artifacts_never_contain_secret() -> None:

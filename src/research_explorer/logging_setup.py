@@ -14,7 +14,7 @@ from typing import Any, ClassVar
 
 import structlog
 
-from research_explorer.redaction import redact_secrets
+from research_explorer.redaction import redact_obj
 
 WIDTH = 72
 
@@ -271,11 +271,8 @@ class ACORenderer:
 
 
 def _redact_processor(logger, method_name, event_dict):
-    """Redact secrets from every string value (including formatted exceptions)."""
-    for key, value in event_dict.items():
-        if isinstance(value, str):
-            event_dict[key] = redact_secrets(value)
-    return event_dict
+    """Redact secrets from every value, recursing into nested structures."""
+    return redact_obj(event_dict)
 
 
 def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
