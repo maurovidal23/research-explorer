@@ -5,8 +5,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "NaN",
       "options": {
-        "baseURL": "https://api.nan.builders/v1",
-        "apiKey": "{env:NAN_API_KEY}"
+        "baseURL": "https://api.nan.builders/v1"
       },
       "models": {
         "deepseek-v4-flash-0731": {
