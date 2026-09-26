@@ -68,9 +68,9 @@ class PeerVoting:
         valid_scores: list[float] = []
         voter_weights: list[float] = []
         for v, s in zip(voters, scores, strict=False):
-            if isinstance(s, Exception):
+            if isinstance(s, BaseException):
                 continue
-            valid_scores.append(s)
+            valid_scores.append(float(s))
             voter_weights.append(v.state.quality)
 
         if not valid_scores:

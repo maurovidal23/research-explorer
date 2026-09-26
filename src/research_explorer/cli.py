@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from research_explorer.config import load_config
+from research_explorer.config import get_api_key, load_config
 from research_explorer.logging_setup import configure_logging, get_logger
 
 app = typer.Typer(
@@ -32,11 +32,19 @@ def explore(
     ),
     output: str = typer.Option(None, "--output", "-o", help="Write narrative to file"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Emit JSON log lines"),
+    pipeline: str = typer.Option(
+        None, "--pipeline", help="Pipeline mode: aco | research-kernel"
+    ),
 ) -> None:
     """Explore a research line starting from a seed paper."""
     cfg = load_config(config_path)
     configure_logging(cfg.log_level, json_logs=json_logs)
     log = get_logger("cli")
+
+    mode = (pipeline or cfg.pipeline or "aco").replace("_", "-").lower()
+    if mode == "research-kernel":
+        _run_research_kernel(cfg, seed_paper_id, seed_query, output)
+        return
 
     from research_explorer.orchestrator.runner import Orchestrator
 
@@ -64,6 +72,104 @@ def explore(
 
     if obsidian_dir:
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
+
+
+def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:
+    """Run the single-agent research-kernel vertical slice."""
+    import uuid
+
+    from research_explorer.agents.llm_client import LLMClient
+    from research_explorer.graph.store import GraphStore
+    from research_explorer.providers.factory import build_all_providers
+    from research_explorer.providers.routing import route_seed_provider
+    from research_explorer.research import (
+        BudgetState,
+        CompositeEvaluator,
+        DeterministicIntegrity,
+        GraphEvidenceGateway,
+        GreedyPolicy,
+        KernelOptions,
+        LLMResearchAgent,
+        LLMRubricEvaluator,
+        ResearchKernel,
+        ResearchObjective,
+        ResearchStore,
+    )
+
+    rk = cfg.research_kernel
+    providers = build_all_providers(cfg)
+    if not providers:
+        raise typer.BadParameter("No providers enabled; set providers.active in the config.")
+    seed_provider, seed_ref = route_seed_provider(
+        seed_paper_id, providers, cfg.providers.seed_routing
+    )
+
+    graph = GraphStore(cfg.storage.db_path)
+    store = ResearchStore(cfg.storage.research_db_path)
+    llm = LLMClient(
+        base_url=cfg.llm.base_url,
+        api_key=get_api_key(cfg.llm.api_key_env),
+        max_concurrent=cfg.llm.max_concurrent,
+        rpm=cfg.llm.rpm,
+    )
+    gateway = GraphEvidenceGateway(graph, providers, seed_provider.name)
+    policy = GreedyPolicy(seed=rk.seed)
+    agent = LLMResearchAgent(llm, model=cfg.llm.explorer_model, max_tokens=rk.output_reserve)
+    rubric = (
+        LLMRubricEvaluator(llm, model=cfg.llm.judge_model)
+        if rk.evaluator_enabled
+        else None
+    )
+    evaluator = CompositeEvaluator(
+        integrity=DeterministicIntegrity(paper_exists=gateway.paper_exists),
+        rubric=rubric,
+        weights=rk.weights,
+        rubric_version=rk.rubric_version,
+    )
+    options = KernelOptions(
+        max_transient_attempts=rk.transient_retry_attempts,
+        plateau_turns=rk.plateau_turns,
+        convergence_epsilon=rk.convergence_epsilon,
+        snapshot_interval=rk.snapshot_interval,
+        context_input_target=rk.context_input_target,
+        output_reserve=rk.output_reserve,
+        eval_interval=rk.eval_interval,
+        evaluator_enabled=rk.evaluator_enabled,
+    )
+    kernel = ResearchKernel(
+        store=store, gateway=gateway, policy=policy, agent=agent, evaluator=evaluator,
+        options=options,
+    )
+    objective = ResearchObjective(
+        run_id=uuid.uuid4().hex[:12],
+        seed_paper_id=seed_ref.value,
+        question=seed_query,
+        budget=BudgetState(
+            max_fetches=rk.max_fetches,
+            max_tokens=rk.max_tokens,
+            max_time_seconds=rk.max_time_seconds,
+            max_turns=rk.max_turns,
+        ),
+        random_seed=rk.seed,
+    )
+
+    async def _run() -> str:
+        try:
+            answer = await kernel.run(objective)
+            return answer.render_markdown()
+        finally:
+            await llm.aclose()
+            for provider in providers.values():
+                await provider.aclose()
+            graph.close()
+            store.close()
+
+    report = asyncio.run(_run())
+    if output:
+        Path(output).write_text(report, encoding="utf-8")
+        typer.echo(f"Research answer written to {output}")
+    else:
+        typer.echo(report)
 
 
 @mcp_app.command("list")
@@ -113,9 +219,15 @@ def config(
     """Show the loaded configuration."""
     cfg = load_config(config_path)
     typer.echo(f"LLM: {cfg.llm.base_url} (model: {cfg.llm.explorer_model})")
+    typer.echo(f"Pipeline: {cfg.pipeline}")
     typer.echo(f"ACO: colony={cfg.aco.colony_size}, K={cfg.aco.max_concurrent}, k={cfg.aco.k_per_turn}")
     typer.echo(f"Providers: {cfg.providers.active} (default: {cfg.providers.default})")
     typer.echo(f"Budget: {cfg.budget.type}={cfg.budget.max_fetches}")
+    rk = cfg.research_kernel
+    typer.echo(
+        f"ResearchKernel: policy={rk.policy}, fetches={rk.max_fetches}, "
+        f"turns={rk.max_turns}, evaluator={rk.evaluator_enabled} ({rk.rubric_version})"
+    )
     typer.echo(f"Quality weights: S={cfg.quality.w_self} P={cfg.quality.w_peers} J={cfg.quality.w_virgin} R={cfg.quality.w_structural}")
 
 

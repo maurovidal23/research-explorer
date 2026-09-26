@@ -96,6 +96,7 @@ class ProvidersConfig:
     default: str = "semantic_scholar"
     active: list[str] = field(default_factory=lambda: ["semantic_scholar", "openalex", "pubmed", "arxiv"])
     entries: dict[str, ProviderEntry] = field(default_factory=dict)
+    seed_routing: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -139,11 +140,51 @@ class StorageConfig:
     db_path: str = "data/explorer.db"
     cache_dir: str = "data/.cache"
     trace_db_path: str = "data/replay.db"
+    research_db_path: str = "data/research.db"
+
+
+def _default_eval_weights() -> dict[str, float]:
+    return {
+        "integrity": 0.35,
+        "relevance": 0.12,
+        "coverage": 0.10,
+        "mechanistic_depth": 0.08,
+        "methodological_understanding": 0.05,
+        "evidence_traceability": 0.15,
+        "counterevidence": 0.05,
+        "uncertainty_calibration": 0.05,
+        "novelty": 0.03,
+        "redundancy": 0.02,
+    }
+
+
+@dataclass
+class ResearchKernelConfig:
+    """Additive configuration for the ``research_kernel`` pipeline mode."""
+
+    policy: str = "greedy"
+    seed: int = 0
+    require_question: bool = True
+    max_fetches: int = 20
+    max_tokens: int = 60_000
+    max_time_seconds: int = 900
+    max_turns: int = 10
+    context_input_target: int = 6_000
+    output_reserve: int = 1_500
+    evaluator_enabled: bool = True
+    rubric_version: str = "v1"
+    eval_interval: int = 1
+    transient_retry_attempts: int = 2
+    snapshot_interval: int = 1
+    plateau_turns: int = 3
+    convergence_epsilon: float = 0.01
+    weights: dict[str, float] = field(default_factory=_default_eval_weights)
 
 
 @dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
+    pipeline: str = "aco"
     aco: ACOConfig = field(default_factory=ACOConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
     direction: DirectionConfig = field(default_factory=DirectionConfig)
@@ -154,6 +195,7 @@ class Config:
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    research_kernel: ResearchKernelConfig = field(default_factory=ResearchKernelConfig)
     log_level: str = "INFO"
     seed_query: str = ""
 
@@ -200,6 +242,7 @@ def load_config(path: str | Path) -> Config:
     cfg = Config()
     cfg.log_level = data.get("log_level", "INFO")
     cfg.seed_query = data.get("seed_query", "")
+    cfg.pipeline = data.get("pipeline", "aco")
 
     if "llm" in data:
         llm = data["llm"]
@@ -265,8 +308,9 @@ def load_config(path: str | Path) -> Config:
         cfg.providers = ProvidersConfig(
             default=p.get("default", cfg.providers.default),
             active=p.get("active", cfg.providers.active),
+            seed_routing=p.get("seed_routing", cfg.providers.seed_routing),
             entries=_load_provider_entries(
-                {k: v for k, v in p.items() if k not in ("default", "active")}
+                {k: v for k, v in p.items() if k not in ("default", "active", "seed_routing")}
             ),
         )
 
@@ -316,6 +360,39 @@ def load_config(path: str | Path) -> Config:
             db_path=st.get("db_path", cfg.storage.db_path),
             cache_dir=st.get("cache_dir", cfg.storage.cache_dir),
             trace_db_path=st.get("trace_db_path", cfg.storage.trace_db_path),
+            research_db_path=st.get("research_db_path", cfg.storage.research_db_path),
+        )
+
+    if "research_kernel" in data:
+        rk = data["research_kernel"]
+        cfg.research_kernel = ResearchKernelConfig(
+            policy=rk.get("policy", cfg.research_kernel.policy),
+            seed=rk.get("seed", cfg.research_kernel.seed),
+            require_question=rk.get("require_question", cfg.research_kernel.require_question),
+            max_fetches=rk.get("max_fetches", cfg.research_kernel.max_fetches),
+            max_tokens=rk.get("max_tokens", cfg.research_kernel.max_tokens),
+            max_time_seconds=rk.get("max_time_seconds", cfg.research_kernel.max_time_seconds),
+            max_turns=rk.get("max_turns", cfg.research_kernel.max_turns),
+            context_input_target=rk.get(
+                "context_input_target", cfg.research_kernel.context_input_target
+            ),
+            output_reserve=rk.get("output_reserve", cfg.research_kernel.output_reserve),
+            evaluator_enabled=rk.get(
+                "evaluator_enabled", cfg.research_kernel.evaluator_enabled
+            ),
+            rubric_version=rk.get("rubric_version", cfg.research_kernel.rubric_version),
+            eval_interval=rk.get("eval_interval", cfg.research_kernel.eval_interval),
+            transient_retry_attempts=rk.get(
+                "transient_retry_attempts", cfg.research_kernel.transient_retry_attempts
+            ),
+            snapshot_interval=rk.get(
+                "snapshot_interval", cfg.research_kernel.snapshot_interval
+            ),
+            plateau_turns=rk.get("plateau_turns", cfg.research_kernel.plateau_turns),
+            convergence_epsilon=rk.get(
+                "convergence_epsilon", cfg.research_kernel.convergence_epsilon
+            ),
+            weights=rk.get("weights", cfg.research_kernel.weights),
         )
 
     return cfg

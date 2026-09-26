@@ -121,12 +121,25 @@ class GraphStore:
     # ---- Papers ----------------------------------------------------------
 
     def cache_paper(self, paper: Paper) -> None:
-        """Insert or replace a paper in the store."""
+        """Insert or replace a paper in the store.
+
+        Re-caching provider metadata without an embedding must not erase an
+        embedding already computed and stored for the node; an explicit
+        non-null embedding may replace it (STAB-5).
+        """
         nid = normalize_id(paper.provider, paper.id)
         existing = self._conn.execute(
-            "SELECT integrated FROM papers WHERE id = ?", (nid,)
+            "SELECT integrated, embedding FROM papers WHERE id = ?", (nid,)
         ).fetchone()
         integrated = int(bool(existing and existing["integrated"]))
+        stored_embedding = (
+            existing["embedding"]
+            if existing is not None and existing["embedding"] is not None
+            else None
+        )
+        embedding_blob = (
+            _pack_embedding(paper.embedding) if paper.embedding else stored_embedding
+        )
         self._conn.execute(
             """INSERT OR REPLACE INTO papers
                (id, provider, doi, arxiv_id, title, year, authors, citation_count,
@@ -142,7 +155,7 @@ class GraphStore:
                 json.dumps(paper.authors),
                 paper.citation_count,
                 paper.abstract,
-                _pack_embedding(paper.embedding) if paper.embedding else None,
+                embedding_blob,
                 None,
                 json.dumps(
                     {

@@ -195,13 +195,15 @@ async def test_take_turn_rejects_mismatched_title() -> None:
     emitted = []
     e._frontier = SimpleNamespace(
         best=lambda exclude=None: "arxiv:1901.03228" if not exclude or "arxiv:1901.03228" not in exclude else None,
-        eligible=lambda exclude=None: ["arxiv:1901.03228"],
+        eligible=lambda exclude=None, turn=None: ["arxiv:1901.03228"],
         sources={"arxiv:1901.03228": ("arxiv:seed", "ref")},
         remove=removed.append,
+        record_absence=removed.append,
         unevaluated=lambda: [],
         set_score=lambda nid, s: None,
         claim_for=lambda nid, agent: True,
         release=lambda nid, agent: None,
+        release_all=lambda agent: None,
         is_claimed=lambda nid: False,
         claims={},
     )
