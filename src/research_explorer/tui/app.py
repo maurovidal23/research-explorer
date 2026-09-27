@@ -28,6 +28,7 @@ from research_explorer.events.models import (
     TimelineEntry,
 )
 from research_explorer.events.projection import RunProjection
+from research_explorer.events.sink import QueueMarker
 from research_explorer.redaction import redact_secrets
 from research_explorer.tui import text as render
 
@@ -166,9 +167,10 @@ class ResearchTUIApp(App[None]):
     def __init__(
         self,
         projection: RunProjection | RunViewState | None = None,
-        queue: asyncio.Queue[RunEvent] | None = None,
+        queue: asyncio.Queue[RunEvent | QueueMarker] | None = None,
         runner: Callable[[], Awaitable[Any]] | None = None,
         can_detach: bool = False,
+        on_result: Callable[[Any], None] | None = None,
     ) -> None:
         super().__init__()
         if isinstance(projection, RunProjection):
@@ -180,13 +182,17 @@ class ResearchTUIApp(App[None]):
         self._queue = queue
         self._runner = runner
         self.can_detach = can_detach
+        self.on_result = on_result
         self.run_result: Any = None
         self.cancelled = False
+        self.report_error: str | None = None
         self.narrow = False
         self.active_pane = "both"
         self.selected_agent_index = 0
         self.event_outcome_filter = ""
         self._runner_worker: Any = None
+        self._consumer_worker: Any = None
+        self._runner_finished = False
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -222,9 +228,19 @@ class ResearchTUIApp(App[None]):
 
     def on_mount(self) -> None:
         if self._queue is not None:
-            self.run_worker(self._consume(), exclusive=False)
+            self._consumer_worker = self.run_worker(
+                self._consume(),
+                name="live-event-consumer",
+                group="live-events",
+                exclusive=False,
+            )
         if self._runner is not None:
-            self._runner_worker = self.run_worker(self._run_runner(), exclusive=True)
+            self._runner_worker = self.run_worker(
+                self._run_runner(),
+                name="research-runner",
+                group="research-runner",
+                exclusive=True,
+            )
         self.set_interval(1.0, self._tick_elapsed)
         self._apply_narrow(self.size.width < NARROW_BREAKPOINT)
         self.refresh_view()
@@ -249,11 +265,35 @@ class ResearchTUIApp(App[None]):
     async def _consume(self) -> None:
         assert self._queue is not None
         while True:
-            event = await self._queue.get()
-            if event is None:
+            item = await self._queue.get()
+            if item is None:
                 break
-            self.projection.apply(event)
+            if isinstance(item, QueueMarker):
+                if item.future is not None and not item.future.done():
+                    item.future.set_result(None)
+                continue
+            self.projection.apply(item)
             self.refresh_view()
+
+    async def _acknowledge_events(self) -> None:
+        """Wait until every event published before completion is projected.
+
+        A FIFO marker is appended behind the queued events; the consumer
+        resolves it only after applying them all. No sleeps, no polling.
+        """
+        queue = self._queue
+        if queue is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        marker = QueueMarker(loop.create_future())
+        await queue.put(marker)
+        future = marker.future
+        assert future is not None
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(future)
 
     async def _run_runner(self) -> None:
         if self._runner is None:
@@ -262,7 +302,6 @@ class ResearchTUIApp(App[None]):
             self.run_result = await self._runner()
         except asyncio.CancelledError:
             self.cancelled = True
-            raise
         except Exception as exc:
             self.projection.apply(
                 RunEvent(
@@ -271,7 +310,18 @@ class ResearchTUIApp(App[None]):
                     payload={"error": redact_secrets(str(exc))},
                 )
             )
-            self.refresh_view()
+        # Terminal-state synchronization: a runner result is only complete once
+        # every event published before it has been applied to the projection.
+        # Durable failure/cancellation events already in the channel take
+        # precedence; no synthetic terminal event is fabricated here.
+        await self._acknowledge_events()
+        self._runner_finished = True
+        if self.run_result is not None and self.on_result is not None:
+            try:
+                self.on_result(self.run_result)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.report_error = redact_secrets(str(exc))
+        self.refresh_view()
 
     # ---- rendering --------------------------------------------------------
 
@@ -457,11 +507,20 @@ class ResearchTUIApp(App[None]):
     def _terminal(self) -> bool:
         return self.state.status in ("completed", "cancelled", "failed")
 
+    def _active(self) -> bool:
+        """True only while a run can still be cancelled or detached.
+
+        A run already completed in the trace store is reflected by a terminal
+        projection (all completion events are applied before the runner is
+        considered finished), so a terminal projection is never active.
+        """
+        return self._runner is not None and not self._terminal()
+
     def action_quit_flow(self) -> None:
         if self.screen is not self.screen_stack[0]:
             self.screen.dismiss(None)
             return
-        if self._terminal() or self._runner is None:
+        if not self._active():
             self.exit()
             return
         self.push_screen(ConfirmQuitScreen(self.can_detach), self._on_quit_choice)
@@ -475,21 +534,27 @@ class ResearchTUIApp(App[None]):
             self.action_cancel_flow()
 
     def action_cancel_flow(self) -> None:
+        if not self._active():
+            if self._terminal():
+                self.exit()
+            return
         if self._runner_worker is not None and not self._runner_worker.is_finished:
             self.cancelled = True
-            self.projection.apply(
-                RunEvent(seq=0, type="status", payload={"status": "evaluating"})
-            )
             self._runner_worker.cancel()
             self.refresh_view()
-        elif self._terminal():
-            self.exit()
 
 
 def build_app(
     projection: RunProjection | RunViewState | None = None,
-    queue: asyncio.Queue[RunEvent] | None = None,
+    queue: asyncio.Queue[RunEvent | QueueMarker] | None = None,
     runner: Callable[[], Awaitable[Any]] | None = None,
     can_detach: bool = False,
+    on_result: Callable[[Any], None] | None = None,
 ) -> ResearchTUIApp:
-    return ResearchTUIApp(projection=projection, queue=queue, runner=runner, can_detach=can_detach)
+    return ResearchTUIApp(
+        projection=projection,
+        queue=queue,
+        runner=runner,
+        can_detach=can_detach,
+        on_result=on_result,
+    )

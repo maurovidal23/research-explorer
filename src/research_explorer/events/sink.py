@@ -10,10 +10,24 @@ authoritative) rather than stalling research.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from research_explorer.events.models import RunEvent
+
+
+@dataclass
+class QueueMarker:
+    """Ordered acknowledgement marker placed behind published events.
+
+    It is never rendered or projected. When the consumer reaches it, every
+    event published before it has already been applied, so awaiting its future
+    is a bounded acknowledgement rather than a timing-dependent poll.
+    """
+
+    future: asyncio.Future[None] | None = field(default=None)
 
 
 @runtime_checkable
@@ -49,12 +63,12 @@ class ChannelSink:
     """
 
     def __init__(self, maxsize: int = 1024, loop: asyncio.AbstractEventLoop | None = None) -> None:
-        self._queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=maxsize)
+        self._queue: asyncio.Queue[RunEvent | QueueMarker] = asyncio.Queue(maxsize=maxsize)
         self._loop = loop
         self.dropped = 0
 
     @property
-    def queue(self) -> asyncio.Queue[RunEvent]:
+    def queue(self) -> asyncio.Queue[RunEvent | QueueMarker]:
         return self._queue
 
     def publish(self, event: RunEvent) -> None:
@@ -81,10 +95,28 @@ class ChannelSink:
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
-    async def get(self) -> RunEvent:
+    async def barrier(self) -> None:
+        """Block until every previously published event has been consumed.
+
+        The marker is appended *behind* the currently queued events, so FIFO
+        ordering guarantees the consumer applies them all before resolving it.
+        A cancellation of the awaiting task never discards the marker.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        marker = QueueMarker(loop.create_future())
+        await self._queue.put(marker)
+        future = marker.future
+        assert future is not None
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(future)
+
+    async def get(self) -> RunEvent | QueueMarker:
         return await self._queue.get()
 
-    def get_nowait(self) -> RunEvent:
+    def get_nowait(self) -> RunEvent | QueueMarker:
         return self._queue.get_nowait()
 
     def empty(self) -> bool:

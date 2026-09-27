@@ -20,11 +20,15 @@ from research_explorer.events.models import (
     AGENT_EXHAUSTED,
     AGENT_FAILED,
     AGENT_WAITING,
+    GENERIC_NO_WINNER_REASON,
     NODE_ACTIVE,
     NODE_COMPLETED,
     NODE_FAILED,
     NODE_PENDING,
     NODE_SKIPPED,
+    OUTCOME_DEGRADED,
+    OUTCOME_OK,
+    REASON_LABELS,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -621,6 +625,11 @@ class RunProjection:
         cits = _as_int(p.get("cits"), 0)
         entry_id = f"discovery:{agent_id}:{wave}:{turn}:{paper_id}"
         label = f"discover {paper_id or 'paper'} (refs={refs} cits={cits})"
+        detail: dict[str, Any] = {"refs": refs, "cits": cits}
+        if "traversable" in p:
+            traversable = _as_int(p.get("traversable"), 0)
+            label += f" traversable={traversable}"
+            detail["traversable"] = traversable
         existing = self.state.entry_by_id(entry_id)
         if existing is None:
             self._add_entry(
@@ -635,13 +644,13 @@ class RunProjection:
                     paper_id=paper_id,
                     parent_id=self._parent_for(wave, turn, agent_id),
                     seq=event.seq,
-                    detail={"refs": refs, "cits": cits},
+                    detail=detail,
                 )
             )
         else:
             existing.status = NODE_COMPLETED
             existing.label = label
-            existing.detail.update({"refs": refs, "cits": cits})
+            existing.detail.update(detail)
 
     def _on_discovery_failed(self, event: RunEvent) -> None:
         p = event.payload
@@ -827,9 +836,48 @@ class RunProjection:
         self.state.status = status if status in (
             STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED
         ) else STATUS_COMPLETED
+        self._apply_degraded_outcome(event, winner)
         if self.state.current_wave:
             self._set_wave_status(self.state.current_wave, NODE_COMPLETED)
         self._finalize_agents()
+
+    def _apply_degraded_outcome(self, event: RunEvent, winner: str) -> None:
+        """Project the terminal reason for a completed but degraded run.
+
+        Enriched ``no_winner`` events carry ``outcome``/``reason_code``/``reason``
+        and are preceded by a ``warning`` event with the same reason. Legacy
+        unenriched ``no_winner`` events still project as completed and receive a
+        single generic, non-duplicated explanation.
+        """
+        p = event.payload
+        outcome = str(p.get("outcome") or "").strip()
+        reason_code = str(p.get("reason_code") or "").strip()
+        reason = str(p.get("reason") or "").strip()
+        if not reason and reason_code:
+            reason = REASON_LABELS.get(reason_code, reason_code)
+        legacy = event.type == "no_winner"
+        if not reason and not winner and (legacy or outcome == OUTCOME_DEGRADED):
+            reason = GENERIC_NO_WINNER_REASON
+        if outcome:
+            self.state.outcome = outcome
+        elif legacy and not winner:
+            self.state.outcome = OUTCOME_DEGRADED
+        elif winner:
+            self.state.outcome = OUTCOME_OK
+        if reason_code and not self.state.terminal_reason_code:
+            self.state.terminal_reason_code = reason_code
+        if reason and not self.state.terminal_reason:
+            self.state.terminal_reason = reason
+        if reason and not winner:
+            self._ensure_warning(reason)
+
+    def _ensure_warning(self, text: str) -> None:
+        if not text:
+            return
+        for existing in self.state.warnings:
+            if text in existing or existing in text:
+                return
+        self.state.warnings.append(text)
 
     def _on_run_failed(self, event: RunEvent) -> None:
         error = redact_secrets(str(event.payload.get("error", "run failed")))

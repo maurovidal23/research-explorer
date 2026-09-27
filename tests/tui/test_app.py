@@ -604,6 +604,278 @@ async def test_render_failure_requests_orderly_shutdown(monkeypatch) -> None:
         assert app._exit
 
 
+async def test_consumer_and_runner_workers_are_independent() -> None:
+    controller = TUIController()
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def runner() -> tuple[str, None]:
+        started.set()
+        await gate.wait()
+        return "late report", None
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await started.wait()
+        controller.event_sink.publish(
+            RunEvent(
+                seq=1,
+                type="orchestrator_start",
+                payload={"run_id": "live-run", "colony_size": 1, "K": 1},
+            )
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=2,
+                type="agent_turn_start",
+                payload={"agent_id": "z0", "caste": "mixto", "oleada": 1, "turn": 0},
+            )
+        )
+        for _ in range(40):
+            await pilot.pause()
+            if app.state.run_id == "live-run" and "A01" in app.query_one(
+                "#tabs", AgentTabs
+            ).plain_text:
+                break
+        assert app.state.run_id == "live-run"
+        assert not app._runner_finished
+        assert not app._runner_worker.is_finished
+        assert not app._consumer_worker.is_finished
+
+        gate.set()
+        for _ in range(40):
+            await pilot.pause()
+            if app._runner_finished:
+                break
+        assert app._runner_finished
+        assert app.run_result == ("late report", None)
+
+
+async def test_runner_completion_waits_for_queued_events() -> None:
+    controller = TUIController()
+
+    async def runner() -> tuple[str, None]:
+        controller.event_sink.publish(
+            RunEvent(
+                seq=1,
+                type="orchestrator_start",
+                payload={"run_id": "sync-run", "colony_size": 1, "K": 1},
+            )
+        )
+        for i in range(40):
+            controller.event_sink.publish(
+                RunEvent(
+                    seq=2 + i,
+                    type="agent_turn_start",
+                    payload={"agent_id": "a0", "caste": "mixto", "oleada": 1, "turn": i},
+                )
+            )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=100,
+                type="warning",
+                payload={
+                    "reason": "no traversable identifiers",
+                    "reason_code": "no_traversable_identifiers",
+                    "classification": "degraded",
+                },
+            )
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=101,
+                type="no_winner",
+                payload={
+                    "run_id": "sync-run",
+                    "status": "completed",
+                    "outcome": "degraded",
+                    "reason_code": "no_traversable_identifiers",
+                    "reason": "no traversable identifiers",
+                    "elapsed": 23.0,
+                },
+            )
+        )
+        return "report body", None
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(60):
+            await pilot.pause()
+            if app._runner_finished and app.run_result is not None:
+                break
+        assert app._runner_finished
+        assert app.state.status == "completed"
+        assert app.state.status != "initializing"
+        assert app.state.terminal_reason_code == "no_traversable_identifiers"
+        assert "a0" in app.state.agents
+        assert app.run_result == ("report body", None)
+
+
+async def test_q_after_completion_exits_without_confirmation() -> None:
+    projection = RunProjection.from_events(
+        [
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "done"}),
+            RunEvent(
+                seq=2,
+                type="orchestrator_complete",
+                payload={"run_id": "done", "status": "completed", "winner": "a0"},
+            ),
+        ]
+    )
+    gate = asyncio.Event()
+
+    async def runner() -> str:
+        await gate.wait()
+        return "done"
+
+    app = build_app(projection, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.state.status == "completed"
+        await pilot.press("q")
+        await pilot.pause()
+        assert not isinstance(app.screen, ConfirmQuitScreen)
+        assert app._exit
+        gate.set()
+
+
+async def test_cancellation_projects_durable_run_cancelled() -> None:
+    controller = TUIController()
+    gate = asyncio.Event()
+
+    async def runner() -> tuple[str, None]:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "cancel-run"})
+        )
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            controller.event_sink.publish(
+                RunEvent(seq=2, type="run_cancelled", payload={"run_id": "cancel-run"})
+            )
+            raise
+        return "never", None
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        for _ in range(40):
+            await pilot.pause()
+            if app.state.status == "cancelled":
+                break
+        assert app.cancelled
+        assert app.state.status == "cancelled"
+
+
+async def test_cancel_cannot_relabel_a_completed_run() -> None:
+    controller = TUIController()
+    controller.event_sink.publish(
+        RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "done"})
+    )
+    controller.event_sink.publish(
+        RunEvent(
+            seq=2,
+            type="orchestrator_complete",
+            payload={"run_id": "done", "status": "completed", "winner": "a0"},
+        )
+    )
+    never = asyncio.Event()
+
+    async def runner() -> str:
+        await never.wait()
+        return "done"
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.state.status == "completed"
+        app.action_cancel_flow()
+        await pilot.pause()
+        assert app.state.status == "completed"
+        assert app.state.winner_agent == "a0"
+        assert not any(e.type == "run_cancelled" for e in app.state.events)
+        never.set()
+
+
+async def test_report_persisted_before_review_and_not_rewritten(tmp_path) -> None:
+    from research_explorer.cli import _write_report_atomic
+
+    controller = TUIController()
+    target = tmp_path / "report.md"
+    writes: list[str] = []
+
+    def persist(result) -> None:
+        writes.append(result[0])
+        _write_report_atomic(result[0], str(target))
+
+    async def runner() -> tuple[str, None]:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "persist"})
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=2,
+                type="no_winner",
+                payload={
+                    "run_id": "persist",
+                    "status": "completed",
+                    "outcome": "degraded",
+                    "reason_code": "no_traversable_identifiers",
+                    "reason": "no traversable identifiers",
+                },
+            )
+        )
+        return "REPORT BODY", None
+
+    app = build_app(
+        controller.projection, queue=controller.queue, runner=runner, on_result=persist
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if app._runner_finished:
+                break
+        assert app.state.status == "completed"
+        assert target.exists()
+        assert target.read_text(encoding="utf-8") == "REPORT BODY"
+        assert writes == ["REPORT BODY"]
+        assert app.run_result == ("REPORT BODY", None)
+
+
+async def test_report_write_failure_keeps_run_completed() -> None:
+    controller = TUIController()
+
+    def boom(result) -> None:
+        raise RuntimeError("disk full api_key=sk-sentinel-4242")
+
+    async def runner() -> tuple[str, None]:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "writer"})
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=2,
+                type="orchestrator_complete",
+                payload={"run_id": "writer", "status": "completed", "winner": "a0"},
+            )
+        )
+        return "body", None
+
+    app = build_app(
+        controller.projection, queue=controller.queue, runner=runner, on_result=boom
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if app._runner_finished:
+                break
+        assert app.state.status == "completed"
+        assert app.state.winner_agent == "a0"
+        assert app.report_error is not None
+        assert "sk-sentinel-4242" not in app.report_error
+
+
 async def test_event_outcome_filter_cycles_in_pilot() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:

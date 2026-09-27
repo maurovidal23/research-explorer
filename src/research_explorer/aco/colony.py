@@ -11,18 +11,24 @@ import asyncio
 import random
 import uuid
 from collections import Counter
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
+from research_explorer.aco.diagnostics import SeedDiscovery, classify_empty_frontier
 from research_explorer.aco.frontier import SharedFrontier
 from research_explorer.agents.explorer import ExplorerAgent
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.state import AgentState
 from research_explorer.config import Config
 from research_explorer.graph.embeddings import EmbeddingService
+from research_explorer.graph.models import parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
+from research_explorer.redaction import redact_secrets
 from research_explorer.resolution.traversal import build_neighbor_expander
+
+if TYPE_CHECKING:
+    from research_explorer.replay.trace import RunTracer
 
 log = get_logger("colony")
 
@@ -62,11 +68,22 @@ class Colony:
         self._best_snapshot_agent: str = ""
         self._best_snapshot_oleada: int = 0
         self._current_oleada: int = 0
+        self._seed_discovery_records: list[SeedDiscovery] = []
 
-    async def initialize(self, seed_id: str, seed_query: str) -> None:
-        """Initialize the colony: N agents at the seed with assigned castes."""
+    async def initialize(
+        self,
+        seed_id: str,
+        seed_query: str,
+        tracer: RunTracer | None = None,
+    ) -> None:
+        """Initialize the colony: N agents at the seed with assigned castes.
+
+        ``tracer`` is attached to every explorer *before* seed neighbor
+        discovery starts, so the seed read emits structured telemetry.
+        """
         self.seed_id = seed_id
         self.seed_query = seed_query
+        self._seed_discovery_records = []
 
         # Compute seed embedding for eta heuristic
         seed_paper = self.graph.get_paper(seed_id)
@@ -109,15 +126,15 @@ class Colony:
                 expander=self.expander,
                 rng=self._agent_rng(i),
             )
+            if tracer is not None:
+                agent.tracer = tracer
             self.agents.append(agent)
 
         # Each agent reads the seed and discovers its neighbors into its own
-        # private graph (per-agent incomplete graph). Done concurrently.
+        # private graph (per-agent incomplete graph). Done concurrently, with
+        # structured telemetry and contained failures.
         self.shared_visited.add(seed_id)
-        await asyncio.gather(
-            *(a._discover_neighbors(seed_id) for a in self.agents),
-            return_exceptions=True,
-        )
+        await asyncio.gather(*(self._seed_discover(a, tracer) for a in self.agents))
 
         log.info(
             "colony_initialized",
@@ -125,7 +142,81 @@ class Colony:
             budget_per_agent=budget_per_agent,
             castes=dict(Counter(castes)),
             shared_frontier=len(self.shared_frontier),
+            empty_frontier_reason=self.empty_frontier_reason(),
         )
+
+    async def _seed_discover(
+        self, agent: ExplorerAgent, tracer: RunTracer | None
+    ) -> None:
+        """Discover the seed's neighbors for one agent with telemetry.
+
+        Concurrent initialization failures are contained per agent: they are
+        logged, emitted as ``neighbor_discovery_failed``, and recorded for the
+        empty-frontier classification instead of being silently discarded.
+        """
+        agent_id = agent.state.id
+        seed_id = self.seed_id
+        if tracer is not None:
+            tracer.emit(
+                "neighbor_discovery_started",
+                agent_id=agent_id,
+                paper_id=seed_id,
+                seed=seed_id,
+                oleada=0,
+                turn=0,
+            )
+        failed = False
+        try:
+            await agent._discover_neighbors(seed_id)
+        except Exception as exc:
+            failed = True
+            log.warning("seed_discovery_failed", agent=agent_id, error=str(exc))
+            if tracer is not None:
+                tracer.emit(
+                    "neighbor_discovery_failed",
+                    agent_id=agent_id,
+                    paper_id=seed_id,
+                    seed=seed_id,
+                    oleada=0,
+                    turn=0,
+                    error=redact_secrets(str(exc)),
+                )
+        refs = agent.state.local_references(seed_id)
+        cits = agent.state.local_citants(seed_id)
+        traversable = self._traversable_count(refs) + self._traversable_count(cits)
+        record = SeedDiscovery(
+            agent_id=agent_id,
+            refs=len(refs),
+            cits=len(cits),
+            traversable=traversable,
+            failed=failed,
+            fulltext_seed=bool(getattr(self.provider, "supports_fulltext", False)),
+        )
+        self._seed_discovery_records.append(record)
+        if tracer is not None and not failed:
+            tracer.emit(
+                "neighbor_discovery_completed",
+                agent_id=agent_id,
+                paper_id=seed_id,
+                seed=seed_id,
+                oleada=0,
+                turn=0,
+                refs=len(refs),
+                cits=len(cits),
+                traversable=traversable,
+            )
+
+    @staticmethod
+    def _traversable_count(paper_ids: list[str]) -> int:
+        return sum(1 for pid in paper_ids if parse_normalized_id(pid)[0] != "unknown")
+
+    @property
+    def seed_discovery_records(self) -> list[SeedDiscovery]:
+        return list(self._seed_discovery_records)
+
+    def empty_frontier_reason(self) -> str | None:
+        """The single primary reason the initial frontier is empty, if any."""
+        return classify_empty_frontier(self._seed_discovery_records)
 
     def _compute_budget_per_agent(self) -> int:
         """Distribute the global budget across the colony."""

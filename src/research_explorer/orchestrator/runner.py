@@ -16,6 +16,7 @@ from research_explorer.aco.scheduler import Scheduler
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.config import Config, get_api_key
 from research_explorer.evaluation.structural import StructuralMetrics
+from research_explorer.events.models import REASON_LABELS
 from research_explorer.events.sink import EventSink
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.feromone import PheromoneManager
@@ -88,6 +89,8 @@ class Orchestrator:
         # Evaluation replay trace store (lazily opened)
         self.trace = RunTraceStore(config.storage.trace_db_path)
         self.tracer: RunTracer | None = None
+        self._terminal_reason_code: str = ""
+        self._run_outcome: str = ""
 
     def _provider_for_seed(self, seed_paper_id: str) -> tuple[ResilientProvider, SeedRef]:
         """Route the seed to a enabled, capable provider (see providers.routing)."""
@@ -107,6 +110,8 @@ class Orchestrator:
         """
         start_time = time.monotonic()
         self._elapsed = 0.0
+        self._terminal_reason_code = ""
+        self._run_outcome = ""
 
         seed_provider, seed_ref = self._provider_for_seed(seed_paper_id)
 
@@ -188,16 +193,17 @@ class Orchestrator:
         self.graph.cache_paper(seed_paper)
         seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
 
-        # 2. Initialize the colony (each agent reads the seed)
+        # 2. Initialize the colony (each agent reads the seed). The tracer is
+        # attached by the colony before seed discovery starts.
         tracer.emit("colony_init_started", seed=seed_nid)
-        await self.colony.initialize(seed_nid, seed_query)
-        for agent in self.colony.agents:
-            agent.tracer = tracer
+        await self.colony.initialize(seed_nid, seed_query, tracer=tracer)
+        self._terminal_reason_code = self.colony.empty_frontier_reason() or ""
         tracer.emit(
             "colony_initialized",
             size=len(self.colony.agents),
             seed=seed_nid,
             agents=[a.state.id for a in self.colony.agents],
+            empty_frontier_reason=self._terminal_reason_code,
         )
 
         # 3. Run oleadas until convergence
@@ -219,8 +225,30 @@ class Orchestrator:
 
         if winner is None:
             log.warning("no_winner")
-            tracer.emit("no_winner", run_id=run_id, elapsed=round(self._elapsed, 1))
+            self._run_outcome = "degraded"
+            reason_code = self._terminal_reason_code
+            reason = REASON_LABELS.get(reason_code, "") if reason_code else ""
+            if reason:
+                tracer.emit(
+                    "warning",
+                    reason=reason,
+                    reason_code=reason_code,
+                    classification="degraded",
+                    phase="seed_discovery",
+                )
+            tracer.emit(
+                "no_winner",
+                run_id=run_id,
+                status="completed",
+                outcome="degraded",
+                reason_code=reason_code,
+                reason=reason,
+                elapsed=round(self._elapsed, 1),
+                total_fetches=self.scheduler.total_fetches,
+                waves=self.scheduler.oleada_count,
+            )
         else:
+            self._run_outcome = "ok"
             log.info(
                 "orchestrator_complete",
                 winner=self.colony.best_snapshot_agent,
@@ -268,6 +296,7 @@ class Orchestrator:
         """Build a full markdown exploration report after run() has completed."""
         from research_explorer.orchestrator.report import build_report
 
+        reason_code = getattr(self, "_terminal_reason_code", "")
         return build_report(
             config=self.cfg,
             colony=self.colony,
@@ -277,6 +306,8 @@ class Orchestrator:
             seed_paper_id=seed_paper_id,
             seed_query=seed_query,
             elapsed=getattr(self, "_elapsed", 0.0),
+            outcome=getattr(self, "_run_outcome", ""),
+            terminal_reason=REASON_LABELS.get(reason_code, "") if reason_code else "",
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:

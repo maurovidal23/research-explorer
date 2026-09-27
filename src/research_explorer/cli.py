@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import tempfile
 from pathlib import Path
 
 import typer
 
 from research_explorer.config import get_api_key, load_config
 from research_explorer.logging_setup import configure_logging, get_logger
+from research_explorer.redaction import redact_secrets
 
 app = typer.Typer(
     name="research-explorer",
@@ -91,6 +95,28 @@ def _emit_report(report: str, output: str | None, obsidian_dir: str | None) -> N
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
 
 
+def _write_report_atomic(report: str, output: str) -> None:
+    """Write ``report`` to ``output`` via an atomic same-directory replace.
+
+    A missing parent directory is an error (no directories are created
+    implicitly). Interruption can never leave a partially written report
+    because the destination only ever sees a fully written temp file.
+    """
+    target = Path(output)
+    parent = target.parent if str(target.parent) else Path(".")
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(report)
+        os.replace(tmp_path, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
 def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:
     """Run the ACO exploration under the Textual terminal interface."""
     from research_explorer.orchestrator.runner import Orchestrator
@@ -98,6 +124,7 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
 
     controller = TUIController()
     orch = Orchestrator(cfg, event_sink=controller.event_sink)
+    write_state: dict[str, object] = {"done": False, "error": None}
 
     async def runner() -> tuple[str, str | None]:
         try:
@@ -111,7 +138,24 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
         finally:
             await orch.aclose()
 
-    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    def persist_report(result: tuple[str, str | None]) -> None:
+        """Persist the report once the backend finishes, before review waits."""
+        if not output or write_state["done"]:
+            return
+        report, _obsidian = result
+        try:
+            _write_report_atomic(report, output)
+        except Exception as exc:
+            write_state["error"] = redact_secrets(str(exc))
+            return
+        write_state["done"] = True
+
+    app = build_app(
+        controller.projection,
+        queue=controller.queue,
+        runner=runner,
+        on_result=persist_report,
+    )
     app.run()
     controller.drain()
 
@@ -122,6 +166,17 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
         typer.echo("Run did not complete; see the failure summary above.", err=True)
         raise typer.Exit(1)
     report, obsidian_dir = app.run_result
+    # Fallback for apps that do not invoke the completion hook.
+    if output and not write_state["done"] and not write_state["error"]:
+        persist_report(app.run_result)
+    if write_state["error"]:
+        typer.echo(f"Report write failed: {write_state['error']}", err=True)
+        raise typer.Exit(1)
+    if output:
+        typer.echo(f"Report written to {output}")
+        if obsidian_dir:
+            typer.echo(f"Obsidian graph written to {obsidian_dir}/")
+        return
     _emit_report(report, output, obsidian_dir)
 
 

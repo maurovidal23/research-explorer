@@ -100,6 +100,29 @@ STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
 
+OUTCOME_OK = "ok"
+OUTCOME_DEGRADED = "degraded"
+
+REASON_NO_NEIGHBORS_DISCOVERED = "no_neighbors_discovered"
+REASON_NO_TRAVERSABLE_IDENTIFIERS = "no_traversable_identifiers"
+REASON_REFERENCE_EXTRACTION_FAILED = "reference_extraction_failed"
+REASON_SEED_DISCOVERY_FAILED = "seed_discovery_failed"
+
+GENERIC_NO_WINNER_REASON = (
+    "run completed without a winner: no traversable frontier was discovered"
+)
+
+REASON_LABELS: dict[str, str] = {
+    REASON_NO_NEIGHBORS_DISCOVERED: "no neighbors were discovered from the seed paper",
+    REASON_NO_TRAVERSABLE_IDENTIFIERS: (
+        "neighbors were discovered but none exposed a traversable identifier"
+    ),
+    REASON_REFERENCE_EXTRACTION_FAILED: (
+        "reference extraction from the seed paper produced no usable entries"
+    ),
+    REASON_SEED_DISCOVERY_FAILED: "seed neighbor discovery failed",
+}
+
 AGENT_ACTIVE = "active"
 AGENT_EVALUATING = "evaluating"
 AGENT_WAITING = "waiting"
@@ -170,6 +193,9 @@ class RunViewState(BaseModel):
     query: str = ""
     pipeline: str = "aco"
     status: str = STATUS_INITIALIZING
+    outcome: str = ""
+    terminal_reason: str = ""
+    terminal_reason_code: str = ""
     started_at: str = ""
     elapsed_seconds: float = 0.0
     fetches_used: int = 0

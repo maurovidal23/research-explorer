@@ -40,6 +40,8 @@ def build_report(
     seed_paper_id: str,
     seed_query: str,
     elapsed: float,
+    outcome: str = "",
+    terminal_reason: str = "",
 ) -> str:
     parts: list[str] = []
 
@@ -58,6 +60,9 @@ def build_report(
 
     # ---- Summary ---------------------------------------------------------
     parts.append("## Summary\n")
+    parts.append(f"- **Outcome:** {outcome or '(unspecified)'}")
+    if terminal_reason:
+        parts.append(f"- **Terminal reason:** {terminal_reason}")
     parts.append(f"- **Winner:** {colony.best_snapshot_agent or '(none)'}")
     parts.append(f"- **Peak Q:** {colony.best_quality:.4f}")
     parts.append(f"- **Peak at oleada:** {colony.best_snapshot_oleada}")
@@ -65,6 +70,12 @@ def build_report(
     parts.append(f"- **Total fetches:** {scheduler.total_fetches}")
     parts.append(f"- **Elapsed:** {elapsed:.1f}s ({elapsed / 60:.1f} min)")
     parts.append(f"- **Active agents at end:** {len(colony.active_candidates())}")
+    if colony.best_agent is None:
+        reason = terminal_reason or "the initial frontier had no traversable candidates"
+        parts.append(
+            "- **No winning narrative was produced.** The run completed as a "
+            f"degraded result: {reason}."
+        )
     parts.append("")
 
     # ---- Winning narrative ----------------------------------------------

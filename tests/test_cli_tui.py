@@ -119,17 +119,20 @@ def test_explicit_no_tui_runs_non_tui(tmp_path, monkeypatch) -> None:
 
 
 class _FakeApp:
-    def __init__(self, projection, queue, runner, can_detach=False):
+    def __init__(self, projection, queue, runner, can_detach=False, on_result=None):
         self.projection = projection
         self.queue = queue
         self.runner = runner
         self.can_detach = can_detach
+        self.on_result = on_result
         self.cancelled = False
         self.state = SimpleNamespace(status="completed")
         self.run_result = None
 
     def run(self):
         self.run_result = ("TUI REPORT BODY", None)
+        if self.on_result is not None:
+            self.on_result(self.run_result)
 
 
 def test_tui_output_still_writes_report(tmp_path, monkeypatch) -> None:
@@ -153,12 +156,17 @@ def test_tui_output_still_writes_report(tmp_path, monkeypatch) -> None:
     assert out.read_text(encoding="utf-8") == "TUI REPORT BODY"
 
 
+class _CancelledApp(_FakeApp):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cancelled = True
+        self.state = SimpleNamespace(status="cancelled")
+
+    def run(self):
+        self.run_result = None
+
+
 def test_tui_cancelled_run_is_reported(tmp_path, monkeypatch) -> None:
-    class _CancelledApp(_FakeApp):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.cancelled = True
-            self.state = SimpleNamespace(status="cancelled")
 
     monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _FakeOrch)
     monkeypatch.setattr("research_explorer.tui.build_app", _CancelledApp)
@@ -168,6 +176,56 @@ def test_tui_cancelled_run_is_reported(tmp_path, monkeypatch) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Run cancelled." in result.output
+
+
+def test_tui_output_write_failure_is_redacted_and_nonzero(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _FakeOrch)
+    monkeypatch.setattr("research_explorer.tui.build_app", _FakeApp)
+
+    def boom(report, output):
+        raise RuntimeError("disk full api_key=sk-sentinel-98765")
+
+    monkeypatch.setattr("research_explorer.cli._write_report_atomic", boom)
+    out = tmp_path / "report.md"
+    result = runner.invoke(
+        app,
+        [
+            "explore",
+            "10.1/x",
+            "question",
+            "--tui",
+            "--output",
+            str(out),
+            "--config",
+            str(_config(tmp_path)),
+        ],
+    )
+    assert result.exit_code != 0
+    combined = result.output + str(result.exception or "")
+    assert "Report write failed" in combined
+    assert "sk-sentinel-98765" not in combined
+    assert "***" in combined
+    assert not out.exists()
+
+
+def test_atomic_report_write_rejects_missing_parent(tmp_path) -> None:
+    from research_explorer.cli import _write_report_atomic
+
+    missing = tmp_path / "nested" / "report.md"
+    with pytest.raises(FileNotFoundError):
+        _write_report_atomic("body", str(missing))
+    assert not missing.exists()
+
+
+def test_atomic_report_write_replaces_in_place(tmp_path) -> None:
+    from research_explorer.cli import _write_report_atomic
+
+    target = tmp_path / "report.md"
+    _write_report_atomic("first", str(target))
+    _write_report_atomic("second", str(target))
+    assert target.read_text(encoding="utf-8") == "second"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "report.md"]
+    assert leftovers == []
 
 
 def test_mark_cancelled_persists_distinct_status(tmp_path) -> None:
@@ -185,12 +243,6 @@ def test_mark_cancelled_persists_distinct_status(tmp_path) -> None:
 
 
 def test_tui_cancelled_run_does_not_write_report(tmp_path, monkeypatch) -> None:
-    class _CancelledApp(_FakeApp):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.cancelled = True
-            self.state = SimpleNamespace(status="cancelled")
-
     monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _FakeOrch)
     monkeypatch.setattr("research_explorer.tui.build_app", _CancelledApp)
     out = tmp_path / "report.md"
@@ -257,8 +309,9 @@ def test_tui_runner_cancels_run_and_closes_resources(tmp_path, monkeypatch) -> N
     captured: dict = {}
 
     class _CapturingApp:
-        def __init__(self, projection, queue, runner, can_detach=False):
+        def __init__(self, projection, queue, runner, can_detach=False, on_result=None):
             captured["runner"] = runner
+            captured["on_result"] = on_result
             self.cancelled = False
             self.state = SimpleNamespace(status="running")
             self.run_result = None

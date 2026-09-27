@@ -6,7 +6,7 @@ import asyncio
 
 from research_explorer.events.models import RunEvent
 from research_explorer.events.projection import RunProjection
-from research_explorer.events.sink import ChannelSink
+from research_explorer.events.sink import ChannelSink, QueueMarker
 
 
 class TUIController:
@@ -17,7 +17,7 @@ class TUIController:
         self.channel = ChannelSink(maxsize=maxsize)
 
     @property
-    def queue(self) -> asyncio.Queue[RunEvent]:
+    def queue(self) -> asyncio.Queue[RunEvent | QueueMarker]:
         return self.channel.queue
 
     @property
@@ -27,4 +27,9 @@ class TUIController:
     def drain(self) -> None:
         """Apply any queued events synchronously (used after shutdown/tests)."""
         while not self.channel.empty():
-            self.projection.apply(self.channel.get_nowait())
+            item = self.channel.get_nowait()
+            if isinstance(item, QueueMarker):
+                if item.future is not None and not item.future.done():
+                    item.future.set_result(None)
+                continue
+            self.projection.apply(item)
