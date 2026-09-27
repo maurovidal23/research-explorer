@@ -313,3 +313,84 @@ async def test_orchestrator_emits_enriched_no_winner_per_reason(
     assert state.terminal_reason_code == reason_code
     assert len(state.warnings) == 1
     assert not state.failures
+
+
+def _bare_orchestrator(store: RunTraceStore, run_id: str) -> Orchestrator:
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.run_id = run_id
+    orch.trace = store
+    orch.tracer = None
+    return orch
+
+
+def test_mark_cancelled_does_not_relabel_completed_run(tmp_path) -> None:
+    store = RunTraceStore(tmp_path / "trace.db")
+    run_id = store.create_run("arxiv:2401.00001", "q")
+    store.finish_run(run_id, "completed", best_quality=1.0)
+
+    _bare_orchestrator(store, run_id).mark_cancelled()
+
+    assert store.get_run(run_id)["status"] == "completed"
+    store.close()
+
+
+def test_mark_cancelled_does_not_relabel_failed_run(tmp_path) -> None:
+    store = RunTraceStore(tmp_path / "trace.db")
+    run_id = store.create_run("arxiv:2401.00001", "q")
+    store.finish_run(run_id, "failed")
+
+    _bare_orchestrator(store, run_id).mark_cancelled()
+
+    assert store.get_run(run_id)["status"] == "failed"
+    store.close()
+
+
+def test_mark_cancelled_persists_cancelled_for_running_run(tmp_path) -> None:
+    store = RunTraceStore(tmp_path / "trace.db")
+    run_id = store.create_run("arxiv:2401.00001", "q")
+
+    _bare_orchestrator(store, run_id).mark_cancelled()
+
+    assert store.get_run(run_id)["status"] == "cancelled"
+    store.close()
+
+
+async def test_durable_completion_precedes_terminal_event_publication(tmp_path) -> None:
+    """The trace store must be terminal before any terminal event is published."""
+    store = RunTraceStore(tmp_path / "trace.db")
+    run_id = store.create_run("arxiv:2401.12345", "q")
+    observed: list[str] = []
+
+    class _StatusSink:
+        def publish(self, event: RunEvent) -> None:
+            if event.type in ("no_winner", "orchestrator_complete"):
+                run = store.get_run(run_id)
+                observed.append(run["status"] if run else "missing")
+
+    tracer = RunTracer(store, run_id, sink=_StatusSink())
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.cfg = Config()
+    orch.graph = _FakeGraph()
+    orch.colony = _FakeColony(REASON_NO_TRAVERSABLE_IDENTIFIERS)
+    orch.scheduler = _FakeScheduler()
+    orch.convergence = _FakeConvergence()
+    orch.trace = store
+    orch.tracer = tracer
+    orch._elapsed = 0.0
+    orch._terminal_reason_code = ""
+    orch._run_outcome = ""
+    paper = Paper(id="2401.12345", title="Seed", provider="arxiv")
+    seed_ref = SeedRef(SeedKind.ARXIV, "arxiv:2401.12345", "2401.12345", "2401.12345")
+
+    await orch._run_impl(
+        "arxiv:2401.12345",
+        "q",
+        time.monotonic(),
+        run_id,
+        tracer,
+        _FakeProvider(paper),
+        seed_ref,
+    )
+
+    assert observed == ["completed"]
+    store.close()

@@ -943,3 +943,78 @@ async def test_event_outcome_filter_cycles_in_pilot() -> None:
         assert "run_failed" not in app.screen.viewer_body
         await pilot.press("escape")
         await pilot.pause()
+
+
+async def test_q_after_terminal_publication_cannot_relabel_completed_run(tmp_path) -> None:
+    """A stale UI exit must never relabel an already-completed durable run.
+
+    The runner publishes a terminal ``no_winner`` event and then pauses. The
+    durable run is already completed before publication (the orchestrator
+    persists completion first). Pressing ``q`` exits immediately; the runner's
+    shutdown cancellation is contained so the trace status stays completed.
+    """
+    from research_explorer.orchestrator.runner import Orchestrator
+    from research_explorer.replay.trace import RunTraceStore
+
+    store = RunTraceStore(tmp_path / "replay.db")
+    run_id = store.create_run("arxiv:2401.00001", "q")
+    store.finish_run(run_id, "completed", best_quality=1.0)
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.run_id = run_id
+    orch.trace = store
+    orch.tracer = None
+
+    controller = TUIController()
+    gate = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def runner() -> tuple[str, None]:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": run_id})
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=2,
+                type="no_winner",
+                payload={
+                    "run_id": run_id,
+                    "status": "completed",
+                    "outcome": "degraded",
+                    "reason_code": "no_traversable_identifiers",
+                    "reason": "no traversable identifiers",
+                },
+            )
+        )
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            orch.mark_cancelled()
+            cancelled.set()
+            raise
+        return "report", None
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if app.state.status == "completed":
+                break
+        assert app.state.status == "completed"
+        await pilot.press("q")
+        for _ in range(40):
+            await pilot.pause()
+            if app._exit:
+                break
+        assert app._exit
+        if app._runner_worker is not None and not cancelled.is_set():
+            app._runner_worker.cancel()
+        for _ in range(40):
+            await pilot.pause()
+            if cancelled.is_set():
+                break
+        assert cancelled.is_set()
+
+    assert store.get_run(run_id)["status"] == "completed"
+    assert not any(e.type == "run_cancelled" for e in app.state.events)
+    store.close()

@@ -238,6 +238,8 @@ class ExplorerAgent:
         self.rng = rng if rng is not None else random.Random()
         self._eta_cache: dict[str, EtaComponents] = {}
         self._llm_priority: dict[str, float] = {}
+        self.extraction_attempted: bool = False
+        self.extraction_failed: bool = False
 
     def _emit(self, type: str, **payload) -> None:
         if self.tracer is not None:
@@ -875,6 +877,7 @@ class ExplorerAgent:
         Also stores the per-paper analysis in state.paper_analyses.
         """
         if paper.ref_entries:
+            self.extraction_attempted = True
             messages = integrate_and_extract(self.state.narrative, paper, self.seed_query)
             try:
                 raw = await self.llm.chat(
@@ -886,12 +889,15 @@ class ExplorerAgent:
                 )
             except Exception as e:
                 log.warning("integrate_extract_failed", agent=self.state.id, error=str(e))
+                self.extraction_failed = True
                 return self.state.narrative, []
             parsed = _parse_json_response(raw)
             if parsed is None:
+                self.extraction_failed = True
                 return self.state.narrative, []
             narrative = normalize_narrative(parsed.get("narrative"), self.state.narrative)
             extracted = self._parse_extracted_refs(parsed.get("references") or [])
+            self.extraction_failed = not extracted
 
             analysis = parsed.get("paper_analysis")
             if isinstance(analysis, dict):
@@ -1022,6 +1028,8 @@ class ExplorerAgent:
         LLM-extracted bibliography entries. Without one, the legacy native-list
         path is used.
         """
+        self.extraction_attempted = False
+        self.extraction_failed = False
         if self.state.is_discovered(paper_id):
             return
 

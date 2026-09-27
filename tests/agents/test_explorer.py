@@ -606,3 +606,76 @@ async def test_take_turn_generic_exception_clears_shared_visited() -> None:
     assert "openalex:W1" not in e._shared_visited
     assert calls["release_all"] == ["test-agent"]
     assert not e._frontier.is_claimed("openalex:W1")
+
+
+def _integrate_explorer(response: str | Exception) -> ExplorerAgent:
+    class _LLM:
+        async def chat(self, *args, **kwargs):
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    e = ExplorerAgent.__new__(ExplorerAgent)
+    e.state = AgentState(id="a0", pos="arxiv:2401.00001")
+    e.seed_query = "question"
+    e.provider = SimpleNamespace(name="arxiv")
+    e.providers = {"arxiv": object()}
+    e.llm = _LLM()
+    e.cfg = SimpleNamespace(
+        llm=SimpleNamespace(explorer_model="m", temperature=0.0, max_tokens=64)
+    )
+    e.extraction_attempted = False
+    e.extraction_failed = False
+    return e
+
+
+async def test_integrate_records_observed_extraction_success() -> None:
+    e = _integrate_explorer(
+        '{"narrative": "n", "references": [{"title": "R", "arxiv_id": "2401.1"}]}'
+    )
+    paper = Paper(
+        id="2401.00001", title="Seed", provider="arxiv", ref_entries=["[1] R"]
+    )
+
+    _narrative, refs = await e._integrate(paper)
+
+    assert e.extraction_attempted is True
+    assert e.extraction_failed is False
+    assert refs
+
+
+async def test_integrate_records_observed_extraction_failure_when_empty() -> None:
+    e = _integrate_explorer('{"narrative": "n", "references": []}')
+    paper = Paper(
+        id="2401.00001", title="Seed", provider="arxiv", ref_entries=["[1] R"]
+    )
+
+    _narrative, refs = await e._integrate(paper)
+
+    assert e.extraction_attempted is True
+    assert e.extraction_failed is True
+    assert refs == []
+
+
+async def test_integrate_records_observed_extraction_failure_on_llm_error() -> None:
+    e = _integrate_explorer(RuntimeError("llm down"))
+    paper = Paper(
+        id="2401.00001", title="Seed", provider="arxiv", ref_entries=["[1] R"]
+    )
+
+    _narrative, refs = await e._integrate(paper)
+
+    assert e.extraction_attempted is True
+    assert e.extraction_failed is True
+    assert refs == []
+
+
+async def test_integrate_without_ref_entries_does_not_claim_extraction() -> None:
+    e = _integrate_explorer('{"narrative": "n", "references": []}')
+    paper = Paper(id="2401.00001", title="Seed", provider="semantic_scholar")
+
+    await e._integrate(paper)
+
+    assert e.extraction_attempted is False
+    assert e.extraction_failed is False
+

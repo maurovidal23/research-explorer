@@ -188,13 +188,16 @@ class Colony:
         refs = agent.state.local_references(seed_id)
         cits = agent.state.local_citants(seed_id)
         traversable = self._traversable_count(refs) + self._traversable_count(cits)
+        extraction_attempted = bool(getattr(agent, "extraction_attempted", False))
+        extraction_failed = bool(getattr(agent, "extraction_failed", False))
         record = SeedDiscovery(
             agent_id=agent_id,
             refs=len(refs),
             cits=len(cits),
             traversable=traversable,
             failed=failed,
-            fulltext_seed=bool(getattr(self.provider, "supports_fulltext", False)),
+            extraction_attempted=extraction_attempted,
+            extraction_failed=extraction_failed,
         )
         self._seed_discovery_records.append(record)
         if tracer is not None and not failed:
@@ -208,6 +211,8 @@ class Colony:
                 refs=len(refs),
                 cits=len(cits),
                 traversable=traversable,
+                extraction_attempted=extraction_attempted,
+                extraction_failed=extraction_failed,
             )
 
     @staticmethod

@@ -44,7 +44,16 @@ def test_classify_empty_frontier_reason_codes() -> None:
         == REASON_NO_NEIGHBORS_DISCOVERED
     )
     assert (
-        classify_empty_frontier([_record(refs=0, cits=0, fulltext_seed=True)])
+        classify_empty_frontier(
+            [
+                _record(
+                    refs=0,
+                    cits=0,
+                    extraction_attempted=True,
+                    extraction_failed=True,
+                )
+            ]
+        )
         == REASON_REFERENCE_EXTRACTION_FAILED
     )
     assert (
@@ -54,7 +63,7 @@ def test_classify_empty_frontier_reason_codes() -> None:
     assert classify_empty_frontier([_record(refs=3, cits=1, traversable=2)]) is None
 
 
-def _fake_colony(supports_fulltext: bool) -> Colony:
+def _fake_colony(supports_fulltext: bool = False) -> Colony:
     colony = Colony.__new__(Colony)
     provider = SimpleNamespace(name="arxiv", supports_fulltext=supports_fulltext)
     colony.graph = SimpleNamespace(get_paper=lambda pid: None)
@@ -78,22 +87,33 @@ def _fake_colony(supports_fulltext: bool) -> Colony:
     return colony
 
 
-async def test_colony_attaches_tracer_before_seed_discovery(monkeypatch) -> None:
-    colony = _fake_colony(supports_fulltext=False)
-    seen: list[object] = []
+async def _initialize_with_seed_signal(
+    monkeypatch,
+    *,
+    refs: list[str] | None = None,
+    cits: list[str] | None = None,
+    extraction_attempted: bool = False,
+    extraction_failed: bool = False,
+) -> tuple[Colony, _RecordingTracer]:
+    colony = _fake_colony()
 
     async def fake_discover(self, paper_id, paper=None, extracted=None) -> None:
-        seen.append(self.tracer)
-        self.state.set_local_neighbors(paper_id, ["arxiv:2401.00002"], [])
+        self.extraction_attempted = extraction_attempted
+        self.extraction_failed = extraction_failed
+        self.state.set_local_neighbors(paper_id, list(refs or []), list(cits or []))
 
     monkeypatch.setattr(ExplorerAgent, "_discover_neighbors", fake_discover)
     tracer = _RecordingTracer()
-
     await colony.initialize("arxiv:2401.00001", "question", tracer=tracer)
+    return colony, tracer
 
-    assert all(item is tracer for item in seen)
-    starts = [e for e in tracer.events if e[0] == "neighbor_discovery_started"]
+
+async def test_colony_attaches_tracer_before_seed_discovery(monkeypatch) -> None:
+    colony, tracer = await _initialize_with_seed_signal(
+        monkeypatch, refs=["arxiv:2401.00002"]
+    )
     completes = [e for e in tracer.events if e[0] == "neighbor_discovery_completed"]
+    starts = [e for e in tracer.events if e[0] == "neighbor_discovery_started"]
     assert len(starts) == 2
     assert len(completes) == 2
     for _type, payload in completes:
@@ -106,7 +126,7 @@ async def test_colony_attaches_tracer_before_seed_discovery(monkeypatch) -> None
 
 
 async def test_seed_discovery_failure_is_contained_and_redacted(monkeypatch) -> None:
-    colony = _fake_colony(supports_fulltext=False)
+    colony = _fake_colony()
 
     async def boom(self, paper_id, paper=None, extracted=None) -> None:
         raise RuntimeError("fetch failed api_key=sk-sentinel-1234")
@@ -123,48 +143,73 @@ async def test_seed_discovery_failure_is_contained_and_redacted(monkeypatch) -> 
 
 
 async def test_empty_frontier_reason_reflects_non_traversable_neighbors(monkeypatch) -> None:
-    colony = _fake_colony(supports_fulltext=True)
-
-    async def fake_discover(self, paper_id, paper=None, extracted=None) -> None:
-        self.state.set_local_neighbors(paper_id, ["unknown:Some Title"], [])
-
-    monkeypatch.setattr(ExplorerAgent, "_discover_neighbors", fake_discover)
-    tracer = _RecordingTracer()
-
-    await colony.initialize("arxiv:2401.00001", "question", tracer=tracer)
-
+    colony, _tracer = await _initialize_with_seed_signal(
+        monkeypatch, refs=["unknown:Some Title"]
+    )
     assert colony.empty_frontier_reason() == REASON_NO_TRAVERSABLE_IDENTIFIERS
 
 
-@pytest.mark.parametrize(
-    ("fulltext", "expected"),
-    [
-        (False, REASON_NO_NEIGHBORS_DISCOVERED),
-        (True, REASON_REFERENCE_EXTRACTION_FAILED),
-        (True, REASON_NO_TRAVERSABLE_IDENTIFIERS),
-    ],
-)
-async def test_empty_frontier_telemetry_is_structured(
-    monkeypatch, fulltext: bool, expected: str
-) -> None:
-    colony = _fake_colony(supports_fulltext=fulltext)
-
-    async def fake_discover(self, paper_id, paper=None, extracted=None) -> None:
-        if expected == REASON_NO_TRAVERSABLE_IDENTIFIERS:
-            self.state.set_local_neighbors(paper_id, ["unknown:Title"], [])
-        else:
-            self.state.set_local_neighbors(paper_id, [], [])
-
-    monkeypatch.setattr(ExplorerAgent, "_discover_neighbors", fake_discover)
-    tracer = _RecordingTracer()
-
-    await colony.initialize("arxiv:2401.00001", "question", tracer=tracer)
-
-    assert colony.empty_frontier_reason() == expected
+async def test_empty_frontier_extraction_failure_uses_observed_signal(monkeypatch) -> None:
+    colony, tracer = await _initialize_with_seed_signal(
+        monkeypatch, extraction_attempted=True, extraction_failed=True
+    )
+    assert colony.empty_frontier_reason() == REASON_REFERENCE_EXTRACTION_FAILED
     completes = [e for e in tracer.events if e[0] == "neighbor_discovery_completed"]
     assert len(completes) == 2
     for _type, payload in completes:
-        assert set(payload) >= {"agent_id", "paper_id", "oleada", "turn", "refs", "cits", "traversable"}
+        assert payload["extraction_attempted"] is True
+        assert payload["extraction_failed"] is True
+
+
+async def test_empty_frontier_extraction_success_without_neighbors_is_not_failure(
+    monkeypatch,
+) -> None:
+    """A successful extraction that finds no neighbors is not an extraction failure."""
+    colony, tracer = await _initialize_with_seed_signal(
+        monkeypatch, extraction_attempted=True, extraction_failed=False
+    )
+    assert colony.empty_frontier_reason() == REASON_NO_NEIGHBORS_DISCOVERED
+    completes = [e for e in tracer.events if e[0] == "neighbor_discovery_completed"]
+    for _type, payload in completes:
+        assert payload["extraction_attempted"] is True
+        assert payload["extraction_failed"] is False
+
+
+async def test_extraction_failure_is_not_inferred_from_provider_capability(monkeypatch) -> None:
+    """A full-text-capable provider alone must never be classified as a failure."""
+    colony = _fake_colony(supports_fulltext=True)
+    assert colony.provider.supports_fulltext is True
+
+    async def fake_discover(self, paper_id, paper=None, extracted=None) -> None:
+        # No extraction was attempted and no neighbors were found.
+        self.state.set_local_neighbors(paper_id, [], [])
+
+    monkeypatch.setattr(ExplorerAgent, "_discover_neighbors", fake_discover)
+
+    await colony.initialize("arxiv:2401.00001", "question", tracer=_RecordingTracer())
+
+    assert colony.empty_frontier_reason() == REASON_NO_NEIGHBORS_DISCOVERED
+
+
+async def test_empty_frontier_telemetry_is_structured(monkeypatch) -> None:
+    colony, tracer = await _initialize_with_seed_signal(
+        monkeypatch, extraction_attempted=True, extraction_failed=True
+    )
+    assert colony.empty_frontier_reason() == REASON_REFERENCE_EXTRACTION_FAILED
+    completes = [e for e in tracer.events if e[0] == "neighbor_discovery_completed"]
+    assert len(completes) == 2
+    for _type, payload in completes:
+        assert set(payload) >= {
+            "agent_id",
+            "paper_id",
+            "oleada",
+            "turn",
+            "refs",
+            "cits",
+            "traversable",
+            "extraction_attempted",
+            "extraction_failed",
+        }
         assert payload["oleada"] == 0
         assert payload["turn"] == 0
     assert not any(e[0] == "llm_operation_completed" for e in tracer.events)
@@ -172,3 +217,19 @@ async def test_empty_frontier_telemetry_is_structured(
 
 def test_classifier_is_deterministic() -> None:
     assert classify_empty_frontier([_record()]) == REASON_NO_NEIGHBORS_DISCOVERED
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"refs": 0, "cits": 0}, REASON_NO_NEIGHBORS_DISCOVERED),
+        (
+            {"refs": 0, "cits": 0, "extraction_attempted": True, "extraction_failed": True},
+            REASON_REFERENCE_EXTRACTION_FAILED,
+        ),
+        ({"refs": 0, "cits": 0, "extraction_attempted": True}, REASON_NO_NEIGHBORS_DISCOVERED),
+        ({"refs": 2, "cits": 0, "traversable": 0}, REASON_NO_TRAVERSABLE_IDENTIFIERS),
+    ],
+)
+def test_classifier_scenarios(record: dict, expected: str) -> None:
+    assert classify_empty_frontier([_record(**record)]) == expected

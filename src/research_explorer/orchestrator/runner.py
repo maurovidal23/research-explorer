@@ -20,7 +20,9 @@ from research_explorer.events.models import (
     OUTCOME_DEGRADED,
     OUTCOME_OK,
     REASON_LABELS,
+    STATUS_CANCELLED,
     STATUS_COMPLETED,
+    STATUS_FAILED,
 )
 from research_explorer.events.sink import EventSink
 from research_explorer.graph.embeddings import EmbeddingService
@@ -35,6 +37,8 @@ from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer, RunTraceStore
 
 log = get_logger("orchestrator")
+
+_TERMINAL_STATUSES = frozenset({STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED})
 
 
 class Orchestrator:
@@ -229,6 +233,15 @@ class Orchestrator:
         winner = self.colony.best_agent
         self._elapsed = time.monotonic() - start_time
 
+        # Persist durable completion *before* publishing any terminal event, so
+        # a consumer that sees terminal UI state can never observe it before the
+        # trace store already records the run as completed (TUI-REL-3/TUI-REL-5).
+        self.trace.finish_run(
+            run_id,
+            "completed",
+            best_quality=round(self.colony.best_quality, 6),
+        )
+
         if winner is None:
             log.warning("no_winner")
             self._run_outcome = OUTCOME_DEGRADED
@@ -283,16 +296,18 @@ class Orchestrator:
                 self.colony.best_narrative,
             )
 
-        self.trace.finish_run(
-            run_id,
-            "completed",
-            best_quality=round(self.colony.best_quality, 6),
-        )
         return self.colony.best_narrative if winner is not None else ""
 
     def mark_cancelled(self) -> None:
-        """Persist a distinct ``cancelled`` status for the active run."""
+        """Persist a distinct ``cancelled`` status for the active run.
+
+        A stale UI cancellation must never relabel a run the trace store already
+        records as terminal (``completed``/``cancelled``/``failed``).
+        """
         if not self.run_id:
+            return
+        current = self.trace.get_run(self.run_id)
+        if current is not None and current.get("status") in _TERMINAL_STATUSES:
             return
         if self.tracer is not None:
             self.tracer.emit("run_cancelled", run_id=self.run_id)
