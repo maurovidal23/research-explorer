@@ -9,28 +9,28 @@ aborts the research run.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.redaction import redact_secrets
-from research_explorer.research.context import RUBRIC_DIMENSIONS, build_evaluation_prompt
+from research_explorer.research.context import (
+    RUBRIC_DIMENSIONS,
+    approx_tokens,
+    build_evaluation_prompt,
+    rubric_schema,
+)
 from research_explorer.research.models import (
     ClaimStatus,
+    ClaimVerdict,
     FinalAnswer,
     IntegrityResult,
     ResearchEvaluation,
     ResearchObjective,
     ResearchState,
     RubricResult,
+    VerdictAssessment,
+    normalize_claim_text,
 )
-
-_WS = re.compile(r"\s+")
-_PUNCT = re.compile(r"[^\w\s]+")
-
-
-def normalize_claim_text(text: str) -> str:
-    return _WS.sub(" ", _PUNCT.sub(" ", text.casefold())).strip()
 
 
 class DeterministicIntegrity:
@@ -58,6 +58,21 @@ class DeterministicIntegrity:
                     invalid_evidence.append(claim.id)
         checks["supported_claims_have_evidence"] = not unsupported
         checks["evidence_references_valid"] = not invalid_evidence
+
+        acquired = {ref.paper_id for ref in state.evidence if ref.paper_id}
+        unresolved_claims: list[str] = []
+        for claim in state.claims.values():
+            if claim.status not in (ClaimStatus.SUPPORTED, ClaimStatus.DISPUTED):
+                continue
+            refs = claim.supporting + claim.contradicting
+            if any(ref.paper_id not in acquired for ref in refs):
+                unresolved_claims.append(claim.id)
+        checks["claim_refs_resolve_to_acquired"] = not unresolved_claims
+        if unresolved_claims:
+            issues.append(
+                "claims reference evidence that was never acquired: "
+                f"{sorted(set(unresolved_claims))}"
+            )
 
         referenced = {ref.paper_id for ref in state.evidence}
         for claim in state.claims.values():
@@ -116,7 +131,7 @@ class LLMRubricEvaluator:
     def __init__(
         self,
         llm: LLMClient,
-        model: str = "deepseek-v4-flash",
+        model: str = "glm-5.3-flash",
         temperature: float = 0.2,
         max_tokens: int = 800,
     ) -> None:
@@ -131,46 +146,159 @@ class LLMRubricEvaluator:
             raw = await self.llm.chat_json(
                 prompt.messages,
                 model=self.model,
+                schema=rubric_schema(),
                 temperature=self.temperature,
                 max_tokens=min(self.max_tokens, prompt.output_reserve or self.max_tokens),
             )
         except Exception as exc:
             error = redact_secrets(str(exc))
             raw_text = json.dumps({"error": error}, sort_keys=True)
-            return RubricResult(ok=False, error=error, raw=raw_text)
+            return RubricResult(
+                ok=False,
+                error=error,
+                raw=raw_text,
+                input_tokens=prompt.approx_input_tokens,
+                output_tokens=approx_tokens(raw_text),
+            )
         raw_text = redact_secrets(json.dumps(raw, sort_keys=True, default=str))
+        input_tokens = prompt.approx_input_tokens
+        output_tokens = approx_tokens(raw_text)
         if not isinstance(raw, dict):
             return RubricResult(
-                ok=False, error="evaluation output was not an object", raw=raw_text
+                ok=False,
+                error="evaluation output was not an object",
+                raw=raw_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         raw_scores = raw.get("dimension_scores")
         if not isinstance(raw_scores, dict):
             return RubricResult(
-                ok=False, error="missing dimension_scores object", raw=raw_text
+                ok=False,
+                error="missing dimension_scores object",
+                raw=raw_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         scores: dict[str, float] = {}
+        invalid_dimensions: list[str] = []
         for dimension in RUBRIC_DIMENSIONS:
             value = raw_scores.get(dimension)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
+                invalid_dimensions.append(dimension)
                 continue
             scores[dimension] = max(0.0, min(1.0, float(value)))
-        if not scores:
-            return RubricResult(ok=False, error="no valid dimension scores", raw=raw_text)
+        if invalid_dimensions:
+            return RubricResult(
+                ok=False,
+                error=f"missing or invalid dimension scores: {invalid_dimensions}",
+                raw=raw_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
 
-        def _str_list(value: object) -> list[str]:
-            if not isinstance(value, list):
-                return []
-            return [item for item in value if isinstance(item, str)]
+        aggregate_fields = {
+            "missing_knowledge": raw.get("missing_knowledge"),
+            "unsupported_claims": raw.get("unsupported_claims"),
+            "contradictions": raw.get("contradictions"),
+            "recommended_questions": raw.get("recommended_questions"),
+        }
+        aggregates: dict[str, list[str]] = {}
+        for field_name, value in aggregate_fields.items():
+            parsed_list = _parse_str_list(value)
+            if parsed_list is None:
+                return RubricResult(
+                    ok=False,
+                    error=f"malformed {field_name} list",
+                    raw=raw_text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+            aggregates[field_name] = parsed_list
+        try:
+            verdicts = parse_claim_verdicts(raw.get("claim_verdicts"), state)
+        except ValueError as exc:
+            return RubricResult(
+                ok=False,
+                error=f"malformed claim_verdicts: {exc}",
+                raw=raw_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
 
         return RubricResult(
             ok=True,
             dimension_scores=scores,
-            missing_knowledge=_str_list(raw.get("missing_knowledge")),
-            unsupported_claims=_str_list(raw.get("unsupported_claims")),
-            contradictions=_str_list(raw.get("contradictions")),
-            recommended_questions=_str_list(raw.get("recommended_questions")),
+            missing_knowledge=aggregates["missing_knowledge"],
+            unsupported_claims=aggregates["unsupported_claims"],
+            contradictions=aggregates["contradictions"],
+            recommended_questions=aggregates["recommended_questions"],
+            claim_verdicts=verdicts,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             raw=raw_text,
         )
+
+
+def _parse_str_list(value: object) -> list[str] | None:
+    """Validate an aggregate string list; return ``None`` when malformed.
+
+    Every aggregate field is required by the rubric schema, so an absent or
+    non-list-of-strings field is malformed and must become an explicit
+    evaluator failure rather than a silent empty list.
+    """
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
+
+def parse_claim_verdicts(value: object, state: ResearchState) -> list[ClaimVerdict]:
+    """Validate structured verdicts for every known claim id.
+
+    The ``claim_verdicts`` collection is required by the rubric schema, so an
+    absent or malformed collection raises ``ValueError`` rather than being
+    treated as an empty verdict set. Each entry must carry a claim id, a known
+    assessment, and a non-empty reason; structure is validated before an
+    unknown claim id is ignored, so a malformed verdict cannot escape
+    governance by naming an unknown claim. Every known claim must be covered by
+    a structurally valid verdict; extra structurally valid unknown ids are
+    ignored.
+    """
+    if not isinstance(value, list):
+        raise ValueError("claim_verdicts must be a list")
+    verdicts: list[ClaimVerdict] = []
+    covered: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError("claim_verdicts entries must be objects")
+        claim_id = entry.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("claim verdict missing a claim_id")
+        assessment = entry.get("assessment")
+        if isinstance(assessment, VerdictAssessment):
+            parsed = assessment
+        elif isinstance(assessment, str):
+            try:
+                parsed = VerdictAssessment(assessment.strip().casefold())
+            except ValueError as exc:
+                raise ValueError(f"unknown claim assessment {assessment!r}") from exc
+        else:
+            raise ValueError("claim verdict missing an assessment")
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("claim verdict missing a reason")
+        if claim_id in covered:
+            continue
+        covered.add(claim_id)
+        if claim_id not in state.claims:
+            continue
+        verdicts.append(
+            ClaimVerdict(claim_id=claim_id, assessment=parsed, reason=reason)
+        )
+    missing = sorted(set(state.claims) - covered)
+    if missing:
+        raise ValueError(f"missing claim verdicts for known claims: {missing}")
+    return verdicts
 
 
 class CompositeEvaluator:
@@ -244,6 +372,11 @@ class CompositeEvaluator:
             ),
             recommended_questions=(
                 list(rubric.recommended_questions)
+                if rubric is not None and rubric.ok
+                else []
+            ),
+            claim_verdicts=(
+                list(rubric.claim_verdicts)
                 if rubric is not None and rubric.ok
                 else []
             ),

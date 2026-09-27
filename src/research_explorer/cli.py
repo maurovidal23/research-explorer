@@ -140,7 +140,11 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         fulltext_max_chars=cfg.llm.fulltext_max_chars,
         question=question,
     )
-    policy = GreedyPolicy(seed=rk.seed)
+    policy = GreedyPolicy(
+        seed=rk.seed,
+        search_enabled=rk.search_enabled,
+        max_search_queries=rk.max_search_queries,
+    )
     agent = LLMResearchAgent(llm, model=cfg.llm.explorer_model, max_tokens=rk.output_reserve)
     rubric = (
         LLMRubricEvaluator(llm, model=cfg.llm.judge_model)
@@ -162,6 +166,9 @@ def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str |
         output_reserve=rk.output_reserve,
         eval_interval=rk.eval_interval,
         evaluator_enabled=rk.evaluator_enabled,
+        search_enabled=rk.search_enabled,
+        max_search_queries=rk.max_search_queries,
+        search_results_limit=rk.search_results_limit,
     )
     kernel = ResearchKernel(
         store=store, gateway=gateway, policy=policy, agent=agent, evaluator=evaluator,

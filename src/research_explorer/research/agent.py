@@ -27,6 +27,36 @@ class AgentOutputError(Exception):
     """Raised when the agent produced unusable (non-object) output."""
 
 
+class ReferenceMappingError(Exception):
+    """Raised when the reference mapper cannot produce usable output."""
+
+
+def reference_schema() -> dict[str, Any]:
+    """JSON schema for schema-constrained reference-mapper output."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "references": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {"type": "string"},
+                        "authors": {"type": "array", "items": {"type": "string"}},
+                        "year": {"type": ["integer", "null"]},
+                        "arxiv_id": {"type": ["string", "null"]},
+                        "doi": {"type": ["string", "null"]},
+                    },
+                    "required": ["title", "authors", "year", "arxiv_id", "doi"],
+                },
+            }
+        },
+        "required": ["references"],
+    }
+
+
 class ResearchAgent(Protocol):
     async def propose_brief(
         self, objective: ResearchObjective, state: ResearchState, prompt: PromptBundle
@@ -123,11 +153,13 @@ class LLMReferenceMapper:
         model: str = "qwen3.6",
         max_tokens: int = 2000,
         doi_provider: str | None = None,
+        max_attempts: int = 2,
     ) -> None:
         self.llm = llm
         self.model = model
         self.max_tokens = max_tokens
         self.doi_provider = doi_provider
+        self.max_attempts = max(1, max_attempts)
 
     async def map_references(
         self, paper: Paper, question: str, limit: int
@@ -135,32 +167,44 @@ class LLMReferenceMapper:
         bibliography = paper.ref_entries[:limit]
         if not bibliography:
             return []
-        raw = await self.llm.chat_json(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract only real works present in the supplied bibliography. "
-                        "Return a JSON object with a references array. Each item may contain "
-                        "title, authors, year, arxiv_id, and doi. Never invent identifiers."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Research question: {question}\n"
-                        f"Source paper: {paper.title}\n"
-                        f"Bibliography:\n" + "\n".join(bibliography)
-                    ),
-                },
-            ],
-            model=self.model,
-            temperature=0.0,
-            max_tokens=self.max_tokens,
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Extract only real works present in the supplied bibliography. "
+                    "Return a JSON object with a references array. Each item may contain "
+                    "title, authors, year, arxiv_id, and doi. Never invent identifiers."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Research question: {question}\n"
+                    f"Source paper: {paper.title}\n"
+                    f"Bibliography:\n" + "\n".join(bibliography)
+                ),
+            },
+        ]
+        raw: dict | None = None
+        last_error: Exception | None = None
+        for _ in range(self.max_attempts):
+            try:
+                raw = await self.llm.chat_json(
+                    messages,
+                    model=self.model,
+                    schema=reference_schema(),
+                    temperature=0.0,
+                    max_tokens=self.max_tokens,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                raw = None
+        if raw is None:
+            raise ReferenceMappingError(str(last_error)) from last_error
         entries = raw.get("references") if isinstance(raw, dict) else None
         if not isinstance(entries, list):
-            return []
+            raise ReferenceMappingError("reference mapping output lacked a references array")
         summaries: list[PaperSummary] = []
         for entry in entries:
             summary = self._parse_reference(entry)

@@ -270,7 +270,7 @@ async def test_reconstruction_equals_live_snapshots(tmp_path) -> None:
         run = store.get_run("run-recon")
         assert run is not None
         assert run["status"] == "completed"
-        assert run["terminal_reason"] == "no_eligible_actions"
+        assert run["terminal_reason"] == "evidence_sufficient"
         seqs = [e.seq for e in store.list_events("run-recon")]
         assert seqs == sorted(set(seqs))
     finally:

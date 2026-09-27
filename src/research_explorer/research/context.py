@@ -40,6 +40,65 @@ def approx_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def dedupe_preserving_order(values: list[str]) -> list[str]:
+    """Remove duplicate ids while preserving first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def rubric_schema() -> dict[str, Any]:
+    """JSON schema for schema-constrained rubric output where supported."""
+    string_list = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "dimension_scores": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    dimension: {"type": "number"} for dimension in RUBRIC_DIMENSIONS
+                },
+                "required": list(RUBRIC_DIMENSIONS),
+            },
+            "missing_knowledge": string_list,
+            "unsupported_claims": string_list,
+            "contradictions": string_list,
+            "recommended_questions": string_list,
+            "claim_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "claim_id": {"type": "string"},
+                        "assessment": {
+                            "type": "string",
+                            "enum": ["supported", "unsupported", "contradicted"],
+                        },
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["claim_id", "assessment", "reason"],
+                },
+            },
+        },
+        "required": [
+            "dimension_scores",
+            "missing_knowledge",
+            "unsupported_claims",
+            "contradictions",
+            "recommended_questions",
+            "claim_verdicts",
+        ],
+    }
+
+
 @dataclass
 class PromptBundle:
     messages: list[dict[str, str]]
@@ -186,7 +245,7 @@ def build_agent_prompt(
     return PromptBundle(
         messages=messages,
         template_version=PROMPT_TEMPLATE_VERSION,
-        selected_ids=selected_ids,
+        selected_ids=dedupe_preserving_order(selected_ids),
         omitted_ids=omitted_ids,
         approx_input_tokens=tokens,
         output_reserve=output_reserve,
@@ -207,15 +266,29 @@ def build_evaluation_prompt(
         "research_question": objective.question,
         "claims": claims,
         "open_questions": questions,
-        "evidence_papers": sorted({ref.paper_id for ref in state.evidence}),
+        "acquired_evidence": [
+            {
+                "paper_id": ref.paper_id,
+                "locator": ref.locator,
+                "content_hash": ref.content_hash,
+                "acquisition_event": ref.acquisition_event,
+                "setting": ref.setting,
+            }
+            for ref in state.evidence
+        ],
     }
     system = (
         "You are an impartial research evaluator. Score each rubric dimension in "
-        "[0,1] and return JSON: "
+        "[0,1]. For every claim id listed below emit a structured verdict with "
+        "assessment one of supported|unsupported|contradicted and a concise reason; "
+        "never invent claim ids. A verdict only records entailment of a claim by its "
+        "acquired evidence; citing a paper is not entailment. Return JSON: "
         '{"dimension_scores": {'
         + ", ".join(f'"{d}": 0.0' for d in RUBRIC_DIMENSIONS)
         + "}, \"missing_knowledge\": [], \"unsupported_claims\": [], "
-        '"contradictions": [], "recommended_questions": []}. '
+        '"contradictions\": [], \"recommended_questions\": [], '
+        '"claim_verdicts": [{"claim_id": "str", "assessment": "unsupported", '
+        '"reason": "str"}]}. '
         "You are not told any controller score or policy name."
     )
     user = (
@@ -226,7 +299,9 @@ def build_evaluation_prompt(
     return PromptBundle(
         messages=messages,
         template_version=EVALUATION_TEMPLATE_VERSION,
-        selected_ids=sorted(state.claims) + sorted(state.questions),
+        selected_ids=dedupe_preserving_order(
+            sorted(state.claims) + sorted(state.questions)
+        ),
         approx_input_tokens=approx_tokens(json.dumps(messages, sort_keys=True)),
         output_reserve=output_reserve,
     )

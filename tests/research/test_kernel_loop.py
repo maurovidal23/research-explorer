@@ -265,7 +265,7 @@ async def test_transient_failure_retains_then_releases_after_bounded_attempts(
         assert all(e.payload["paper_id"] == SEED for e in failures)
         # A transient failure never masquerades as acquired evidence.
         assert not [e for e in events if e.type == "evidence_acquired"]
-        assert store.get_run("run-transient")["terminal_reason"] == "no_eligible_actions"
+        assert store.get_run("run-transient")["terminal_reason"] == "provider_failure"
         state = store.reconstruct("run-transient")
         assert state.visited == []
         assert state.objective.budget.fetches_used == 2

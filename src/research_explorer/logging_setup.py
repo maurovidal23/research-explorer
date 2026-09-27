@@ -232,6 +232,34 @@ class ACORenderer:
             event = event[:87] + "..."
         return _c(_Color.YELLOW, f"  [retry] {event}")
 
+    def _fmt_research_event(self, d):
+        """Render kernel research events with explicit field separators."""
+        d.pop("event", None)
+        d.pop("level", None)
+        d.pop("timestamp", None)
+        event_type = str(d.pop("event_type", "event"))
+        outcome = d.pop("outcome", None)
+        preferred = (
+            "run_id",
+            "seq",
+            "turn",
+            "actor",
+            "tokens",
+            "fetches",
+            "seconds",
+        )
+        keys = [k for k in preferred if k in d and d[k] is not None]
+        keys.extend(
+            k for k, v in d.items() if k not in preferred and v is not None
+        )
+        label = f"{event_type} ({outcome})" if outcome else event_type
+        color = self._research_event_colors.get(event_type, _Color.GRAY)
+        line = _c(color + _Color.BOLD, f"  [kernel] {label}")
+        if keys:
+            parts = [f"{key}={d[key]}" for key in keys]
+            line += _c(_Color.GRAY, "  " + " | ".join(parts))
+        return line
+
     def _fmt_default(self, event, level, d):
         d.pop("event", None)
         d.pop("level", None)
@@ -246,6 +274,18 @@ class ACORenderer:
         if exc:
             line += f"\n{exc}"
         return line
+
+    _research_event_colors: ClassVar[dict[str, str]] = {
+        "kernel_start": _Color.CYAN,
+        "run_complete": _Color.GREEN,
+        "final_answer": _Color.GREEN,
+        "evidence_acquired": _Color.GREEN,
+        "search_complete": _Color.GREEN,
+        "evaluation_complete": _Color.GREEN,
+        "verdict_transition": _Color.CYAN,
+        "provider_failure": _Color.YELLOW,
+        "agent_turn_failed": _Color.YELLOW,
+    }
 
     _dispatch: ClassVar[dict[str, Callable]] = {
         "orchestrator_start": _fmt_orchestrator_start,
@@ -267,6 +307,7 @@ class ACORenderer:
         "request_failed": _fmt_warning_generic,
         "self_assess_failed": _fmt_warning_generic,
         "virgin_judge_failed": _fmt_warning_generic,
+        "research_event": _fmt_research_event,
     }
 
 

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
+import httpx
+import pytest
+
 from research_explorer.providers.arxiv import ArxivProvider
+from research_explorer.providers.base import RetryableHTTPError, TransientProviderError
 
 _ENTRY_XML = """<entry xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
   <id>http://arxiv.org/abs/2301.00001v1</id>
@@ -198,3 +202,137 @@ def test_extract_bib_entries_strips_tags() -> None:
 
 def test_supports_fulltext_flag() -> None:
     assert ArxivProvider.supports_fulltext is True
+
+
+# ---- REL-7: XML outcome classification under strict_outcomes() --------------
+
+
+async def test_strict_xml_transient_is_not_classified_as_absence(
+    tmp_path, monkeypatch
+) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def failing(path: str, **params: object) -> httpx.Response:
+        raise RetryableHTTPError(503, "https://export.arxiv.org/api/query")
+
+    monkeypatch.setattr(p, "_attempt_get", failing)
+    try:
+        async with p.strict_outcomes():
+            with pytest.raises(TransientProviderError) as exc_info:
+                await p._get_xml("/api/query", id_list="2301.00001")
+        assert exc_info.value.reason == "retry_exhausted"
+    finally:
+        await p.aclose()
+
+
+async def test_lenient_xml_transient_degrades_to_none(tmp_path, monkeypatch) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def failing(path: str, **params: object) -> httpx.Response:
+        raise RetryableHTTPError(503, "https://export.arxiv.org/api/query")
+
+    monkeypatch.setattr(p, "_attempt_get", failing)
+    try:
+        assert await p._get_xml("/api/query", id_list="2301.00001") is None
+    finally:
+        await p.aclose()
+
+
+async def test_strict_malformed_success_payload_is_transient(
+    tmp_path, monkeypatch
+) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def malformed(path: str, **params: object) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<not-a-valid-feed",
+            request=httpx.Request("GET", "https://export.arxiv.org/api/query"),
+        )
+
+    monkeypatch.setattr(p, "_attempt_get", malformed)
+    try:
+        async with p.strict_outcomes():
+            with pytest.raises(TransientProviderError) as exc_info:
+                await p._get_xml("/api/query", id_list="2301.00001")
+        assert exc_info.value.reason == "malformed_response"
+    finally:
+        await p.aclose()
+
+
+async def test_strict_valid_empty_response_is_absence(tmp_path, monkeypatch) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def empty(path: str, **params: object) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                '<?xml version="1.0"?>'
+                '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+            ),
+            request=httpx.Request("GET", "https://export.arxiv.org/api/query"),
+        )
+
+    monkeypatch.setattr(p, "_attempt_get", empty)
+    try:
+        async with p.strict_outcomes():
+            assert await p.get_paper("2301.00001") is None
+    finally:
+        await p.aclose()
+
+
+def _status_response(status: int) -> httpx.Response:
+    return httpx.Response(
+        status,
+        text="denied",
+        request=httpx.Request("GET", "https://export.arxiv.org/api/query"),
+    )
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+async def test_strict_xml_non_404_http_error_is_not_absence(
+    tmp_path, monkeypatch, status: int
+) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def denied(path: str, **params: object) -> httpx.Response:
+        return _status_response(status)
+
+    monkeypatch.setattr(p, "_attempt_get", denied)
+    try:
+        async with p.strict_outcomes():
+            with pytest.raises(TransientProviderError) as exc_info:
+                await p._get_xml("/api/query", id_list="2301.00001")
+        assert exc_info.value.reason == "http_error"
+        assert exc_info.value.status == status
+    finally:
+        await p.aclose()
+
+
+async def test_strict_xml_404_is_definitive_absence(tmp_path, monkeypatch) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def missing(path: str, **params: object) -> httpx.Response:
+        return _status_response(404)
+
+    monkeypatch.setattr(p, "_attempt_get", missing)
+    try:
+        async with p.strict_outcomes():
+            assert await p._get_xml("/api/query", id_list="2301.00001") is None
+    finally:
+        await p.aclose()
+
+
+async def test_lenient_xml_non_404_http_error_degrades_to_none(
+    tmp_path, monkeypatch
+) -> None:
+    p = ArxivProvider(cache_dir=str(tmp_path))
+
+    async def denied(path: str, **params: object) -> httpx.Response:
+        return _status_response(403)
+
+    monkeypatch.setattr(p, "_attempt_get", denied)
+    try:
+        assert await p._get_xml("/api/query", id_list="2301.00001") is None
+    finally:
+        await p.aclose()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from research_explorer.research.models import (
+    ActionKind,
     AgentNotebook,
     BudgetState,
     CandidateAction,
@@ -113,3 +114,35 @@ async def test_exhausted_token_budget_blocks_selection() -> None:
         _state(), _candidates(), BudgetState(max_tokens=0), SlotState()
     )
     assert actions == []
+
+
+async def test_empty_frontier_schedules_search_for_missing_knowledge() -> None:
+    state = _state()
+    state.latest_evaluation = ResearchEvaluation(missing_knowledge=["gap"])
+    policy = GreedyPolicy(seed=0, search_enabled=True, max_search_queries=2)
+    actions = await policy.select_actions(
+        state, [], BudgetState(max_fetches=5), SlotState()
+    )
+    assert len(actions) == 1
+    assert actions[0].kind is ActionKind.SEARCH
+    assert actions[0].query == "gap"
+
+
+async def test_search_not_scheduled_without_evaluator_gaps() -> None:
+    policy = GreedyPolicy(seed=0)
+    actions = await policy.select_actions(
+        _state(), [], BudgetState(max_fetches=5), SlotState()
+    )
+    assert actions == []
+
+
+async def test_search_skips_equivalent_issued_query() -> None:
+    state = _state()
+    state.search_queries = ["gap"]
+    state.latest_evaluation = ResearchEvaluation(missing_knowledge=["  Gap "])
+    policy = GreedyPolicy(seed=0, search_enabled=True, max_search_queries=5)
+    actions = await policy.select_actions(
+        state, [], BudgetState(max_fetches=5), SlotState()
+    )
+    assert actions and actions[0].kind is ActionKind.SEARCH
+    assert actions[0].query == "Q"
