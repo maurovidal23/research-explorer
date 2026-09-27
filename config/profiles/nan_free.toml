@@ -46,7 +46,7 @@ eta_llm = false
 
 [providers]
 default = "semantic_scholar"
-active = ["semantic_scholar", "openalex", "pubmed"]
+active = ["semantic_scholar", "openalex", "pubmed", "arxiv"]
 
 [providers.semantic_scholar]
 rate = 1
@@ -68,6 +68,12 @@ period = 1
 concurrency = 5
 timeout = 30.0
 api_key_env = "PUBMED_API_KEY"
+
+[providers.arxiv]
+rate = 1
+period = 3
+concurrency = 3
+timeout = 30.0
 
 [budget]
 type = "fetches"
