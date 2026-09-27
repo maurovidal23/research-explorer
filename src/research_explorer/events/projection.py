@@ -71,6 +71,7 @@ class RunProjection:
         self.state = state if state is not None else RunViewState()
         self._seen_seq: set[int] = set()
         self._open_frontier: dict[tuple[str, int, int], str] = {}
+        self._current_agent: str = ""
 
     @classmethod
     def from_events(cls, events: Iterable[RunEvent | dict]) -> RunProjection:
@@ -132,12 +133,16 @@ class RunProjection:
     # ---- helpers ----------------------------------------------------------
 
     def _agent_id(self, event: RunEvent) -> str:
-        return str(
+        raw = (
             event.payload.get("agent_id")
             or event.payload.get("agent")
             or event.payload.get("winner")
-            or ""
         )
+        if raw:
+            return str(raw)
+        # Old traces omit ``agent_id`` on some paper/telemetry events; derive the
+        # surrounding turn's agent so agent-first navigation stays truthful.
+        return self._current_agent
 
     def _ensure_agent(self, agent_id: str, caste: str = "") -> AgentSummary:
         summary = self.state.agents.get(agent_id)
@@ -185,6 +190,34 @@ class RunProjection:
                 records[i] = detail
                 return
         records.append(detail)
+
+    def hydrate_evaluation(self, detail: DetailedEvaluation) -> None:
+        """Merge a persisted evaluation record without re-recording an event.
+
+        Replay uses this to recover full rationale detail from the
+        ``evaluation_results`` table when a trace only carried the compact
+        ``evaluation_complete`` event. Persisted rows are stored verbatim, so the
+        detail passes through the redaction boundary here before it can reach a
+        renderer. Existing records win to avoid duplication.
+        """
+        detail = DetailedEvaluation.model_validate(redact_obj(detail.model_dump()))
+        existing = self.state.evaluations.get(detail.agent_id, [])
+        if any(
+            record.oleada == detail.oleada and record.turn == detail.turn
+            for record in existing
+        ):
+            return
+        self._upsert_evaluation(detail)
+        summary = self._ensure_agent(detail.agent_id)
+        summary.quality = detail.q
+        summary.delta_q = detail.delta_q
+
+    def hydrate_narrative(self, agent_id: str, content: str) -> None:
+        """Recover a narrative artifact that a trace did not inline."""
+        if agent_id and not self.state.narratives.get(agent_id):
+            self.state.narratives[agent_id] = content
+        if content and not self.state.narratives.get("__latest__"):
+            self.state.narratives["__latest__"] = content
 
     # ---- handlers ---------------------------------------------------------
 
@@ -281,6 +314,7 @@ class RunProjection:
         turn = _as_int(p.get("turn"), self.state.current_turn)
         summary = self._ensure_agent(agent_id, str(p.get("caste", "")))
         summary.status = AGENT_ACTIVE
+        self._current_agent = agent_id
         self.state.current_turn = turn
         turn_entry = self._turn_entry(wave, turn, agent_id)
         if turn_entry is None:
@@ -506,12 +540,15 @@ class RunProjection:
                         "year": p.get("year"),
                         "authors": list(p.get("authors") or []),
                         "source": p.get("src") or p.get("source") or "",
+                        "analysis": p.get("analysis"),
                     },
                 )
             )
         else:
             existing.status = status
             existing.label = label
+            if p.get("title"):
+                existing.detail["title"] = p.get("title")
             if p.get("year") is not None:
                 existing.detail["year"] = p.get("year")
             if p.get("authors"):

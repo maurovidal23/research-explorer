@@ -471,6 +471,32 @@ def replay_export(
     store.close()
 
 
+@replay_app.command("tui")
+def replay_tui(
+    run_id: str = typer.Argument(help="Run ID"),
+    db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),
+) -> None:
+    """Open a recorded run in the read-only dashboard."""
+    from research_explorer.events.projection import RunProjection
+    from research_explorer.replay.trace import RunTraceStore
+    from research_explorer.tui import build_app
+    from research_explorer.tui.replay import hydrate_from_store
+
+    store = RunTraceStore(db)
+    run = store.get_run(run_id)
+    if run is None:
+        store.close()
+        typer.echo(f"Run not found: {run_id}", err=True)
+        raise typer.Exit(1)
+
+    projection = RunProjection.from_events(store.list_events(run_id))
+    hydrate_from_store(projection, store, run_id)
+    store.close()
+
+    app = build_app(projection, read_only=True)
+    app.run()
+
+
 @replay_app.command("serve")
 def replay_serve(
     db: str = typer.Option("data/replay.db", "--db", help="Path to the replay database"),

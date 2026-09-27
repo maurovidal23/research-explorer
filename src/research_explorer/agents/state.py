@@ -80,6 +80,7 @@ class AgentState(BaseModel):
     )
     delta_q: float = Field(default=0.0, description="Quality change this turn")
     turn_count: int = Field(default=0, description="Number of turns completed")
+    oleada: int = Field(default=0, description="Wave (oleada) of the current turn")
 
     local_refs: dict[str, list[str]] = Field(
         default_factory=dict,

@@ -332,8 +332,23 @@ class RunTracer:
         self.run_id = run_id
         self._sink = sink
         self.durability_failed = False
+        self._context: dict = {}
+
+    def set_context(self, **fields) -> None:
+        """Attach ambient context (agent_id, oleada, turn) to every emit.
+
+        The ACO scheduler runs agent turns sequentially, so a single ambient
+        context is unambiguous for the duration of one turn. Explicit payload
+        keys always win over ambient context.
+        """
+        self._context = {k: v for k, v in fields.items() if v is not None}
+
+    def clear_context(self) -> None:
+        self._context = {}
 
     def emit(self, type: str, **payload) -> int:
+        if self._context:
+            payload = {**self._context, **payload}
         try:
             seq = self.store.append_event(self.run_id, type, payload)
         except Exception as exc:

@@ -12,6 +12,13 @@ from research_explorer.events.models import (
     RunViewState,
     TimelineEntry,
 )
+from research_explorer.events.navigation import (
+    NavNode,
+    active_agent_id,
+    build_agent_navigation,
+    find_node,
+    flatten_navigation,
+)
 from research_explorer.events.projection import RunProjection
 from research_explorer.events.sink import (
     CallbackSink,
@@ -28,9 +35,14 @@ __all__ = [
     "CompositeSink",
     "EventSink",
     "EventType",
+    "NavNode",
     "NullSink",
     "RunEvent",
     "RunProjection",
     "RunViewState",
     "TimelineEntry",
+    "active_agent_id",
+    "build_agent_navigation",
+    "find_node",
+    "flatten_navigation",
 ]

@@ -7,7 +7,7 @@ import asyncio
 from research_explorer.events.models import RunEvent
 from research_explorer.events.projection import RunProjection
 from research_explorer.tui import TUIController, build_app
-from research_explorer.tui.app import AgentTabs, ConfirmQuitScreen
+from research_explorer.tui.app import ConfirmQuitScreen
 
 
 async def test_worker_groups_keep_both_workers_alive_before_runner_finishes() -> None:
@@ -37,11 +37,11 @@ async def test_worker_groups_keep_both_workers_alive_before_runner_finishes() ->
     async with app.run_test(size=(120, 40)) as pilot:
         for _ in range(30):
             await pilot.pause()
-            if started.is_set() and "A01" in app.query_one("#tabs", AgentTabs).plain_text:
+            if started.is_set() and "A01" in app.agent_roster_text:
                 break
         assert started.is_set()
         assert app.state.run_id == "live"
-        assert "A01" in app.query_one("#tabs", AgentTabs).plain_text
+        assert "A01" in app.agent_roster_text
         # The exclusive research runner must not have cancelled the consumer.
         assert app._consumer_worker is not None
         assert not app._consumer_worker.is_finished

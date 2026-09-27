@@ -261,6 +261,9 @@ class ExplorerAgent:
 
     def _emit(self, type: str, **payload) -> None:
         if self.tracer is not None:
+            payload.setdefault("agent_id", self.state.id)
+            payload.setdefault("oleada", self.state.oleada)
+            payload.setdefault("turn", self.state.turn_count)
             self.tracer.emit(type, **payload)
 
     async def take_turn(self, k: int) -> list[tuple[str, str, str]]:

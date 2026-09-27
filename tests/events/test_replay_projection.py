@@ -123,6 +123,30 @@ def test_persisted_stream_reconstructs_live_projection(tmp_path) -> None:
     store.close()
 
 
+def test_hydrated_evaluation_detail_is_redacted() -> None:
+    projection = RunProjection()
+    projection.hydrate_evaluation(
+        DetailedEvaluation(
+            agent_id="a0",
+            oleada=1,
+            turn=0,
+            q=0.7,
+            delta_q=0.7,
+            self_assessment=SelfAssessmentDetail(
+                score=0.7, reasoning="leak api_key=sk-sentinel-4242"
+            ),
+            peers=PeerVotesDetail(
+                votes=[PeerVoteDetail(voter_id="a1", score=0.6, reasoning="token: sk-sentinel-1")],
+                num_votes=1,
+            ),
+        )
+    )
+    record = projection.state.evaluations["a0"][-1]
+    assert "sk-sentinel-4242" not in record.self_assessment.reasoning
+    assert "sk-sentinel-1" not in record.peers.votes[0].reasoning
+    assert "***" in record.self_assessment.reasoning
+
+
 def test_required_semantic_events_persist(tmp_path) -> None:
     store = RunTraceStore(tmp_path / "replay.db")
     run_id = store.create_run("seed-1", "how?")

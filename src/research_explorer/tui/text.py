@@ -7,6 +7,8 @@ unit-tested without a terminal. The Textual widgets in
 
 from __future__ import annotations
 
+from rich.text import Text
+
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_COMPLETED,
@@ -23,10 +25,23 @@ from research_explorer.events.models import (
     RunViewState,
     TimelineEntry,
 )
+from research_explorer.events.navigation import AGENT_NODE, NavNode
 from research_explorer.redaction import redact_secrets
+from research_explorer.tui import theme
+from research_explorer.tui.actions import footer_hints
+from research_explorer.tui.session import (
+    EVENT_AGENT_ALL,
+    EVENT_AGENT_WINNER,
+    PRIMARY_TABS,
+    TAB_EVALUATION,
+    TAB_EVENTS,
+    TAB_PAPER,
+    TAB_RESEARCH,
+    UISession,
+    tab_label,
+)
 
 UNAVAILABLE = "unavailable"
-NARROW_BREAKPOINT = 100
 DASH = "\u2014"
 
 
@@ -96,8 +111,6 @@ def status_label(state: RunViewState) -> str:
     return label
 
 
-EVENT_OUTCOMES: tuple[str, ...] = ("", "error", "warning", "info")
-
 _ERROR_OUTCOMES = frozenset({"fatal", "error", "failed"})
 _WARNING_OUTCOMES = frozenset({"transient", "warning", "skipped", "degraded"})
 
@@ -116,11 +129,6 @@ def classify_event_outcome(event: RunEvent) -> str:
     if "skipped" in name or name == "warning" or name in ("provider_failure", "metadata_transit"):
         return "warning"
     return "info"
-
-
-def next_event_outcome(current: str) -> str:
-    index = EVENT_OUTCOMES.index(current) if current in EVENT_OUTCOMES else 0
-    return EVENT_OUTCOMES[(index + 1) % len(EVENT_OUTCOMES)]
 
 
 def render_header(state: RunViewState) -> str:
@@ -149,22 +157,6 @@ def render_header(state: RunViewState) -> str:
     )
     query = f"Q: {state.query}" if state.query else f"Q: {DASH}"
     return row1 + "\n" + row2 + "\n" + query
-
-
-def render_tabs(state: RunViewState, selected_index: int) -> str:
-    agents = state.ordered_agents()
-    if not agents:
-        return "agents: waiting for colony initialization"
-    parts: list[str] = []
-    for index, agent in enumerate(agents):
-        winner = "*" if agent.is_winner else " "
-        marker = ">" if index == selected_index else " "
-        delta = f"{agent.delta_q:+.3f}"
-        parts.append(
-            f"{marker} [{agent.label}{winner} {caste_label(agent.caste)} "
-            f"Q={agent.quality:.3f} d={delta} {status_mark(agent.status)}]"
-        )
-    return " ".join(parts)
 
 
 def render_budget(state: RunViewState) -> str:
@@ -460,49 +452,6 @@ def _render_narrative(state: RunViewState, entry: TimelineEntry | None) -> list[
     return lines
 
 
-def render_footer(state: RunViewState) -> str:
-    if state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
-        return f"[{status_label(state)}] press q to exit, ? for help"
-    return (
-        "left/right agent  up/down step  enter details  home live\n"
-        "e eval  f frontier  p paper  n narrative  l events  r metadata  t panes  ? help  q quit"
-    )
-
-
-def render_evaluation(state: RunViewState, agent_id: str) -> str:
-    records = state.evaluations.get(agent_id, [])
-    if not records:
-        return (
-            "=== Evaluation ===\n\n"
-            f"no detailed evaluation recorded for {agent_id or 'the selected agent'}"
-        )
-    record = records[-1]
-    lines = [
-        f"=== Evaluation: {record.agent_id} wave={record.oleada} turn={record.turn} ===",
-        f"Q={record.q:.4f}  old={record.old_quality:.4f}  delta={record.delta_q:+.4f}",
-        f"weights {_format_field(record.weights) or UNAVAILABLE}",
-        f"S={record.self_assessment.score:.4f}  P={record.peers.aggregated_score:.4f}  "
-        f"J={record.virgin_judge.score:.4f}  R={record.structural.r:.4f}",
-        "",
-        f"self rationale: {record.self_assessment.reasoning or UNAVAILABLE}",
-    ]
-    if record.peers.votes:
-        for vote in record.peers.votes:
-            lines.append(
-                f"peer {vote.voter_id}: {vote.score:.4f} -- {vote.reasoning or UNAVAILABLE}"
-            )
-    else:
-        lines.append("peer votes: none recorded")
-    lines.append(f"virgin coverage: {record.virgin_judge.coverage or UNAVAILABLE}")
-    lines.append(f"virgin gaps: {record.virgin_judge.gaps or UNAVAILABLE}")
-    structural = record.structural
-    lines.append(
-        f"structural coverage={structural.coverage:.3f} diversity={structural.diversity:.3f} "
-        f"depth={structural.depth:.3f} coherence={structural.coherence:.3f} R={structural.r:.3f}"
-    )
-    return "\n".join(lines)
-
-
 def render_frontier(state: RunViewState, agent_id: str) -> str:
     candidates = [c for c in state.candidate_scores if not agent_id or c.agent_id == agent_id]
     if not candidates:
@@ -644,22 +593,487 @@ def render_metadata(state: RunViewState) -> str:
     return "\n".join(lines)
 
 
-def render_help() -> str:
-    return (
-        "=== Key help ===\n"
-        "Left/Right  select previous/next agent tab\n"
-        "Up/Down     select timeline item\n"
-        "Enter       open details for selected item\n"
-        "Home        restore follow-live mode and jump to newest\n"
-        "e           detailed evaluation for selected agent\n"
-        "f           recorded frontier / candidate ranking\n"
-        "p           full selected-paper analysis\n"
-        "n           complete agent narrative\n"
-        "l           run events filtered to selected agent\n"
-        "o           run events filtered by outcome (error/warning/info)\n"
-        "r           run metadata and resolved configuration\n"
-        "t           toggle timeline/detail panes (narrow terminals)\n"
-        "?           this help\n"
-        "q           exit flow (confirm when a run is active)\n"
-        "Ctrl+C      graceful cancellation"
+def agent_label(state: RunViewState, agent_id: str) -> str:
+    summary = state.agents.get(agent_id)
+    return summary.label if summary is not None else (agent_id or DASH)
+
+
+def winner_label(state: RunViewState) -> str:
+    if not state.winner_agent:
+        return DASH
+    return agent_label(state, state.winner_agent)
+
+
+def _fit_segments(segments: list[tuple[str, str | None]], width: int) -> Text:
+    """Join styled segments, ellipsizing the segment that crosses ``width``.
+
+    Used for the context and query rows and for tree labels, where a wrapped or
+    overflowing value would break the row rhythm. Segments after the crossing
+    one are dropped.
+    """
+    text = Text()
+    for segment, style in segments:
+        remaining = width - text.cell_len
+        if remaining <= 0:
+            break
+        if len(segment) <= remaining:
+            text.append(segment, style=style)
+        else:
+            text.append(ellipsize(segment, remaining), style=style)
+            break
+    return text
+
+
+def render_context_line(state: RunViewState, width: int = 120) -> Text:
+    return _fit_segments(
+        [
+            (" Research Explorer ", f"bold {theme.COLOR_ACCENT}"),
+            (" ACO colony ", theme.COLOR_MUTED),
+            (f" run {state.run_id or DASH}", None),
+            (f"  seed {state.seed_paper_id or DASH}", theme.COLOR_MUTED),
+            (f"  pipeline {state.pipeline}", theme.COLOR_MUTED),
+            (
+                f"  explorer {state.explorer_model or UNAVAILABLE}"
+                f"  judge {state.judge_model or UNAVAILABLE}",
+                theme.COLOR_MUTED,
+            ),
+        ],
+        width,
     )
+
+
+def render_dashboard_header(
+    state: RunViewState, width: int = 120, follow_live: bool = True
+) -> Text:
+    """Context line plus two run-fact rows.
+
+    The context and query rows are ellipsized so they stay single-line. The
+    run-fact row may wrap instead, because dropping the winner or the budget
+    would hide a run fact; the header caps its own height.
+    """
+    glyph, color = theme.status_style(state.status)
+    tokens = UNAVAILABLE
+    if state.token_usage is not None:
+        tokens = str(state.token_usage)
+    elif state.cost is not None:
+        tokens = f"cost {state.cost:.4f}"
+
+    row1 = Text()
+    row1.append(f"{glyph} ", style=color)
+    row1.append(status_label(state), style=f"bold {color}")
+    row1.append(f"  elapsed {format_duration(state.elapsed_seconds)}")
+    row1.append(f"  fetch {state.fetches_used}/{state.max_fetches}")
+    row1.append(f"  wave {state.current_wave}  turn {state.current_turn}")
+    row1.append(f"  best {state.best_quality:.3f}", style=theme.COLOR_GOOD)
+    row1.append(f"  winner {winner_label(state)}", style=theme.COLOR_WARN)
+    row1.append(f"  tokens {tokens}", style=theme.COLOR_MUTED)
+
+    row2_segments: list[tuple[str, str | None]] = [
+        (f"Q {state.query or DASH}", None),
+        (
+            f"  colony {state.colony_size}  slots {state.max_concurrent}  "
+            f"papers/eval {state.k_per_turn}",
+            theme.COLOR_MUTED,
+        ),
+    ]
+    if not follow_live:
+        row2_segments.append(("  historical snapshot", f"bold {theme.COLOR_WARN}"))
+    row2 = _fit_segments(row2_segments, width)
+
+    header = Text()
+    header.append_text(render_context_line(state, width))
+    header.append("\n")
+    header.append_text(row1)
+    header.append("\n")
+    header.append_text(row2)
+    return header
+
+
+def render_tree_label(
+    state: RunViewState,
+    node: NavNode,
+    *,
+    selected: bool,
+    expanded: bool,
+    depth: int,
+    width: int = 120,
+) -> Text:
+    """One tree row, pruned to ``width`` so the tree keeps a one-row rhythm.
+
+    The lifecycle glyph and label are reserved first; descriptive fields are
+    then ellipsized into what is left, so a narrow pane never hides the state.
+    """
+    indent = "  " * depth
+    marker = f"{theme.SELECTION_MARK} " if selected else "  "
+    prefix = indent + marker
+    if node.kind == AGENT_NODE:
+        summary = state.agents.get(node.agent_id)
+        if summary is None:
+            return _fit_segments([(prefix + node.label, None)], width)
+        glyph, color = theme.status_style(summary.status)
+        status = f"  {glyph} {status_mark(summary.status)}"
+        winner = "  ★" if summary.is_winner else ""
+        budget = max(1, width - len(prefix) - len(status) - len(winner))
+        head = _fit_segments(
+            [
+                (node.label, f"bold {theme.COLOR_TEXT}"),
+                (f" {caste_label(summary.caste)}", theme.COLOR_MUTED),
+                (f"  Q={summary.quality:.3f}", None),
+                (
+                    f"  Δ{summary.delta_q:+.3f}",
+                    theme.COLOR_GOOD if summary.delta_q >= 0 else theme.COLOR_BAD,
+                ),
+            ],
+            budget,
+        )
+        text = Text(prefix)
+        text.append_text(head)
+        if winner:
+            text.append(winner, style=theme.COLOR_WARN)
+        text.append(status, style=color)
+        return text
+
+    geometry = "\u25be" if (node.children and expanded) else (
+        "\u25b8" if node.children else "\u00b7"
+    )
+    glyph, color = theme.status_style(node.status)
+    status = f"  {glyph} {status_mark(node.status)}"
+    body = _fit_segments(
+        [(node.label, None)],
+        max(1, width - len(prefix) - len(geometry) - 1 - len(status)),
+    )
+    text = Text(prefix + geometry + " ")
+    text.append_text(body)
+    text.append(status, style=color)
+    return text
+
+
+def render_tree_title(row_count: int) -> str:
+    """Left-pane heading that states whether the colony has reported yet."""
+    if row_count:
+        return "Execution tree"
+    return "Execution tree · waiting for the first wave"
+
+
+def render_agent_roster(state: RunViewState) -> Text:
+    """Compact agent roster used by tests and narrow layouts."""
+    text = Text()
+    for summary in state.ordered_agents():
+        glyph, color = theme.status_style(summary.status)
+        text.append(f" {summary.label}", style=f"bold {theme.COLOR_TEXT}")
+        text.append(f" {caste_label(summary.caste)}", style=theme.COLOR_MUTED)
+        text.append(f" Q={summary.quality:.3f}")
+        text.append(f" {glyph}", style=color)
+        if summary.is_winner:
+            text.append(" ★", style=theme.COLOR_WARN)
+    return text
+
+
+def render_activity_card(
+    state: RunViewState,
+    agent_id: str,
+    entry: TimelineEntry | None,
+    width: int = 60,
+    follow_live: bool = True,
+    compact: bool = False,
+) -> Text:
+    summary = state.agents.get(agent_id)
+    text = Text()
+    text.append("Agent", style=f"bold {theme.COLOR_ACCENT}")
+    if summary is None:
+        text.append("\n  waiting for colony initialization", style=theme.COLOR_MUTED)
+        return text
+    glyph, color = theme.status_style(summary.status)
+    text.append(f" {summary.label}")
+    text.append(f"  {caste_label(summary.caste)}", style=theme.COLOR_MUTED)
+    text.append(f"  {glyph} {status_mark(summary.status)}", style=color)
+    if not compact:
+        text.append("\n")
+
+    action = entry.label if entry is not None else "idle"
+    paper_entry = _paper_entry_for(state, agent_id)
+    meta = _activity_meta(entry, paper_entry, summary)
+    mode = "live" if follow_live else "historical"
+    title = str(meta.get("title") or summary.current_paper_title or "")
+    paper_id = str(meta.get("paper_id") or summary.current_paper_id or "")
+    operation = state.current_operation or UNAVAILABLE
+    model = state.current_operation_model or (
+        state.explorer_model if state.current_operation else ""
+    )
+    elapsed = _format_optional_duration(state.operation_elapsed_seconds)
+
+    if compact:
+        mode_style = theme.COLOR_WARN if mode == "historical" else theme.COLOR_MUTED
+        text.append(f"  [{mode}]", style=mode_style)
+        text.append("\n  ")
+        text.append(ellipsize(str(action), max(10, width - 18)))
+        text.append(" · ", style=theme.COLOR_MUTED)
+        text.append(ellipsize(title or paper_id or UNAVAILABLE, max(10, width // 2)))
+        operation_bits = []
+        if model:
+            operation_bits.append(model)
+        if state.operation_elapsed_seconds is not None:
+            operation_bits.append(elapsed)
+        if operation_bits:
+            text.append("  " + "  ".join(operation_bits), style=theme.COLOR_MUTED)
+        text.append("\n  ")
+        text.append("Q ", style=theme.COLOR_MUTED)
+        text.append(f"{summary.quality:.3f}")
+        delta_style = theme.COLOR_GOOD if summary.delta_q >= 0 else theme.COLOR_BAD
+        text.append(f"  Δ{summary.delta_q:+.3f}", style=delta_style)
+        text.append(f"  budget {summary.budget}  frontier {summary.frontier}")
+        return text
+
+    text.append("  action ", style=theme.COLOR_MUTED)
+    text.append(ellipsize(str(action), max(10, width - 12)))
+    text.append(f"  [{mode}]", style=theme.COLOR_WARN if mode == "historical" else theme.COLOR_MUTED)
+    text.append("\n")
+
+    text.append("  paper ", style=theme.COLOR_MUTED)
+    text.append(ellipsize(title or paper_id or UNAVAILABLE, max(10, width - 8)))
+    text.append("\n")
+
+    text.append("  op ", style=theme.COLOR_MUTED)
+    text.append(f"{operation}  model {model or UNAVAILABLE}  elapsed {elapsed}")
+    text.append("\n")
+
+    text.append("  Q ", style=theme.COLOR_MUTED)
+    text.append(f"{summary.quality:.3f}")
+    delta_style = theme.COLOR_GOOD if summary.delta_q >= 0 else theme.COLOR_BAD
+    text.append(f"  Δ{summary.delta_q:+.3f}", style=delta_style)
+    text.append(f"  budget {summary.budget}  frontier {summary.frontier}")
+    return text
+
+
+def render_tab_bar(session: UISession) -> Text:
+    text = Text()
+    for index, tab in enumerate(PRIMARY_TABS, start=1):
+        active = tab == session.active_tab
+        label = f"{index}:{tab_label(tab)}"
+        if active:
+            text.append(f" {theme.SELECTION_MARK} {label} ", style=f"bold {theme.COLOR_ACCENT}")
+        else:
+            text.append(f"   {label} ", style=theme.COLOR_MUTED)
+    return text
+
+
+def render_footer_text(state: RunViewState, session: UISession, settling: bool = False) -> Text:
+    text = Text()
+    if settling and state.status not in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
+        text.append(" cancellation requested; settling… ", style=f"bold {theme.COLOR_WARN}")
+    if state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
+        text.append(f" {status_label(state)} ", style=f"bold {theme.COLOR_ACCENT}")
+        text.append("press "
+                    "q to exit  ? for help  Ctrl+P for commands", style=theme.COLOR_MUTED)
+        return text
+    text.append("Research Explorer", style=f"bold {theme.COLOR_ACCENT}")
+    text.append("  ")
+    text.append(footer_hints(session.narrowed), style=theme.COLOR_MUTED)
+    return text
+
+
+def render_scope_caption(
+    state: RunViewState,
+    agent_id: str,
+    entry: TimelineEntry | None,
+    follow_live: bool = True,
+) -> str:
+    parts = [f"agent {agent_label(state, agent_id)}"]
+    if entry is not None:
+        parts.append(f"wave {entry.wave or DASH}")
+        parts.append(f"turn {entry.turn}")
+        parts.append(f"{entry.kind} · {entry.status}")
+    if not follow_live:
+        parts.append("historical snapshot")
+    return "  ".join(parts)
+
+
+def render_research_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | None) -> str:
+    lines = [f"## Research line · {agent_label(state, agent_id)}", ""]
+    detail = entry.detail if entry is not None else {}
+    delta = detail.get("delta_narrative") or detail.get("changed_understanding")
+    if delta is None:
+        records = state.evaluations.get(agent_id, [])
+        if records:
+            delta = f"Q {records[-1].q:.4f} (Δ{records[-1].delta_q:+.4f})"
+    narrative = state.narratives.get(agent_id) or state.narratives.get("__latest__", "")
+    if delta:
+        lines.append("### Understanding delta")
+        lines.append(str(delta))
+        lines.append("")
+    if not narrative:
+        lines.append("_No narrative recorded yet._")
+    else:
+        lines.append(narrative)
+    return "\n".join(lines)
+
+
+def render_paper_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | None) -> str:
+    entry = _paper_entry_for(state, agent_id) if (
+        entry is None or not entry.paper_id
+    ) else entry
+    if entry is None or (not entry.paper_id and not entry.detail.get("title")):
+        return "_No paper selected yet._"
+    paper_id = entry.paper_id
+    meta = entry.detail
+    lines = [f"## Paper · {ellipsize(paper_id or DASH, 60)}", ""]
+    lines.append(f"- title: {meta.get('title') or UNAVAILABLE}")
+    lines.append(f"- year: {meta.get('year') if meta.get('year') is not None else UNAVAILABLE}")
+    authors = ", ".join(str(a) for a in (meta.get("authors") or [])) or UNAVAILABLE
+    lines.append(f"- authors: {authors}")
+    lines.append(f"- source paper: {meta.get('source') or UNAVAILABLE}")
+    lines.append(f"- traversal mode: {meta.get('mode') or UNAVAILABLE}")
+    lines.append(f"- provider: {meta.get('provider') or UNAVAILABLE}")
+    lines.append("")
+    lines.append("### Selection rationale")
+    lines.extend(_render_rationale(state, entry))
+    lines.append("")
+    lines.append("### Structured analysis")
+    analysis = state.paper_analyses.get(agent_id or entry.agent_id, {}).get(paper_id)
+    lines.extend(_render_paper_fields(analysis) if analysis else ["no structured analysis recorded"])
+    lines.append("")
+    lines.append("### Decision-time frontier")
+    frontier = [
+        c for c in state.candidate_scores
+        if not entry.agent_id or c.agent_id == entry.agent_id
+    ]
+    if not frontier:
+        lines.append("no recorded frontier candidates")
+    else:
+        for candidate in sorted(frontier, key=lambda c: c.eta, reverse=True)[:12]:
+            marker = "chosen" if any(
+                s.paper_id == candidate.paper_id for s in state.selections
+            ) else "candidate"
+            lines.append(
+                f"- {ellipsize(candidate.paper_id, 48)} eta={candidate.eta:.4f} "
+                f"mode={candidate.mode or DASH} [{marker}]"
+            )
+    return "\n".join(lines)
+
+
+def render_evaluation_tab(state: RunViewState, agent_id: str) -> str:
+    records = state.evaluations.get(agent_id, [])
+    lines = [f"## Evaluation · {agent_label(state, agent_id)}", ""]
+    if not records:
+        lines.append("_No detailed evaluation recorded for this agent yet._")
+        lines.append("")
+        lines.append("A skipped evaluation means no new evidence was produced; it is not a zero score.")
+        return "\n".join(lines)
+    if len(records) > 1:
+        lines.append("### Q history")
+        for record in records:
+            lines.append(
+                f"- wave {record.oleada} turn {record.turn}: "
+                f"Q={record.q:.4f} (Δ{record.delta_q:+.4f})"
+            )
+        lines.append("")
+    record = records[-1]
+    lines.append(
+        f"Q={record.q:.4f}  old={record.old_quality:.4f}  delta={record.delta_q:+.4f}"
+    )
+    lines.append(f"weights {_format_field(record.weights) or UNAVAILABLE}")
+    lines.append(
+        f"S={record.self_assessment.score:.4f}  P={record.peers.aggregated_score:.4f}  "
+        f"J={record.virgin_judge.score:.4f}  R={record.structural.r:.4f}"
+    )
+    lines.append("")
+    lines.append(f"self rationale: {record.self_assessment.reasoning or UNAVAILABLE}")
+    if record.peers.votes:
+        for vote in record.peers.votes:
+            lines.append(
+                f"peer {vote.voter_id}: {vote.score:.4f} — {vote.reasoning or UNAVAILABLE}"
+            )
+    else:
+        lines.append("peer votes: none recorded")
+    lines.append(
+        f"judge coverage: {record.virgin_judge.coverage or UNAVAILABLE}  "
+        f"gaps: {record.virgin_judge.gaps or UNAVAILABLE}"
+    )
+    structural = record.structural
+    lines.append(
+        f"structural coverage={structural.coverage:.3f} diversity={structural.diversity:.3f} "
+        f"depth={structural.depth:.3f} coherence={structural.coherence:.3f} R={structural.r:.3f}"
+    )
+    return "\n".join(lines)
+
+
+def render_events_tab(
+    state: RunViewState, agent_id: str = "", outcome: str = "", newest_first: bool = True
+) -> str:
+    events = [e for e in state.events if not agent_id or agent_id in str(e.payload)]
+    if outcome:
+        events = [e for e in events if classify_event_outcome(e) == outcome]
+    if newest_first:
+        events = list(reversed(events))
+    filters: list[str] = []
+    if agent_id:
+        filters.append(f"agent={agent_label(state, agent_id)}")
+    if outcome:
+        filters.append(f"outcome={outcome}")
+    scope = f" ({', '.join(filters)})" if filters else ""
+    lines = [f"## Events{scope}", ""]
+    if not events:
+        lines.append("_No events recorded for this filter._")
+        return "\n".join(lines)
+    for event in events:
+        summary = " ".join(
+            f"{k}={v}" for k, v in event.payload.items() if k != "content"
+        )[:160]
+        lines.append(f"- `[{event.seq:>4}] {event.type}` {redact_secrets(summary)}")
+    return "\n".join(lines)
+
+
+def events_scope_agent(state: RunViewState, session: UISession) -> str:
+    """Resolve the Events filter, shared by the tab and the fullscreen reader."""
+    if session.event_agent == EVENT_AGENT_ALL:
+        return ""
+    if session.event_agent == EVENT_AGENT_WINNER:
+        return state.winner_agent
+    return session.selected_agent_id
+
+
+def render_tab_body(state: RunViewState, session: UISession, entry: TimelineEntry | None) -> str:
+    if session.active_tab == TAB_RESEARCH:
+        return render_research_tab(state, session.selected_agent_id, entry)
+    if session.active_tab == TAB_PAPER:
+        return render_paper_tab(state, session.selected_agent_id, entry)
+    if session.active_tab == TAB_EVALUATION:
+        return render_evaluation_tab(state, session.selected_agent_id)
+    if session.active_tab == TAB_EVENTS:
+        return render_events_tab(
+            state, events_scope_agent(state, session), session.event_outcome
+        )
+    return ""
+
+
+def render_reader(state: RunViewState, session: UISession, entry: TimelineEntry | None) -> tuple[str, str]:
+    title = f"{tab_label(session.active_tab)} · {agent_label(state, session.selected_agent_id)}"
+    body = render_tab_body(state, session, entry)
+    if session.active_tab == TAB_EVENTS:
+        return title, body
+    caption = render_scope_caption(
+        state, session.selected_agent_id, entry, session.follow_live
+    )
+    return title, body + "\n\n" + caption
+
+
+def render_status_banner(state: RunViewState) -> Text:
+    """Terminal banner colored by outcome rather than a single failure color."""
+    glyph, color = theme.status_style(state.status)
+    text = Text()
+    text.append(f"{glyph} ", style=color)
+    if state.status == STATUS_FAILED:
+        text.append(render_failure_summary(state), style=color)
+        return text
+    text.append(status_label(state), style=f"bold {color}")
+    text.append(f" {DASH} {state.terminal_reason or 'run finished'}", style=theme.COLOR_MUTED)
+    return text
+
+
+def render_failure_summary(state: RunViewState) -> str:
+    lines = [f"Run {state.run_id or DASH} ended with status {status_label(state)}."]
+    if state.terminal_reason:
+        lines.append(state.terminal_reason)
+    for failure in state.failures:
+        lines.append(redact_secrets(str(failure)))
+    return "\n".join(lines)

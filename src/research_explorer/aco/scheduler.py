@@ -79,6 +79,15 @@ class Scheduler:
         # Each agent takes its turn (sequentially within the oleada for peer voting)
         agent_paths: list[AgentPath] = []
         for agent in k_agents:
+            agent.state.oleada = self.oleada_count
+            if self.tracer is not None:
+                set_context = getattr(self.tracer, "set_context", None)
+                if set_context is not None:
+                    set_context(
+                        agent_id=agent.state.id,
+                        oleada=self.oleada_count,
+                        turn=agent.state.turn_count,
+                    )
             log.info(
                 "agent_turn_start",
                 agent=agent.state.id,
@@ -215,6 +224,10 @@ class Scheduler:
                     )
 
         # Update pheromone (per-agent private trails)
+        if self.tracer is not None:
+            clear_context = getattr(self.tracer, "clear_context", None)
+            if clear_context is not None:
+                clear_context()
         best_path = max(agent_paths, key=lambda p: p.delta_q) if agent_paths else None
         self.pheromone.update(
             agent_paths,

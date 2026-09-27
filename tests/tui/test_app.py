@@ -1,4 +1,4 @@
-"""Textual pilot tests for the live research TUI."""
+"""Textual pilot tests for the Convoy-style research dashboard."""
 
 from __future__ import annotations
 
@@ -8,10 +8,8 @@ from research_explorer.events.models import RunEvent
 from research_explorer.events.projection import RunProjection
 from research_explorer.tui import TUIController, build_app
 from research_explorer.tui.app import (
-    AgentTabs,
+    CommandPaletteScreen,
     ConfirmQuitScreen,
-    DetailPane,
-    HeaderBar,
     ResearchTUIApp,
     TextViewer,
 )
@@ -20,7 +18,7 @@ from research_explorer.tui.app import (
 def _analysis() -> dict:
     return {
         "summary": "A summary",
-        "key_concepts": ["concept-a", "concept-b"],
+        "key_concepts": ["concept-a"],
         "methods": "Methods",
         "findings": "Findings",
         "relevance": "Relevance",
@@ -40,7 +38,7 @@ def _events() -> list[RunEvent]:
                 "query": "How do things work?",
                 "colony_size": 3,
                 "K": 2,
-                "k_per_turn": 4,
+                "k_per_turn": 2,
                 "max_fetches": 100,
                 "explorer_model": "explorer-x",
                 "judge_model": "judge-y",
@@ -48,24 +46,14 @@ def _events() -> list[RunEvent]:
         ),
         RunEvent(
             seq=2,
-            type="oleada_start",
-            payload={"oleada": 1, "active": ["agent-0", "agent-1"], "max_fetches": 100},
+            type="colony_initialized",
+            payload={"size": 3, "agents": ["agent-0", "agent-1", "agent-2"]},
         ),
-        RunEvent(
-            seq=3,
-            type="agent_turn_start",
-            payload={"agent_id": "agent-0", "caste": "fundaciones", "oleada": 1, "turn": 0},
-        ),
+        RunEvent(seq=3, type="oleada_start", payload={"oleada": 1, "active": ["agent-0", "agent-1"]}),
         RunEvent(
             seq=4,
-            type="paper_fetch_started",
-            payload={
-                "agent_id": "agent-0",
-                "paper_id": "openalex:W1",
-                "mode": "ref",
-                "src": "10.1/seed",
-                "turn": 0,
-            },
+            type="agent_turn_start",
+            payload={"agent_id": "agent-0", "caste": "fundaciones", "oleada": 1, "turn": 0},
         ),
         RunEvent(
             seq=5,
@@ -78,6 +66,7 @@ def _events() -> list[RunEvent]:
                 "authors": ["Ada", "Bob"],
                 "mode": "ref",
                 "src": "10.1/seed",
+                "oleada": 1,
                 "turn": 0,
                 "provider": "openalex",
                 "analysis": _analysis(),
@@ -91,7 +80,6 @@ def _events() -> list[RunEvent]:
                 "agent_id": "agent-0",
                 "provider": "openalex",
                 "components": {"sim": 0.5, "citations": 0.4},
-                "weights": {"w_sim": 0.6},
                 "eta": 0.6,
                 "source": "10.1/seed",
                 "mode": "ref",
@@ -127,7 +115,6 @@ def _events() -> list[RunEvent]:
                     "turn": 0,
                     "q": 0.7,
                     "delta_q": 0.7,
-                    "weights": {"S": 0.25, "P": 0.25, "J": 0.25, "R": 0.25},
                     "self_assessment": {"score": 0.7, "reasoning": "self good"},
                     "peers": {
                         "votes": [{"voter_id": "agent-1", "score": 0.6, "reasoning": "peer ok"}],
@@ -150,8 +137,9 @@ def _events() -> list[RunEvent]:
             type="agent_turn_complete",
             payload={"agent": "agent-0", "oleada": 1, "turn": 0, "Q": 0.7, "delta_q": 0.7, "budget": 10},
         ),
+        RunEvent(seq=10, type="new_best", payload={"agent": "agent-0", "Q": 0.7, "oleada": 1}),
         RunEvent(
-            seq=10,
+            seq=11,
             type="artifact_saved",
             payload={
                 "artifact_id": "a1",
@@ -161,37 +149,7 @@ def _events() -> list[RunEvent]:
             },
         ),
         RunEvent(
-            seq=13,
-            type="neighbor_discovery_started",
-            payload={"agent_id": "agent-0", "paper_id": "openalex:W1", "turn": 0},
-        ),
-        RunEvent(
-            seq=14,
-            type="neighbor_discovery_completed",
-            payload={"agent_id": "agent-0", "paper_id": "openalex:W1", "turn": 0, "refs": 3, "cits": 1},
-        ),
-        RunEvent(
-            seq=15,
-            type="frontier_reference_evaluation_started",
-            payload={"agent_id": "agent-0", "count": 3, "turn": 0},
-        ),
-        RunEvent(
-            seq=16,
-            type="frontier_reference_evaluation_completed",
-            payload={"agent_id": "agent-0", "count": 3, "turn": 0},
-        ),
-        RunEvent(
-            seq=17,
-            type="llm_operation_started",
-            payload={"purpose": "paper_integration", "model": "explorer-x"},
-        ),
-        RunEvent(
-            seq=18,
-            type="llm_operation_completed",
-            payload={"purpose": "paper_integration", "model": "explorer-x", "elapsed": 1.25},
-        ),
-        RunEvent(
-            seq=19,
+            seq=12,
             type="provider_failure",
             payload={
                 "agent_id": "agent-0",
@@ -203,154 +161,304 @@ def _events() -> list[RunEvent]:
     ]
 
 
-def _projection() -> RunProjection:
-    return RunProjection.from_events(_events())
-
-
 def _app() -> ResearchTUIApp:
-    return build_app(_projection())
+    return build_app(RunProjection.from_events(_events()))
 
 
-async def test_initial_layout() -> None:
+async def test_initial_dashboard_layout() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        header = app.query_one("#header", HeaderBar).plain_text
+        header = app.query_one("#header").plain_text
+        assert "Research Explorer" in header
         assert "run-abc" in header
         assert "explorer-x" in header
-        tabs = app.query_one("#tabs", AgentTabs).plain_text
-        assert "A01" in tabs
-        assert "foundations" in tabs
-        timeline = app.query_one("#timeline").plain_text
-        assert "Wave 1" in timeline
-        assert "Paper One" in timeline
-        detail = app.query_one("#detail", DetailPane).plain_text
-        assert "Current activity" in detail
-        assert not app.narrow
+        rows = app.tree_row_texts()
+        assert any("A01" in row and "foundations" in row for row in rows)
+        assert any("Paper One" in row for row in rows)
+        activity = app.query_one("#activity").plain_text
+        assert "Agent" in activity and "Paper One" in activity
+        assert app.query_one("#tabbar").active == "research"
+        assert "Research Explorer" in app.query_one("#footer").plain_text
+        assert not app.session.narrowed
 
 
-async def test_agent_navigation_changes_detail() -> None:
+async def test_tree_navigation_is_agent_first_and_home_restores_follow() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert app.selected_agent_id == "agent-0"
-        await pilot.press("right")
-        assert app.selected_agent_index == 1
-        assert app.selected_agent_id == "agent-1"
+        assert app.session.follow_live
         await pilot.press("left")
-        assert app.selected_agent_id == "agent-0"
-
-
-async def test_timeline_navigation_and_follow_live() -> None:
-    app = _app()
-    async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert app.state.follow_live
+        assert app.session.focus == "tree"
         await pilot.press("up")
-        assert not app.state.follow_live
-        assert app.state.selected_entry_id is not None
+        await pilot.pause()
+        assert not app.session.follow_live
+        selected = app.session.selected_node_id
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.session.selected_node_id != selected
         await pilot.press("home")
-        assert app.state.follow_live
-        assert app.state.selected_entry_id == app.state.timeline[-1].entry_id
+        await pilot.pause()
+        assert app.session.follow_live
+        assert app.session.selected_agent_id == "agent-0"
 
 
-async def test_focused_views_and_restoration() -> None:
+async def test_tabs_select_with_number_and_cycle_keys() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        selected_before = app.state.selected_entry_id
-        for key, expected in (
-            ("e", "Evaluation"),
-            ("f", "Frontier decision record"),
-            ("p", "Paper analysis"),
-            ("n", "Agent narrative"),
-            ("l", "Events"),
-            ("r", "Metadata"),
-            ("question_mark", "Key help"),
-        ):
+        for key, tab in (("2", "paper"), ("3", "evaluation"), ("4", "events"), ("1", "research")):
             await pilot.press(key)
             await pilot.pause()
-            assert isinstance(app.screen, TextViewer), key
-            assert app.screen.viewer_title == expected
-            await pilot.press("escape")
-            await pilot.pause()
-            assert app.state.selected_entry_id == selected_before
+            assert app.session.active_tab == tab
+            assert app.query_one("#tabbar").active == tab
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.session.active_tab == "paper"
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert app.session.active_tab == "research"
 
 
-async def test_details_overlay_and_restoration() -> None:
+async def test_content_tabs_render_projected_facts() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("up")
-        selected = app.state.selected_entry_id
+        assert "Research line" in str(app.query_one("#content").source)
+        await pilot.press("2")
+        await pilot.pause()
+        assert "Selection rationale" in str(app.query_one("#content").source)
+        await pilot.press("3")
+        await pilot.pause()
+        content = str(app.query_one("#content").source)
+        assert "Q=0.7000" in content and "self rationale" in content
+        await pilot.press("4")
+        await pilot.pause()
+        assert "429 timeout" in str(app.query_one("#content").source)
+
+
+async def test_enter_toggles_tree_expansion() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("left")
+        await pilot.pause()
+        # Select the first agent root explicitly.
+        app._on_tree_select(app._tree_nodes[0])
+        await pilot.pause()
+        assert app._tree_nodes[0].node_id in app.session.expanded
         await pilot.press("enter")
+        await pilot.pause()
+        assert app._tree_nodes[0].node_id not in app.session.expanded
+
+
+async def test_reader_and_help_overlays() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("v")
         await pilot.pause()
         assert isinstance(app.screen, TextViewer)
         await pilot.press("escape")
         await pilot.pause()
-        assert app.state.selected_entry_id == selected
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, TextViewer)
+        assert "keyboard shortcuts" in app.screen.viewer_body
+        await pilot.press("escape")
+        await pilot.pause()
 
 
-async def test_narrow_terminal_fallback() -> None:
+async def test_command_palette_runs_an_action() -> None:
     app = _app()
-    async with app.run_test(size=(70, 24)) as pilot:
+    async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert app.narrow
-        await pilot.press("t")
+        await pilot.press("ctrl+p")
         await pilot.pause()
-        assert app.active_pane in ("timeline", "detail")
-        timeline = app.query_one("#timeline-pane")
-        detail = app.query_one("#detail-pane")
-        assert not (timeline.display and detail.display)
+        assert isinstance(app.screen, CommandPaletteScreen)
+        commands = app.screen._actions
+        assert "tab_events" in commands
+        app.screen._choose(commands.index("tab_events"))
+        await pilot.pause()
+        assert app.session.active_tab == "events"
 
 
-async def test_completed_and_failed_screens() -> None:
-    projection = _projection()
-    projection.apply(
+async def test_event_outcome_and_agent_filters() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("o")
+        await pilot.pause()
+        assert app.session.event_outcome == "error"
+        assert app.session.active_tab == "events"
+        assert "outcome=error" in str(app.query_one("#content").source)
+        await pilot.press("o")
+        await pilot.pause()
+        assert app.session.event_outcome == "warning"
+        assert "429 timeout" in str(app.query_one("#content").source)
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.session.event_agent == "all"
+        assert "agent=" not in str(app.query_one("#content").source)
+
+
+async def test_focused_views_open_and_restore_selection() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        before = app.session.selected_node_id
+        for key, expected in (
+            ("e", "Evaluation"),
+            ("f", "Frontier"),
+            ("p", "Paper"),
+            ("n", "Narrative"),
+            ("l", "Events"),
+            ("r", "Metadata"),
+        ):
+            await pilot.press(key)
+            await pilot.pause()
+            assert isinstance(app.screen, TextViewer), key
+            assert app.screen.viewer_title == expected, key
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.session.selected_node_id == before
+
+
+async def test_mouse_selection_on_tree_row() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        items = list(app.query("#tree ListItem"))
+        await pilot.click(items[1])
+        await pilot.pause()
+        assert not app.session.follow_live
+
+
+async def test_mouse_click_selects_tab() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        tabs = list(app.query("#tabbar Tab"))
+        await pilot.click(tabs[3])
+        await pilot.pause()
+        assert app.session.active_tab == "events"
+
+
+async def test_wheel_scrolls_the_focused_panel() -> None:
+    from textual.containers import VerticalScroll
+    from textual.events import MouseScrollDown
+
+    events = _events()
+    events.append(
         RunEvent(
-            seq=11,
-            type="orchestrator_complete",
+            seq=20,
+            type="artifact_saved",
             payload={
-                "run_id": "run-abc",
-                "winner": "agent-0",
-                "peak_Q": 0.7,
-                "status": "completed",
-                "total_fetches": 5,
-                "elapsed": 12.0,
+                "artifact_id": "long",
+                "name": "narrative_agent-0_t0.md",
+                "kind": "narrative",
+                "content": "\n".join(f"paragraph {i}" for i in range(200)),
             },
         )
     )
-    app = build_app(projection)
+    app = build_app(RunProjection.from_events(events))
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert app.state.status == "completed"
-        footer = app.query_one("#footer").plain_text
-        assert "completed" in footer
+        scroll = app.query_one("#content-scroll", VerticalScroll)
+        scroll.scroll_y = 0
+        assert scroll.max_scroll_y > 0
+        event = MouseScrollDown(scroll, 10, 5, 0, 3, 0, False, False, False, 10, 5)
+        scroll._on_mouse_scroll_down(event)
+        await pilot.pause()
+        assert scroll.scroll_y > 0
+
+
+async def test_compact_layout_stacks_and_footer_adapts() -> None:
+    app = _app()
+    async with app.run_test(size=(70, 24)) as pilot:
+        await pilot.pause()
+        assert app.session.narrowed
+        assert app.query_one("#main").has_class("narrow")
+        assert app.query_one("#left").has_class("narrow")
+        assert "toggle panes" in app.query_one("#footer").plain_text
+        await pilot.press("t")
+        await pilot.pause()
+        assert app.session.focus == "content"
+        await pilot.press("t")
+        await pilot.pause()
+        assert app.session.focus == "tree"
+
+
+async def test_resize_preserves_selection_and_tab() -> None:
+    app = _app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        agent = app.session.selected_agent_id
+        await pilot.resize_terminal(70, 24)
+        await pilot.pause()
+        assert app.session.narrowed
+        await pilot.resize_terminal(120, 40)
+        await pilot.pause()
+        assert not app.session.narrowed
+        assert app.session.active_tab == "evaluation"
+        assert app.session.selected_agent_id == agent
+
+
+async def test_completed_failed_and_cancelled_states_are_distinct() -> None:
+    completed = _app()
+    completed.projection.apply(
+        RunEvent(
+            seq=13,
+            type="orchestrator_complete",
+            payload={"run_id": "run-abc", "winner": "agent-0", "peak_Q": 0.7, "status": "completed"},
+        )
+    )
+    async with completed.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert completed.state.status == "completed"
+        assert "completed" in completed.query_one("#footer").plain_text
+        assert completed.query_one("#status-banner").display
         await pilot.press("q")
         await pilot.pause()
 
-    failed = RunProjection.from_events(
-        [
-            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r2"}),
-            RunEvent(seq=2, type="run_failed", payload={"error": "boom"}),
-        ]
+    failed = build_app(
+        RunProjection.from_events(
+            [
+                RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r2"}),
+                RunEvent(seq=2, type="run_failed", payload={"error": "boom"}),
+            ]
+        )
     )
-    app2 = build_app(failed)
-    async with app2.run_test(size=(120, 40)) as pilot:
+    async with failed.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert app2.state.status == "failed"
-        assert any("boom" in f for f in app2.state.failures)
+        assert failed.state.status == "failed"
+        assert "boom" in failed.query_one("#status-banner").plain_text
+
+    cancelled = build_app(
+        RunProjection.from_events(
+            [
+                RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r3"}),
+                RunEvent(seq=2, type="run_cancelled", payload={"run_id": "r3"}),
+            ]
+        )
+    )
+    async with cancelled.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert cancelled.state.status == "cancelled"
 
 
-async def test_quit_confirmation_when_active() -> None:
-    sentinel = asyncio.Event()
+async def test_quit_confirmation_and_cancel_flow() -> None:
+    gate = asyncio.Event()
 
     async def runner() -> str:
-        await sentinel.wait()
-        return "finished"
+        await gate.wait()
+        return "done"
 
     projection = RunProjection.from_events(
-        [RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r3"})]
+        [RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r4"})]
     )
     app = build_app(projection, runner=runner)
     async with app.run_test(size=(120, 40)) as pilot:
@@ -358,94 +466,13 @@ async def test_quit_confirmation_when_active() -> None:
         await pilot.press("q")
         await pilot.pause()
         assert isinstance(app.screen, ConfirmQuitScreen)
-        assert not app.screen.can_detach
         await pilot.press("escape")
         await pilot.pause()
-        assert app.screen is app.screen_stack[0]
         await pilot.press("ctrl+c")
         await pilot.pause()
         assert app.cancelled
-        assert "settling" in app.query_one("#footer").plain_text
-        sentinel.set()
+        gate.set()
         await pilot.pause()
-
-
-async def test_live_event_channel_updates_view() -> None:
-    app = _app()
-    projection = app.projection
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        projection.apply(
-            RunEvent(
-                seq=12,
-                type="agent_turn_start",
-                payload={"agent_id": "agent-2", "caste": "mixto", "oleada": 2, "turn": 0},
-            )
-        )
-        app.refresh_view()
-        await pilot.pause()
-        assert "A03" in app.query_one("#tabs", AgentTabs).plain_text
-
-
-async def test_terminal_safe_shutdown() -> None:
-    app = _app()
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        await pilot.press("q")
-        await pilot.pause()
-    assert app.state.status in ("running", "completed")
-
-
-async def test_live_channel_queue_updates_projection_and_view() -> None:
-    controller = TUIController()
-    app = build_app(controller.projection, queue=controller.queue)
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        controller.event_sink.publish(
-            RunEvent(
-                seq=1,
-                type="orchestrator_start",
-                payload={"run_id": "live-run", "colony_size": 1, "K": 1},
-            )
-        )
-        controller.event_sink.publish(
-            RunEvent(
-                seq=2,
-                type="agent_turn_start",
-                payload={"agent_id": "z0", "caste": "mixto", "oleada": 1, "turn": 0},
-            )
-        )
-        for _ in range(20):
-            await pilot.pause()
-            if app.state.run_id == "live-run" and "A01" in app.query_one(
-                "#tabs", AgentTabs
-            ).plain_text:
-                break
-        assert app.state.run_id == "live-run"
-        assert "A01" in app.query_one("#tabs", AgentTabs).plain_text
-        await controller.queue.put(None)
-
-
-def test_controller_drain_matches_direct_projection() -> None:
-    events = _events()
-    controller = TUIController()
-    for event in events:
-        controller.event_sink.publish(event)
-    assert not controller.channel.empty()
-    controller.drain()
-    assert controller.channel.empty()
-    drained = controller.projection.state
-    direct = RunProjection.from_events(events).state
-    assert drained.run_id == direct.run_id
-    assert drained.status == direct.status
-    assert drained.agents == direct.agents
-    assert drained.timeline == direct.timeline
-    assert drained.narratives == direct.narratives
-    assert [s.paper_id for s in drained.selections] == [s.paper_id for s in direct.selections]
-    assert [c.paper_id for c in drained.candidate_scores] == [
-        c.paper_id for c in direct.candidate_scores
-    ]
-    assert drained.evaluations["agent-0"][-1].q == direct.evaluations["agent-0"][-1].q
 
 
 async def test_runner_failure_marks_failed_and_redacts() -> None:
@@ -463,128 +490,132 @@ async def test_runner_failure_marks_failed_and_redacts() -> None:
     assert "sk-sentinel-4242" not in " ".join(app.state.failures)
 
 
-async def test_runner_success_captures_result() -> None:
-    async def runner() -> tuple[str, None]:
-        return "report body", None
-
-    app = build_app(_projection(), runner=runner)
-    await app._run_runner()
-    assert app.run_result == ("report body", None)
+def _projection() -> RunProjection:
+    return RunProjection.from_events(_events())
 
 
-async def test_quit_confirmation_offers_detach_when_allowed() -> None:
-    async def runner() -> str:
-        return "done"
-
-    app = build_app(_projection(), runner=runner, can_detach=True)
+async def test_live_channel_updates_projection_and_tree() -> None:
+    controller = TUIController()
+    app = build_app(controller.projection, queue=controller.queue)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("q")
+        controller.event_sink.publish(
+            RunEvent(
+                seq=1,
+                type="orchestrator_start",
+                payload={"run_id": "live-run", "colony_size": 1, "K": 1},
+            )
+        )
+        controller.event_sink.publish(
+            RunEvent(seq=2, type="colony_initialized", payload={"size": 1, "agents": ["z0"]})
+        )
+        for _ in range(20):
+            await pilot.pause()
+            if app.state.run_id == "live-run" and "A01" in app.agent_roster_text:
+                break
+        assert app.state.run_id == "live-run"
+        assert "A01" in app.agent_roster_text
+        await controller.queue.put(None)
+
+
+async def test_read_only_replay_freezes_elapsed() -> None:
+    projection = RunProjection.from_events(_events())
+    projection.apply(
+        RunEvent(
+            seq=13,
+            type="orchestrator_complete",
+            payload={"run_id": "run-abc", "winner": "agent-0", "status": "completed", "elapsed": 42.0},
+        )
+    )
+    before = projection.state.elapsed_seconds
+    app = build_app(projection, read_only=True)
+    async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert isinstance(app.screen, ConfirmQuitScreen)
-        assert app.screen.can_detach
+        app._tick_elapsed()
+        assert app.state.elapsed_seconds == before
+        assert app.session.follow_live
+        assert app.session.selected_agent_id == "agent-0"
 
 
-async def test_cancel_choice_cancels_active_run() -> None:
+async def test_replay_without_winner_selects_first_agent_and_research_tab() -> None:
+    projection = RunProjection.from_events(
+        [
+            RunEvent(
+                seq=1,
+                type="orchestrator_start",
+                payload={"run_id": "degraded", "colony_size": 2, "K": 1},
+            ),
+            RunEvent(
+                seq=2,
+                type="colony_initialized",
+                payload={"size": 2, "agents": ["a0", "a1"]},
+            ),
+        ]
+    )
+    app = build_app(projection, read_only=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.session.active_tab == "research"
+        assert app.session.selected_agent_id == "a0"
+        assert app.session.follow_live
+
+
+async def test_read_only_replay_has_no_cancel_or_detach() -> None:
+    projection = RunProjection.from_events(
+        [RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r"})]
+    )
+    app = build_app(projection, read_only=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.can_detach is False
+        assert app._runner is None
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not app.cancelled
+        assert app.state.status == "running"
+
+
+async def test_quit_confirmation_keep_then_detach() -> None:
     gate = asyncio.Event()
 
     async def runner() -> str:
         await gate.wait()
         return "done"
 
-    app = build_app(_projection(), runner=runner)
+    projection = RunProjection.from_events(
+        [RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "r5"})]
+    )
+    app = build_app(projection, runner=runner, can_detach=True)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await pilot.press("q")
         await pilot.pause()
-        await pilot.press("c")
+        assert isinstance(app.screen, ConfirmQuitScreen)
+        assert app.screen.can_detach is True
+        await pilot.press("k")
         await pilot.pause()
-        assert app.cancelled
+        assert not isinstance(app.screen, ConfirmQuitScreen)
+        assert not app._exit
+        await pilot.press("q")
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        assert app._exit
         gate.set()
         await pilot.pause()
 
 
-async def test_down_navigation_then_home_restores_follow() -> None:
+async def test_command_palette_filters_commands() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        newest = app.state.selected_entry_id
-        await pilot.press("up")
-        assert not app.state.follow_live
-        assert app.state.selected_entry_id != newest
-        await pilot.press("down")
-        assert app.state.selected_entry_id == newest
-        await pilot.press("home")
-        assert app.state.follow_live
-        assert app.state.selected_entry_id == newest
-
-
-async def test_focused_views_render_projected_content() -> None:
-    app = _app()
-    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("ctrl+p")
         await pilot.pause()
-        for key, expected in (
-            ("e", "Q=0.7000"),
-            ("f", "openalex:W1"),
-            ("n", "Body text"),
-            ("l", "Events"),
-        ):
-            await pilot.press(key)
-            await pilot.pause()
-            assert isinstance(app.screen, TextViewer), key
-            assert expected in app.screen.viewer_body, key
-            await pilot.press("escape")
-            await pilot.pause()
-
-
-async def test_narrow_toggle_switches_visible_pane() -> None:
-    app = _app()
-    async with app.run_test(size=(70, 24)) as pilot:
+        assert isinstance(app.screen, CommandPaletteScreen)
+        app.screen._populate("events")
         await pilot.pause()
-        assert app.narrow
-        assert app.active_pane == "timeline"
-        await pilot.press("t")
-        await pilot.pause()
-        assert app.active_pane == "detail"
-        assert app.query_one("#detail-pane").display
-        assert not app.query_one("#timeline-pane").display
-        await pilot.press("t")
-        await pilot.pause()
-        assert app.active_pane == "timeline"
-
-
-async def test_resize_preserves_selection() -> None:
-    app = _app()
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        await pilot.press("right")
-        agent = app.selected_agent_id
-        selected = app.state.selected_entry_id
-        await pilot.resize_terminal(70, 24)
-        await pilot.pause()
-        assert app.narrow
-        await pilot.resize_terminal(120, 40)
-        await pilot.pause()
-        assert not app.narrow
-        assert app.selected_agent_id == agent
-        assert app.state.selected_entry_id == selected
-
-
-async def test_timeline_and_detail_project_discovery_and_telemetry() -> None:
-    app = _app()
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        timeline = app.query_one("#timeline").plain_text
-        assert "discover openalex:W1" in timeline
-        assert "refs=3" in timeline
-        assert "frontier evaluation" in timeline
-        detail = app.query_one("#detail", DetailPane).plain_text
-        assert "operation paper_integration" in detail
-        assert "model explorer-x" in detail
-        assert "elapsed 1s" in detail
-        assert "year 2020" in detail
-        assert "authors Ada, Bob" in detail
-        assert "source 10.1/seed" in detail
+        assert "tab_events" in app.screen._actions
+        assert "quit" not in app.screen._actions
 
 
 async def test_render_failure_requests_orderly_shutdown(monkeypatch) -> None:
@@ -594,31 +625,27 @@ async def test_render_failure_requests_orderly_shutdown(monkeypatch) -> None:
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
 
-        def boom(state):
+        def boom(*args, **kwargs):
             raise RuntimeError("render exploded")
 
-        monkeypatch.setattr(render, "render_header", boom)
+        monkeypatch.setattr(render, "render_dashboard_header", boom)
         app.refresh_view()
         await pilot.pause()
         assert any("ui render failed" in w for w in app.state.warnings)
         assert app._exit
 
 
-async def test_event_outcome_filter_cycles_in_pilot() -> None:
+async def test_footer_and_help_come_from_action_registry() -> None:
+    from research_explorer.tui.actions import ACTIONS, help_text
+
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("o")
-        await pilot.pause()
-        assert isinstance(app.screen, TextViewer)
-        assert app.screen.viewer_title == "Events (error)"
-        assert "no events recorded for this filter" in app.screen.viewer_body
-        await pilot.press("escape")
-        await pilot.pause()
-        await pilot.press("o")
-        await pilot.pause()
-        assert app.screen.viewer_title == "Events (warning)"
-        assert "429 timeout" in app.screen.viewer_body
-        assert "run_failed" not in app.screen.viewer_body
-        await pilot.press("escape")
-        await pilot.pause()
+        help_body = help_text()
+        for action in ACTIONS:
+            key = action.key_display or action.key or ""
+            assert key in help_body, action.id
+        footer = app.query_one("#footer").plain_text
+        for action in ACTIONS:
+            if action.footer and not action.narrow:
+                assert (action.key_display or action.key) in footer, action.id
