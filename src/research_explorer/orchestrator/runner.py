@@ -16,6 +16,7 @@ from research_explorer.aco.scheduler import Scheduler
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.config import Config, get_api_key
 from research_explorer.evaluation.structural import StructuralMetrics
+from research_explorer.events.sink import EventSink
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.feromone import PheromoneManager
 from research_explorer.graph.models import normalize_id
@@ -38,8 +39,10 @@ class Orchestrator:
         narrative = await orch.run(seed_paper_id="10.1038/nrn3241", seed_query="...")
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, event_sink: EventSink | None = None):
         self.cfg = config
+        self.event_sink = event_sink
+        self.run_id: str = ""
         configure_logging(config.log_level)
 
         # Storage
@@ -112,7 +115,9 @@ class Orchestrator:
             seed_query,
             config_json=json.dumps(dataclasses.asdict(self.cfg), default=str),
         )
-        self.tracer = RunTracer(self.trace, run_id)
+        self.run_id = run_id
+        self.tracer = RunTracer(self.trace, run_id, sink=self.event_sink)
+        self.llm.tracer = self.tracer
         self.scheduler.tracer = self.tracer
 
         log.info(
@@ -135,6 +140,7 @@ class Orchestrator:
             )
         except Exception as e:
             if self.tracer is not None:
+                self.tracer.emit("run_failed", run_id=run_id, error=redact_secrets(str(e)))
                 self.tracer.record_artifact(
                     "run_error.txt", "error", redact_secrets(str(e))
                 )
@@ -153,14 +159,22 @@ class Orchestrator:
     ) -> str:
         tracer.emit(
             "orchestrator_start",
+            run_id=run_id,
             seed=seed_paper_id,
             query=seed_query,
+            pipeline=self.cfg.pipeline,
             colony_size=self.cfg.aco.colony_size,
             K=self.cfg.aco.max_concurrent,
+            k_per_turn=self.cfg.aco.k_per_turn,
             max_fetches=self.cfg.budget.max_fetches,
+            budget_type=self.cfg.budget.type,
+            max_time_seconds=self.cfg.budget.max_time_seconds,
+            explorer_model=self.cfg.llm.explorer_model,
+            judge_model=self.cfg.llm.judge_model,
         )
 
         # 1. Fetch the seed paper and cache it
+        tracer.emit("seed_routing_started", seed=seed_paper_id)
         tracer.emit(
             "seed_routed",
             seed=seed_paper_id,
@@ -175,6 +189,7 @@ class Orchestrator:
         seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
 
         # 2. Initialize the colony (each agent reads the seed)
+        tracer.emit("colony_init_started", seed=seed_nid)
         await self.colony.initialize(seed_nid, seed_query)
         for agent in self.colony.agents:
             agent.tracer = tracer
@@ -182,6 +197,7 @@ class Orchestrator:
             "colony_initialized",
             size=len(self.colony.agents),
             seed=seed_nid,
+            agents=[a.state.id for a in self.colony.agents],
         )
 
         # 3. Run oleadas until convergence
@@ -203,7 +219,7 @@ class Orchestrator:
 
         if winner is None:
             log.warning("no_winner")
-            tracer.emit("no_winner", elapsed=round(self._elapsed, 1))
+            tracer.emit("no_winner", run_id=run_id, elapsed=round(self._elapsed, 1))
         else:
             log.info(
                 "orchestrator_complete",
@@ -217,6 +233,8 @@ class Orchestrator:
             )
             tracer.emit(
                 "orchestrator_complete",
+                run_id=run_id,
+                status="completed",
                 winner=self.colony.best_snapshot_agent,
                 best_Q=round(winner.state.quality, 4),
                 peak_Q=round(self.colony.best_quality, 4),
@@ -237,6 +255,14 @@ class Orchestrator:
             best_quality=round(self.colony.best_quality, 6),
         )
         return self.colony.best_narrative if winner is not None else ""
+
+    def mark_cancelled(self) -> None:
+        """Persist a distinct ``cancelled`` status for the active run."""
+        if not self.run_id:
+            return
+        if self.tracer is not None:
+            self.tracer.emit("run_cancelled", run_id=self.run_id)
+        self.trace.finish_run(self.run_id, "cancelled")
 
     def generate_report(self, seed_paper_id: str, seed_query: str) -> str:
         """Build a full markdown exploration report after run() has completed."""

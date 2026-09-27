@@ -239,6 +239,10 @@ class ExplorerAgent:
         self._eta_cache: dict[str, EtaComponents] = {}
         self._llm_priority: dict[str, float] = {}
 
+    def _emit(self, type: str, **payload) -> None:
+        if self.tracer is not None:
+            self.tracer.emit(type, **payload)
+
     async def take_turn(self, k: int) -> list[tuple[str, str, str]]:
         """Execute one turn: fetch k papers, integrate narratives.
 
@@ -275,6 +279,16 @@ class ExplorerAgent:
                 expected_title = expected_summary.title if expected_summary else ""
                 self._shared_visited.add(next_id)
                 inflight = next_id
+                provider_name, _ = parse_normalized_id(next_id)
+                self._emit(
+                    "paper_fetch_started",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    mode=mode,
+                    provider=provider_name,
+                    src=src,
+                    turn=self.state.turn_count,
+                )
 
                 try:
                     paper = await self._fetch_paper(next_id)
@@ -290,15 +304,23 @@ class ExplorerAgent:
                         provider=exc.provider,
                         reason=exc.reason,
                     )
-                    if self.tracer is not None:
-                        self.tracer.emit(
-                            "provider_failure",
-                            paper_id=next_id,
-                            provider=exc.provider,
-                            reason=exc.reason,
-                            classification="transient",
-                            attempts=self._frontier.attempt_count(next_id),
-                        )
+                    self._emit(
+                        "paper_fetch_failed",
+                        agent_id=self.state.id,
+                        paper_id=next_id,
+                        provider=exc.provider,
+                        reason=exc.reason,
+                        classification="transient",
+                        attempts=self._frontier.attempt_count(next_id),
+                    )
+                    self._emit(
+                        "provider_failure",
+                        paper_id=next_id,
+                        provider=exc.provider,
+                        reason=exc.reason,
+                        classification="transient",
+                        attempts=self._frontier.attempt_count(next_id),
+                    )
                     continue
 
                 owned = self._frontier.claim_for(next_id, self.state.id)
@@ -351,17 +373,66 @@ class ExplorerAgent:
                     continue
 
                 self.graph.cache_paper(paper)
+                self._emit(
+                    "paper_fetch_completed",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    title=paper.title,
+                    year=paper.year,
+                    authors=list(paper.authors),
+                    provider=paper.provider,
+                    mode=mode,
+                    src=src,
+                    turn=self.state.turn_count,
+                )
+                self._emit(
+                    "paper_integration_started",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    title=paper.title,
+                    mode=mode,
+                    src=src,
+                    turn=self.state.turn_count,
+                )
                 narrative, extracted = await self._integrate(paper)
                 self.state.narrative = narrative
                 if paper.fulltext or paper.abstract:
                     self.graph.mark_integrated(next_id)
+
+                self._emit(
+                    "paper_integration_completed",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    title=paper.title,
+                    year=paper.year,
+                    authors=list(paper.authors),
+                    provider=paper.provider,
+                    mode=mode,
+                    src=src,
+                    turn=self.state.turn_count,
+                    analysis=self.state.paper_analyses.get(next_id),
+                )
 
                 self.state.visit(next_id, mode)
                 self._frontier.remove(next_id)
                 inflight = None
                 edges.append((src, next_id, mode))
 
+                self._emit(
+                    "neighbor_discovery_started",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    turn=self.state.turn_count,
+                )
                 await self._discover_neighbors(next_id, paper, extracted)
+                self._emit(
+                    "neighbor_discovery_completed",
+                    agent_id=self.state.id,
+                    paper_id=next_id,
+                    turn=self.state.turn_count,
+                    refs=len(self.state.local_references(next_id)),
+                    cits=len(self.state.local_citants(next_id)),
+                )
 
                 await self._evaluate_new_refs()
 
@@ -596,6 +667,12 @@ class ExplorerAgent:
         new_refs = self._frontier.unevaluated()
         if not new_refs:
             return
+        self._emit(
+            "frontier_reference_evaluation_started",
+            agent_id=self.state.id,
+            count=len(new_refs),
+            turn=self.state.turn_count,
+        )
 
         # Build PaperSummary list for the prompt (from shared store)
         candidates: list[PaperSummary] = []
@@ -610,6 +687,12 @@ class ExplorerAgent:
             for pid in new_refs:
                 eta = await self._heuristic(pid)
                 self._frontier.set_score(pid, eta)
+            self._emit(
+                "frontier_reference_evaluation_completed",
+                agent_id=self.state.id,
+                count=len(new_refs),
+                turn=self.state.turn_count,
+            )
             return
 
         MAX_BATCH = 30
@@ -625,12 +708,20 @@ class ExplorerAgent:
                 model=self.cfg.llm.explorer_model,
                 temperature=0.3,
                 max_tokens=min(self.cfg.llm.max_tokens, 2000),
+                purpose="frontier_reference_evaluation",
             )
         except Exception as e:
             log.warning("eval_refs_failed", agent=self.state.id, error=str(e))
             for pid in new_refs:
                 eta = await self._heuristic(pid)
                 self._frontier.set_score(pid, eta)
+            self._emit(
+                "frontier_reference_evaluation_completed",
+                agent_id=self.state.id,
+                count=len(new_refs),
+                turn=self.state.turn_count,
+                degraded=True,
+            )
             return
 
         scores = self._parse_eval_response(raw)
@@ -646,6 +737,12 @@ class ExplorerAgent:
             if pid not in self._frontier.scores:
                 eta = await self._heuristic(pid)
                 self._frontier.set_score(pid, eta)
+        self._emit(
+            "frontier_reference_evaluation_completed",
+            agent_id=self.state.id,
+            count=len(new_refs),
+            turn=self.state.turn_count,
+        )
 
     def _parse_eval_response(self, raw: str) -> list[dict]:
         """Parse the LLM's reference evaluation response.
@@ -785,6 +882,7 @@ class ExplorerAgent:
                     model=self.cfg.llm.explorer_model,
                     temperature=self.cfg.llm.temperature,
                     max_tokens=self.cfg.llm.max_tokens,
+                    purpose="paper_integration",
                 )
             except Exception as e:
                 log.warning("integrate_extract_failed", agent=self.state.id, error=str(e))
@@ -809,6 +907,7 @@ class ExplorerAgent:
                 model=self.cfg.llm.explorer_model,
                 temperature=self.cfg.llm.temperature,
                 max_tokens=self.cfg.llm.max_tokens,
+                purpose="paper_integration",
             )
         except Exception as e:
             log.warning("integrate_failed", agent=self.state.id, error=str(e))

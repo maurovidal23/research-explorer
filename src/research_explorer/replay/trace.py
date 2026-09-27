@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from research_explorer.events.models import RunEvent
+from research_explorer.events.sink import EventSink
 from research_explorer.logging_setup import get_logger
 from research_explorer.redaction import redact_obj, redact_secrets
 from research_explorer.replay.models import (
@@ -318,14 +320,37 @@ class RunTracer:
 
     It also keeps the event stream lean: rationales live in the evaluation
     records; event payloads carry only compact fields.
+
+    When an :class:`~research_explorer.events.sink.EventSink` is attached, every
+    durable event is republished as a normalized
+    :class:`~research_explorer.events.models.RunEvent` carrying the durable
+    per-run sequence number, so the live TUI and replay share one ordering.
     """
 
-    def __init__(self, store: RunTraceStore, run_id: str):
+    def __init__(self, store: RunTraceStore, run_id: str, sink: EventSink | None = None):
         self.store = store
         self.run_id = run_id
+        self._sink = sink
+        self.durability_failed = False
 
     def emit(self, type: str, **payload) -> int:
-        return self.store.append_event(self.run_id, type, payload)
+        try:
+            seq = self.store.append_event(self.run_id, type, payload)
+        except Exception as exc:
+            self.durability_failed = True
+            self._publish(0, "trace_write_failed", {"error": str(exc)})
+            raise
+        self._publish(seq, type, payload)
+        return seq
+
+    def _publish(self, seq: int, type: str, payload: dict) -> None:
+        if self._sink is None:
+            return
+        try:
+            normalized = json.loads(json.dumps(redact_obj(payload), default=str))
+        except (TypeError, ValueError):
+            normalized = {}
+        self._sink.publish(RunEvent(seq=seq, type=type, payload=normalized, ts=utc_now()))
 
     def record_evaluation(self, detail: DetailedEvaluation) -> None:
         self.store.save_evaluation(self.run_id, detail)
@@ -341,10 +366,22 @@ class RunTracer:
             delta_q=round(detail.delta_q, 4),
             num_votes=detail.peers.num_votes,
         )
+        try:
+            full = json.loads(detail.model_dump_json())
+        except (TypeError, ValueError):
+            full = None
+        if full is not None:
+            self.emit("evaluation_detail", detail=full)
 
     def record_artifact(self, name: str, kind: str, content: str) -> str:
         artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
-        self.emit("artifact_saved", artifact_id=artifact_id, name=name, kind=kind)
+        self.emit(
+            "artifact_saved",
+            artifact_id=artifact_id,
+            name=name,
+            kind=kind,
+            content=redact_secrets(content),
+        )
         return artifact_id
 
     def record_candidate_score(self, score: CandidateScore) -> int:

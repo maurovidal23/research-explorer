@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from aiolimiter import AsyncLimiter
 from openai import AsyncOpenAI
@@ -25,6 +26,10 @@ from tenacity import (
 )
 
 from research_explorer.logging_setup import get_logger
+from research_explorer.redaction import redact_secrets
+
+if TYPE_CHECKING:
+    from research_explorer.replay.trace import RunTracer
 
 log = get_logger("llm")
 
@@ -55,13 +60,14 @@ class LLMClient:
         )
         self.sem = asyncio.Semaphore(max_concurrent)
         self.limiter = AsyncLimiter(max(rpm / 60, 0.1), 1)
+        self.tracer: RunTracer | None = None
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(3),
-        wait=wait_random_exponential(multiplier=1, max=30),
-        retry=retry_if_exception_type(Exception),
-    )
+    def _emit_operation(self, type: str, **payload: Any) -> None:
+        tracer = self.tracer
+        if tracer is None:
+            return
+        tracer.emit(type, **payload)
+
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -71,8 +77,59 @@ class LLMClient:
         temperature: float = 0.6,
         max_tokens: int = 2000,
         extra_body: dict | None = None,
+        purpose: str = "chat",
     ) -> str:
-        """Send a chat completion request. Returns the assistant message content."""
+        """Send a chat completion request. Returns the assistant message content.
+
+        Emits ``llm_operation_started``/``completed``/``failed`` telemetry when a
+        :class:`~research_explorer.replay.trace.RunTracer` is attached; the
+        payload carries purpose, model, elapsed time, and token usage only.
+        """
+        started = time.monotonic()
+        self._emit_operation("llm_operation_started", purpose=purpose, model=model)
+        try:
+            content, usage = await self._chat_impl(
+                messages,
+                model=model,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._emit_operation(
+                "llm_operation_failed",
+                purpose=purpose,
+                model=model,
+                elapsed=round(time.monotonic() - started, 4),
+                error=redact_secrets(str(exc)),
+            )
+            raise
+        self._emit_operation(
+            "llm_operation_completed",
+            purpose=purpose,
+            model=model,
+            elapsed=round(time.monotonic() - started, 4),
+            **usage,
+        )
+        return content
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        retry=retry_if_exception_type(Exception),
+    )
+    async def _chat_impl(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str,
+        response_format: dict | None,
+        temperature: float,
+        max_tokens: int,
+        extra_body: dict | None,
+    ) -> tuple[str, dict[str, int]]:
         async with self.sem, self.limiter:
             kwargs: dict[str, Any] = {
                 "model": model,
@@ -85,7 +142,18 @@ class LLMClient:
             if extra_body:
                 kwargs["extra_body"] = extra_body
             resp = await self.client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content or ""
+            usage: dict[str, int] = {}
+            reported = getattr(resp, "usage", None)
+            if reported is not None:
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = getattr(reported, key, None)
+                    if value is not None:
+                        usage[key] = int(value)
+            if "total_tokens" not in usage:
+                total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                if total:
+                    usage["total_tokens"] = total
+            return resp.choices[0].message.content or "", usage
 
     async def chat_json(
         self,
@@ -95,6 +163,7 @@ class LLMClient:
         schema: dict | None = None,
         temperature: float = 0.6,
         max_tokens: int = 2000,
+        purpose: str = "chat_json",
     ) -> dict:
         """Chat with structured JSON output (json_schema strict)."""
         if schema:
@@ -110,6 +179,7 @@ class LLMClient:
             response_format=response_format,
             temperature=temperature,
             max_tokens=max_tokens,
+            purpose=purpose,
         )
         import json
 

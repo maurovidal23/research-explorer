@@ -155,6 +155,7 @@ class PeerVoting:
             schema=VOTE_SCHEMA,
             temperature=0.3,
             max_tokens=1000,
+            purpose="peer_vote_detail",
         )
         score = float(result.get("score", 0.5))
         score = max(0.0, min(1.0, score))
@@ -183,6 +184,7 @@ class PeerVoting:
             schema=VOTE_SCHEMA,
             temperature=0.3,
             max_tokens=1000,
+            purpose="peer_vote",
         )
         score = float(result.get("score", 0.5))
         return max(0.0, min(1.0, score))

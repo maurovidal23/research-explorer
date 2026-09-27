@@ -18,7 +18,9 @@ from research_explorer.replay.models import StructuralComponentsDetail
 class FakeLLM:
     """Scripted chat_json that returns schema-appropriate structured output."""
 
-    async def chat_json(self, messages, *, model="", schema=None, temperature=0.0, max_tokens=0):
+    async def chat_json(
+        self, messages, *, model="", schema=None, temperature=0.0, max_tokens=0, **kwargs
+    ):
         if schema is None:
             return {"score": 0.5}
         if schema is SCORE_SCHEMA:
@@ -107,7 +109,9 @@ async def test_assess_surfaces_breakdown(assessor):
 class FailingLLM:
     """LLM that always fails, simulating JSON parse errors."""
 
-    async def chat_json(self, messages, *, model="", schema=None, temperature=0.0, max_tokens=0):
+    async def chat_json(
+        self, messages, *, model="", schema=None, temperature=0.0, max_tokens=0, **kwargs
+    ):
         raise ValueError("simulated LLM failure")
 
 

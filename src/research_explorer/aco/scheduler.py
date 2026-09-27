@@ -64,7 +64,17 @@ class Scheduler:
                 "oleada_start",
                 oleada=self.oleada_count,
                 active=[a.state.id for a in k_agents],
+                max_fetches=self.cfg.budget.max_fetches,
             )
+            for queued in self.colony.agents:
+                if queued not in k_agents:
+                    self.tracer.emit(
+                        "agent_turn_queued",
+                        agent_id=queued.state.id,
+                        oleada=self.oleada_count,
+                        turn=queued.state.turn_count,
+                        state="waiting",
+                    )
 
         # Each agent takes its turn (sequentially within the oleada for peer voting)
         agent_paths: list[AgentPath] = []
@@ -79,6 +89,7 @@ class Scheduler:
                 self.tracer.emit(
                     "agent_turn_start",
                     agent=agent.state.id,
+                    agent_id=agent.state.id,
                     caste=agent.state.caste,
                     oleada=self.oleada_count,
                     turn=agent.state.turn_count,
@@ -129,6 +140,13 @@ class Scheduler:
                     )
             else:
                 # Assess quality -- returns a detailed record retaining rationales
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "quality_evaluation_started",
+                        agent_id=agent.state.id,
+                        oleada=self.oleada_count,
+                        turn=agent.state.turn_count,
+                    )
                 record = await self.assessor.assess_detail(
                     agent, k_agents, self.colony.seed_query, new_papers,
                     oleada=self.oleada_count,

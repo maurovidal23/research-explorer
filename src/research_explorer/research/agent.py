@@ -110,6 +110,7 @@ class LLMResearchAgent:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=min(self.max_tokens, prompt.output_reserve or self.max_tokens),
+                purpose="research_agent",
             )
         except Exception as exc:  # transport/decoding failures are contained by the caller
             raise AgentOutputError(str(exc)) from exc
@@ -157,6 +158,7 @@ class LLMReferenceMapper:
             model=self.model,
             temperature=0.0,
             max_tokens=self.max_tokens,
+            purpose="reference_mapping",
         )
         entries = raw.get("references") if isinstance(raw, dict) else None
         if not isinstance(entries, list):

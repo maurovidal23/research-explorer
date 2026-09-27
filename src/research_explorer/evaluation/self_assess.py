@@ -47,6 +47,7 @@ class SelfAssessment:
                 schema=SCORE_SCHEMA,
                 temperature=0.3,
                 max_tokens=1000,
+                purpose="self_assessment",
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))

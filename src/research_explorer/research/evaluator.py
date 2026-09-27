@@ -133,6 +133,7 @@ class LLMRubricEvaluator:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=min(self.max_tokens, prompt.output_reserve or self.max_tokens),
+                purpose="rubric_evaluation",
             )
         except Exception as exc:
             error = redact_secrets(str(exc))

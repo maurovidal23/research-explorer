@@ -76,6 +76,39 @@ research-explorer mcp list
 python -m research_explorer.mcp.semantic_scholar_server
 ```
 
+### Interfaz TUI (pipeline ACO)
+
+Añade `--tui` para seguir la exploración ACO en vivo desde la terminal. El pipeline
+`research-kernel` no está soportado todavía: `--tui` con ese pipeline falla antes de
+abrir proveedores o bases de datos.
+
+```bash
+research-explorer explore 10.1038/nrn3241 \
+  "origin of extracellular fields in the brain" \
+  --tui
+```
+
+La TUI muestra cabecera (run, tiempo, presupuesto, oleada, mejor Q), pestañas por
+agente, el timeline de descubrimiento/evaluación y el detalle del agente seleccionado
+(actividad actual, racional de selección, contribución del paper y línea de
+investigación). Navegación solo con teclado:
+
+| Tecla | Acción |
+|---|---|
+| `←` / `→` | agente anterior / siguiente |
+| `↑` / `↓` | paso anterior / siguiente del timeline |
+| `Enter` | detalle del paso seleccionado |
+| `Home` | volver a modo en vivo |
+| `e` / `f` / `p` / `n` | evaluación, frontera, paper, narrativa |
+| `l` / `r` / `?` | eventos, metadatos, ayuda |
+| `t` | alternar paneles en terminal estrecha |
+| `q` / `Ctrl+C` | salir / cancelar |
+
+Los eventos se publican por un contrato tipado e independiente de la UI y se
+proyectan de forma determinista, de modo que la misma vista se reconstruye desde el
+trace durable (`data/replay.db`). El comportamiento sin `--tui` y el pipeline
+`research-kernel` no cambian.
+
 ## Servidores MCP
 
 El proyecto incluye 4 servidores MCP standalone (usables desde Claude Desktop, etc.):

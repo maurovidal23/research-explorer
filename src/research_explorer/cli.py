@@ -35,6 +35,11 @@ def explore(
     pipeline: str = typer.Option(
         None, "--pipeline", help="Pipeline mode: aco | research-kernel"
     ),
+    tui: bool = typer.Option(
+        False,
+        "--tui/--no-tui",
+        help="Launch the live terminal interface (ACO pipeline only)",
+    ),
 ) -> None:
     """Explore a research line starting from a seed paper."""
     cfg = load_config(config_path)
@@ -42,11 +47,20 @@ def explore(
     log = get_logger("cli")
 
     mode = (pipeline or cfg.pipeline or "aco").replace("_", "-").lower()
+    if tui and mode != "aco":
+        raise typer.BadParameter(
+            f"--tui is not supported for the '{mode}' pipeline yet; "
+            "run without --tui or use --pipeline aco."
+        )
     if mode == "research-kernel":
         _run_research_kernel(cfg, seed_paper_id, seed_query, output)
         return
 
     from research_explorer.orchestrator.runner import Orchestrator
+
+    if tui:
+        _run_aco_tui(cfg, seed_paper_id, seed_query, output)
+        return
 
     async def _run() -> tuple[str, str | None]:
         orch = Orchestrator(cfg)
@@ -60,7 +74,10 @@ def explore(
 
     log.info("starting_exploration", seed=seed_paper_id, query=seed_query)
     report, obsidian_dir = asyncio.run(_run())
+    _emit_report(report, output, obsidian_dir)
 
+
+def _emit_report(report: str, output: str | None, obsidian_dir: str | None) -> None:
     if output:
         Path(output).write_text(report, encoding="utf-8")
         typer.echo(f"Report written to {output}")
@@ -72,6 +89,40 @@ def explore(
 
     if obsidian_dir:
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
+
+
+def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:
+    """Run the ACO exploration under the Textual terminal interface."""
+    from research_explorer.orchestrator.runner import Orchestrator
+    from research_explorer.tui import TUIController, build_app
+
+    controller = TUIController()
+    orch = Orchestrator(cfg, event_sink=controller.event_sink)
+
+    async def runner() -> tuple[str, str | None]:
+        try:
+            await orch.run(seed_paper_id, seed_query)
+            report = orch.generate_report(seed_paper_id, seed_query)
+            obsidian_dir = orch.generate_obsidian(seed_query)
+            return report, obsidian_dir
+        except asyncio.CancelledError:
+            orch.mark_cancelled()
+            raise
+        finally:
+            await orch.aclose()
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    app.run()
+    controller.drain()
+
+    if app.cancelled or app.state.status == "cancelled":
+        typer.echo("Run cancelled.")
+        return
+    if app.run_result is None:
+        typer.echo("Run did not complete; see the failure summary above.", err=True)
+        raise typer.Exit(1)
+    report, obsidian_dir = app.run_result
+    _emit_report(report, output, obsidian_dir)
 
 
 def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:

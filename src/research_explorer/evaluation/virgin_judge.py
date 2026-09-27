@@ -49,6 +49,7 @@ class VirginJudge:
                 schema=JUDGE_SCHEMA,
                 temperature=0.2,
                 max_tokens=1500,
+                purpose="virgin_judge",
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))

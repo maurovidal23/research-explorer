@@ -250,7 +250,11 @@ async def test_take_turn_rejects_mismatched_title() -> None:
     assert e._shared_visited == set()
     assert cached == []
     assert removed == ["arxiv:1901.03228"]
-    assert emitted == [
+    emitted_types = [t for t, _ in emitted]
+    assert emitted_types[0] == "paper_fetch_started"
+    assert emitted_types[-1] == "id_title_mismatch"
+    mismatch = [item for item in emitted if item[0] == "id_title_mismatch"]
+    assert mismatch == [
         (
             "id_title_mismatch",
             {
