@@ -187,6 +187,8 @@ class ResearchTUIApp(App[None]):
         self.selected_agent_index = 0
         self.event_outcome_filter = ""
         self._runner_worker: Any = None
+        self._consumer_worker: Any = None
+        self.run_finished = False
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -221,10 +223,16 @@ class ResearchTUIApp(App[None]):
         yield FooterBar(id="footer")
 
     def on_mount(self) -> None:
+        # The consumer and the runner live in distinct Textual worker groups so
+        # the exclusive runner never cancels the live-event consumer (TUI-REL-1).
         if self._queue is not None:
-            self.run_worker(self._consume(), exclusive=False)
+            self._consumer_worker = self.run_worker(
+                self._consume(), name="live-consumer", group="live-consumer", exclusive=False
+            )
         if self._runner is not None:
-            self._runner_worker = self.run_worker(self._run_runner(), exclusive=True)
+            self._runner_worker = self.run_worker(
+                self._run_runner(), name="research-runner", group="research-runner", exclusive=True
+            )
         self.set_interval(1.0, self._tick_elapsed)
         self._apply_narrow(self.size.width < NARROW_BREAKPOINT)
         self.refresh_view()
@@ -250,28 +258,55 @@ class ResearchTUIApp(App[None]):
         assert self._queue is not None
         while True:
             event = await self._queue.get()
-            if event is None:
-                break
-            self.projection.apply(event)
-            self.refresh_view()
+            try:
+                if event is None:
+                    break
+                self.projection.apply(event)
+                self.refresh_view()
+            finally:
+                # Acknowledge every dequeued event so the runner can await
+                # ``queue.join()`` as a bounded terminal-state barrier.
+                with contextlib.suppress(ValueError):
+                    self._queue.task_done()
 
     async def _run_runner(self) -> None:
         if self._runner is None:
             return
+        error: Exception | None = None
+        result: Any = None
         try:
-            self.run_result = await self._runner()
+            result = await self._runner()
         except asyncio.CancelledError:
             self.cancelled = True
-            raise
         except Exception as exc:
-            self.projection.apply(
-                RunEvent(
-                    seq=0,
-                    type="run_failed",
-                    payload={"error": redact_secrets(str(exc))},
+            error = exc
+        finally:
+            if self._queue is not None and not self.cancelled:
+                # Runner completion waits for every event published before it,
+                # so the projected terminal state agrees with the durable trace.
+                with contextlib.suppress(Exception):
+                    await self._queue.join()
+            # The result only becomes ready once the queued events are applied.
+            self.run_result = result
+            if error is not None and not self._durable_terminal_received():
+                self.projection.apply(
+                    RunEvent(
+                        seq=0,
+                        type="run_failed",
+                        payload={"error": redact_secrets(str(error))},
+                    )
                 )
-            )
+            self.run_finished = True
             self.refresh_view()
+
+    def _durable_terminal_received(self) -> bool:
+        """Whether the event stream already delivered a terminal event."""
+        if self._terminal():
+            return True
+        return any(
+            event.type in ("run_failed", "run_cancelled", "orchestrator_complete", "no_winner")
+            for event in self.state.events
+        )
 
     # ---- rendering --------------------------------------------------------
 
@@ -475,15 +510,19 @@ class ResearchTUIApp(App[None]):
             self.action_cancel_flow()
 
     def action_cancel_flow(self) -> None:
+        # A run already terminal in the projection/trace is never cancelled or
+        # relabelled; ``q``/Ctrl+C in a terminal state simply exits.
+        if self._terminal():
+            self.exit()
+            return
+        if self.run_finished:
+            return
         if self._runner_worker is not None and not self._runner_worker.is_finished:
+            # Target only the runner; the consumer stays alive to project the
+            # durable ``run_cancelled`` event and the persisted cancelled status.
             self.cancelled = True
-            self.projection.apply(
-                RunEvent(seq=0, type="status", payload={"status": "evaluating"})
-            )
             self._runner_worker.cancel()
             self.refresh_view()
-        elif self._terminal():
-            self.exit()
 
 
 def build_app(

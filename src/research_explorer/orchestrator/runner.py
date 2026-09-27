@@ -16,6 +16,13 @@ from research_explorer.aco.scheduler import Scheduler
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.config import Config, get_api_key
 from research_explorer.evaluation.structural import StructuralMetrics
+from research_explorer.events.models import (
+    OUTCOME_COMPLETED,
+    OUTCOME_DEGRADED,
+    REASON_NO_WINNER,
+    STATUS_RUNNING,
+    reason_text,
+)
 from research_explorer.events.sink import EventSink
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.feromone import PheromoneManager
@@ -43,6 +50,8 @@ class Orchestrator:
         self.cfg = config
         self.event_sink = event_sink
         self.run_id: str = ""
+        self.outcome: str = OUTCOME_COMPLETED
+        self.terminal_reason: str = ""
         configure_logging(config.log_level)
 
         # Storage
@@ -188,11 +197,10 @@ class Orchestrator:
         self.graph.cache_paper(seed_paper)
         seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
 
-        # 2. Initialize the colony (each agent reads the seed)
+        # 2. Initialize the colony (each agent reads the seed). The tracer is
+        # attached before seed discovery so its telemetry is durable/replayable.
         tracer.emit("colony_init_started", seed=seed_nid)
-        await self.colony.initialize(seed_nid, seed_query)
-        for agent in self.colony.agents:
-            agent.tracer = tracer
+        await self.colony.initialize(seed_nid, seed_query, tracer=tracer)
         tracer.emit(
             "colony_initialized",
             size=len(self.colony.agents),
@@ -218,9 +226,36 @@ class Orchestrator:
         self._elapsed = time.monotonic() - start_time
 
         if winner is None:
-            log.warning("no_winner")
-            tracer.emit("no_winner", run_id=run_id, elapsed=round(self._elapsed, 1))
+            reason_code = self.colony.init_reason
+            reason = self.colony.init_reason_text or reason_text(REASON_NO_WINNER)
+            self.outcome = OUTCOME_DEGRADED
+            self.terminal_reason = reason
+            log.warning("no_winner", reason_code=reason_code or REASON_NO_WINNER)
+            # The warning precedes the terminal event so the timeline and the
+            # warning-filtered event view explain the stop.
+            tracer.emit(
+                "warning",
+                run_id=run_id,
+                classification="warning",
+                outcome=OUTCOME_DEGRADED,
+                reason_code=reason_code or REASON_NO_WINNER,
+                reason=reason,
+                elapsed=round(self._elapsed, 1),
+            )
+            tracer.emit(
+                "no_winner",
+                run_id=run_id,
+                status="completed",
+                outcome=OUTCOME_DEGRADED,
+                reason_code=reason_code or REASON_NO_WINNER,
+                reason=reason,
+                elapsed=round(self._elapsed, 1),
+                total_fetches=self.scheduler.total_fetches,
+                total_waves=self.scheduler.oleada_count,
+            )
         else:
+            self.outcome = OUTCOME_COMPLETED
+            self.terminal_reason = ""
             log.info(
                 "orchestrator_complete",
                 winner=self.colony.best_snapshot_agent,
@@ -235,11 +270,13 @@ class Orchestrator:
                 "orchestrator_complete",
                 run_id=run_id,
                 status="completed",
+                outcome=OUTCOME_COMPLETED,
                 winner=self.colony.best_snapshot_agent,
                 best_Q=round(winner.state.quality, 4),
                 peak_Q=round(self.colony.best_quality, 4),
                 snapshot_oleada=self.colony.best_snapshot_oleada,
                 total_fetches=self.scheduler.total_fetches,
+                total_waves=self.scheduler.oleada_count,
                 oleadas=self.scheduler.oleada_count,
                 elapsed=round(self._elapsed, 1),
             )
@@ -257,8 +294,15 @@ class Orchestrator:
         return self.colony.best_narrative if winner is not None else ""
 
     def mark_cancelled(self) -> None:
-        """Persist a distinct ``cancelled`` status for the active run."""
+        """Persist a distinct ``cancelled`` status for the active run.
+
+        A run already terminal in the trace store is never relabelled by a stale
+        UI cancellation (TUI-REL-3).
+        """
         if not self.run_id:
+            return
+        run = self.trace.get_run(self.run_id)
+        if run is not None and run.get("status") not in (None, STATUS_RUNNING):
             return
         if self.tracer is not None:
             self.tracer.emit("run_cancelled", run_id=self.run_id)
@@ -277,6 +321,8 @@ class Orchestrator:
             seed_paper_id=seed_paper_id,
             seed_query=seed_query,
             elapsed=getattr(self, "_elapsed", 0.0),
+            outcome=self.outcome,
+            terminal_reason=self.terminal_reason,
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:

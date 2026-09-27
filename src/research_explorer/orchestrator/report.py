@@ -13,6 +13,7 @@ from research_explorer.aco.colony import Colony
 from research_explorer.aco.convergence import ConvergenceChecker
 from research_explorer.aco.scheduler import Scheduler
 from research_explorer.config import Config
+from research_explorer.events.models import OUTCOME_COMPLETED
 from research_explorer.graph.store import GraphStore
 
 
@@ -40,6 +41,8 @@ def build_report(
     seed_paper_id: str,
     seed_query: str,
     elapsed: float,
+    outcome: str = OUTCOME_COMPLETED,
+    terminal_reason: str = "",
 ) -> str:
     parts: list[str] = []
 
@@ -58,6 +61,7 @@ def build_report(
 
     # ---- Summary ---------------------------------------------------------
     parts.append("## Summary\n")
+    parts.append(f"- **Outcome:** {outcome}")
     parts.append(f"- **Winner:** {colony.best_snapshot_agent or '(none)'}")
     parts.append(f"- **Peak Q:** {colony.best_quality:.4f}")
     parts.append(f"- **Peak at oleada:** {colony.best_snapshot_oleada}")
@@ -65,11 +69,18 @@ def build_report(
     parts.append(f"- **Total fetches:** {scheduler.total_fetches}")
     parts.append(f"- **Elapsed:** {elapsed:.1f}s ({elapsed / 60:.1f} min)")
     parts.append(f"- **Active agents at end:** {len(colony.active_candidates())}")
+    if terminal_reason:
+        parts.append(f"- **Terminal reason:** {terminal_reason}")
     parts.append("")
 
     # ---- Winning narrative ----------------------------------------------
     parts.append("## Winning Narrative\n")
-    parts.append(colony.best_narrative or "(no narrative produced)")
+    if colony.best_narrative:
+        parts.append(colony.best_narrative)
+    else:
+        parts.append("No winning narrative was produced.")
+        if terminal_reason:
+            parts.append(f"Reason: {terminal_reason}.")
     parts.append("")
 
     # ---- Quality evolution ----------------------------------------------

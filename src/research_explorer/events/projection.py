@@ -25,6 +25,9 @@ from research_explorer.events.models import (
     NODE_FAILED,
     NODE_PENDING,
     NODE_SKIPPED,
+    OUTCOME_COMPLETED,
+    OUTCOME_DEGRADED,
+    REASON_NO_WINNER,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -35,6 +38,7 @@ from research_explorer.events.models import (
     RunEvent,
     RunViewState,
     TimelineEntry,
+    reason_text,
 )
 from research_explorer.redaction import redact_obj, redact_secrets
 from research_explorer.replay.models import (
@@ -109,7 +113,13 @@ class RunProjection:
         if event.payload:
             event = event.model_copy(update={"payload": redact_obj(event.payload)})
         self.state.events.append(event)
-        handler = _HANDLERS.get(event.canonical_type())
+        # ``no_winner`` is a durable legacy event that must stay readable but
+        # carries richer semantics than the generic completed handler.
+        handler: Any
+        if event.type == "no_winner":
+            handler = RunProjection._on_no_winner
+        else:
+            handler = _HANDLERS.get(event.canonical_type())
         if handler is not None:
             try:
                 handler(self, event)
@@ -619,6 +629,7 @@ class RunProjection:
         turn = _as_int(p.get("turn"), self.state.current_turn)
         refs = _as_int(p.get("refs"), 0)
         cits = _as_int(p.get("cits"), 0)
+        traversable = _as_int(p.get("traversable"), refs + cits)
         entry_id = f"discovery:{agent_id}:{wave}:{turn}:{paper_id}"
         label = f"discover {paper_id or 'paper'} (refs={refs} cits={cits})"
         existing = self.state.entry_by_id(entry_id)
@@ -635,13 +646,15 @@ class RunProjection:
                     paper_id=paper_id,
                     parent_id=self._parent_for(wave, turn, agent_id),
                     seq=event.seq,
-                    detail={"refs": refs, "cits": cits},
+                    detail={"refs": refs, "cits": cits, "traversable": traversable},
                 )
             )
         else:
             existing.status = NODE_COMPLETED
             existing.label = label
-            existing.detail.update({"refs": refs, "cits": cits})
+            existing.detail.update(
+                {"refs": refs, "cits": cits, "traversable": traversable}
+            )
 
     def _on_discovery_failed(self, event: RunEvent) -> None:
         p = event.payload
@@ -819,6 +832,7 @@ class RunProjection:
             for agent_id, summary in self.state.agents.items():
                 summary.is_winner = agent_id == winner
         self.state.best_quality = _as_float(p.get("peak_Q", p.get("best_Q", p.get("Q"))), self.state.best_quality)
+        self._apply_terminal_fields(p)
         if "total_fetches" in p:
             self.state.fetches_used = _as_int(p.get("total_fetches"), self.state.fetches_used)
         if "elapsed" in p:
@@ -830,6 +844,53 @@ class RunProjection:
         if self.state.current_wave:
             self._set_wave_status(self.state.current_wave, NODE_COMPLETED)
         self._finalize_agents()
+
+    def _on_no_winner(self, event: RunEvent) -> None:
+        """Project a completed-but-degraded run that produced no winner.
+
+        New traces arrive enriched with ``status``/``outcome``/``reason`` plus a
+        preceding warning event. Old traces carry only ``run_id``/``elapsed`` and
+        still project as completed with exactly one generic, non-duplicated
+        explanation.
+        """
+        p = event.payload
+        self._apply_terminal_fields(p, default_outcome=OUTCOME_DEGRADED)
+        enriched = bool(p.get("reason") or p.get("reason_code"))
+        if not enriched:
+            reason = reason_text(REASON_NO_WINNER)
+            self.state.terminal_reason = reason
+            if reason not in self.state.warnings:
+                self.state.warnings.append(reason)
+                self._add_entry(
+                    TimelineEntry(
+                        entry_id=f"warning:{event.seq or 'legacy'}",
+                        kind="warning",
+                        label=reason,
+                        status=NODE_SKIPPED,
+                        seq=event.seq,
+                    )
+                )
+        if "total_fetches" in p:
+            self.state.fetches_used = _as_int(p.get("total_fetches"), self.state.fetches_used)
+        if "elapsed" in p:
+            self.state.elapsed_seconds = _as_float(p.get("elapsed"), self.state.elapsed_seconds)
+        self.state.status = STATUS_COMPLETED
+        if self.state.current_wave:
+            self._set_wave_status(self.state.current_wave, NODE_COMPLETED)
+        self._finalize_agents()
+
+    def _apply_terminal_fields(self, p: dict[str, Any], default_outcome: str = OUTCOME_COMPLETED) -> None:
+        self.state.outcome = str(p.get("outcome") or default_outcome)
+        reason_code = str(p.get("reason_code") or "")
+        if reason_code:
+            self.state.reason_code = reason_code
+        reason = str(p.get("reason") or "")
+        if reason:
+            self.state.terminal_reason = reason
+        elif reason_code:
+            self.state.terminal_reason = reason_text(reason_code)
+        if "total_waves" in p:
+            self.state.total_waves = _as_int(p.get("total_waves"), self.state.total_waves)
 
     def _on_run_failed(self, event: RunEvent) -> None:
         error = redact_secrets(str(event.payload.get("error", "run failed")))

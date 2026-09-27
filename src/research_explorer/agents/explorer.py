@@ -32,6 +32,7 @@ import math
 import random
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -59,6 +60,7 @@ from research_explorer.graph.models import Paper, PaperSummary, normalize_id, pa
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider, TransientProviderError
+from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer
 
 if TYPE_CHECKING:
@@ -67,6 +69,24 @@ if TYPE_CHECKING:
 log = get_logger("agent")
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+
+@dataclass
+class DiscoveryOutcome:
+    """Counts describing one neighbor-discovery pass for a paper.
+
+    ``found_*`` counts every discovered neighbor (including untraversable
+    ones) so an empty initial frontier can be classified precisely.
+    """
+
+    found_refs: int = 0
+    found_cits: int = 0
+    traversable: int = 0
+    extraction_failed: bool = False
+
+    @property
+    def found(self) -> int:
+        return self.found_refs + self.found_cits
 
 
 def _sigmoid(x: float) -> float:
@@ -418,21 +438,7 @@ class ExplorerAgent:
                 inflight = None
                 edges.append((src, next_id, mode))
 
-                self._emit(
-                    "neighbor_discovery_started",
-                    agent_id=self.state.id,
-                    paper_id=next_id,
-                    turn=self.state.turn_count,
-                )
                 await self._discover_neighbors(next_id, paper, extracted)
-                self._emit(
-                    "neighbor_discovery_completed",
-                    agent_id=self.state.id,
-                    paper_id=next_id,
-                    turn=self.state.turn_count,
-                    refs=len(self.state.local_references(next_id)),
-                    cits=len(self.state.local_citants(next_id)),
-                )
 
                 await self._evaluate_new_refs()
 
@@ -1014,27 +1020,81 @@ class ExplorerAgent:
         paper_id: str,
         paper: Paper | None = None,
         extracted: list[PaperSummary] | None = None,
-    ) -> None:
+        wave: int | None = None,
+    ) -> DiscoveryOutcome:
         """Read a paper and record its neighbors in the agent's private graph.
 
         With an expander attached, both directions come from provider-verified
         canonical expansion (OpenAlex primary, Semantic Scholar fallback) plus
         LLM-extracted bibliography entries. Without one, the legacy native-list
         path is used.
+
+        Emits started/completed/failed telemetry for every pass, including the
+        seed discovery performed during colony initialization, and returns the
+        counts used to classify an empty initial frontier. ``wave`` pins the
+        seed-discovery wave (``0``) explicitly in the durable payload.
         """
         if self.state.is_discovered(paper_id):
-            return
+            return DiscoveryOutcome()
 
+        location: dict[str, int] = {"oleada": wave} if wave is not None else {}
+        self._emit(
+            "neighbor_discovery_started",
+            agent_id=self.state.id,
+            paper_id=paper_id,
+            turn=self.state.turn_count,
+            **location,
+        )
+        try:
+            outcome = await self._discover_impl(paper_id, paper, extracted)
+        except Exception as exc:
+            error = redact_secrets(str(exc))
+            log.warning(
+                "neighbor_discovery_failed", agent=self.state.id, paper=paper_id, error=error
+            )
+            self._emit(
+                "neighbor_discovery_failed",
+                agent_id=self.state.id,
+                paper_id=paper_id,
+                turn=self.state.turn_count,
+                error=error,
+                **location,
+            )
+            raise
+        self._emit(
+            "neighbor_discovery_completed",
+            agent_id=self.state.id,
+            paper_id=paper_id,
+            turn=self.state.turn_count,
+            refs=outcome.found_refs,
+            cits=outcome.found_cits,
+            traversable=outcome.traversable,
+            **location,
+        )
+        return outcome
+
+    async def _discover_impl(
+        self,
+        paper_id: str,
+        paper: Paper | None,
+        extracted: list[PaperSummary] | None,
+    ) -> DiscoveryOutcome:
         expander = getattr(self, "expander", None)
         if expander is not None:
-            await self._discover_via_expander(paper_id, paper, extracted, expander)
-            return
+            return await self._discover_via_expander(paper_id, paper, extracted, expander)
+        return await self._discover_native(paper_id, paper, extracted)
 
+    async def _discover_native(
+        self,
+        paper_id: str,
+        paper: Paper | None,
+        extracted: list[PaperSummary] | None,
+    ) -> DiscoveryOutcome:
         if paper is None:
             paper = await self._fetch_paper(paper_id)
             if paper is None:
                 self.state.set_local_neighbors(paper_id, [], [])
-                return
+                return DiscoveryOutcome()
             self.graph.cache_paper(paper)
 
         # Full-text papers (arXiv): extract references from the bibliography.
@@ -1081,6 +1141,12 @@ class ExplorerAgent:
             cits=len(cit_ids),
             frontier_added=len(ref_frontier) + len(cit_frontier),
         )
+        return DiscoveryOutcome(
+            found_refs=len(ref_ids),
+            found_cits=len(cit_ids),
+            traversable=len(ref_frontier) + len(cit_frontier),
+            extraction_failed=self._extraction_failed(paper, extracted),
+        )
 
     async def _discover_via_expander(
         self,
@@ -1088,7 +1154,7 @@ class ExplorerAgent:
         paper: Paper | None,
         extracted: list[PaperSummary] | None,
         expander: NeighborExpander,
-    ) -> None:
+    ) -> DiscoveryOutcome:
         """Canonical neighbor discovery via the resolution expander."""
         if paper is None:
             paper = await self._fetch_paper(paper_id)
@@ -1113,13 +1179,32 @@ class ExplorerAgent:
         self.state.set_local_neighbors(
             paper_id, result.outgoing.node_ids, result.incoming.node_ids
         )
+        traversable = len(result.outgoing.node_ids) + len(result.incoming.node_ids)
         log.info(
             "discovered_neighbors",
             agent=self.state.id,
             paper=paper_id,
             refs=len(result.outgoing.node_ids),
             cits=len(result.incoming.node_ids),
-            frontier_added=len(result.outgoing.node_ids) + len(result.incoming.node_ids),
+            frontier_added=traversable,
+        )
+        return DiscoveryOutcome(
+            found_refs=result.outgoing.discovered,
+            found_cits=result.incoming.discovered,
+            traversable=traversable,
+            extraction_failed=self._extraction_failed(paper, extracted),
+        )
+
+    def _extraction_failed(
+        self, paper: Paper | None, extracted: list[PaperSummary]
+    ) -> bool:
+        """A bibliography existed but extraction yielded no usable entries."""
+        return bool(
+            paper is not None
+            and paper.ref_entries
+            and not extracted
+            and not paper.references
+            and not paper.citations
         )
 
     def _neighbor_summaries(

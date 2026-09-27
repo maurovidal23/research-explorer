@@ -10,6 +10,7 @@ authoritative) rather than stalling research.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable, Iterable
 from typing import Protocol, runtime_checkable
 
@@ -75,11 +76,14 @@ class ChannelSink:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
             self.dropped += 1
-            try:
+            # Evict the oldest event and acknowledge it so ``queue.join()``
+            # remains a faithful bounded backpressure signal even when a live
+            # consumer falls behind (the durable store stays authoritative).
+            with contextlib.suppress(asyncio.QueueEmpty, ValueError):
                 self._queue.get_nowait()
+                self._queue.task_done()
+            with contextlib.suppress(asyncio.QueueFull):
                 self._queue.put_nowait(event)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                pass
 
     async def get(self) -> RunEvent:
         return await self._queue.get()

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import tempfile
 from pathlib import Path
 
 import typer
 
 from research_explorer.config import get_api_key, load_config
 from research_explorer.logging_setup import configure_logging, get_logger
+from research_explorer.redaction import redact_secrets
 
 app = typer.Typer(
     name="research-explorer",
@@ -82,13 +86,64 @@ def _emit_report(report: str, output: str | None, obsidian_dir: str | None) -> N
         Path(output).write_text(report, encoding="utf-8")
         typer.echo(f"Report written to {output}")
     else:
-        typer.echo("\n" + "=" * 80)
-        typer.echo("EXPLORATION REPORT")
-        typer.echo("=" * 80)
-        typer.echo(report)
+        _echo_report_stdout(report)
 
     if obsidian_dir:
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
+
+
+def _echo_report_stdout(report: str) -> None:
+    typer.echo("\n" + "=" * 80)
+    typer.echo("EXPLORATION REPORT")
+    typer.echo("=" * 80)
+    typer.echo(report)
+
+
+def _atomic_write_report(path: str, report: str) -> None:
+    """Atomically replace ``path`` with ``report`` in the same directory.
+
+    A missing parent directory is an error (directories are never created
+    implicitly). The temporary file is created in the target directory so
+    ``os.replace`` is an atomic same-filesystem rename; interruption can never
+    leave a partially written report.
+    """
+    target = Path(path)
+    parent = target.parent
+    if not parent.exists():
+        raise FileNotFoundError(f"report directory does not exist: {parent}")
+    fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=".report-", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(report)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+class _ReportWriter:
+    """Writes the completed report once, before the review screen waits."""
+
+    def __init__(self, path: str | None) -> None:
+        self.path = path
+        self.written = False
+        self.error: str | None = None
+
+    def write(self, report: str) -> None:
+        if self.path is None or self.written or self.error is not None:
+            return
+        try:
+            _atomic_write_report(self.path, report)
+        except Exception as exc:
+            self.error = redact_secrets(
+                f"failed to write report to {self.path}: {exc}"
+            )
+            return
+        self.written = True
 
 
 def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:
@@ -98,12 +153,15 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
 
     controller = TUIController()
     orch = Orchestrator(cfg, event_sink=controller.event_sink)
+    writer = _ReportWriter(output)
 
     async def runner() -> tuple[str, str | None]:
         try:
             await orch.run(seed_paper_id, seed_query)
             report = orch.generate_report(seed_paper_id, seed_query)
             obsidian_dir = orch.generate_obsidian(seed_query)
+            # Persist before the completed review screen waits for the user.
+            writer.write(report)
             return report, obsidian_dir
         except asyncio.CancelledError:
             orch.mark_cancelled()
@@ -118,11 +176,26 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
     if app.cancelled or app.state.status == "cancelled":
         typer.echo("Run cancelled.")
         return
+    if writer.error is not None:
+        typer.echo(writer.error, err=True)
+        raise typer.Exit(1)
     if app.run_result is None:
         typer.echo("Run did not complete; see the failure summary above.", err=True)
         raise typer.Exit(1)
     report, obsidian_dir = app.run_result
-    _emit_report(report, output, obsidian_dir)
+    if output:
+        if not writer.written:
+            # Alternate runners (e.g. injected test apps) may not persist the
+            # report; write it once now and never rewrite afterwards.
+            writer.write(report)
+        if writer.error is not None:
+            typer.echo(writer.error, err=True)
+            raise typer.Exit(1)
+        typer.echo(f"Report written to {output}")
+    else:
+        _echo_report_stdout(report)
+    if obsidian_dir:
+        typer.echo(f"Obsidian graph written to {obsidian_dir}/")
 
 
 def _run_research_kernel(cfg, seed_paper_id: str, seed_query: str, output: str | None) -> None:

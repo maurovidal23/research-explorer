@@ -5,7 +5,7 @@ defaults:
 
 pipelines:
   reliability-full-cycle:
-    description: "Implement entirely with NaN DeepSeek, then evaluate independently with NaN GLM 5.3 Flash and OpenAI GPT-5.6 Sol low until the verified score reaches 90."
+    description: "Implement entirely with NaN DeepSeek, then evaluate independently with NaN GLM 5.3 Flash and NaN Qwen 3.8 Flash until the verified score reaches 90."
     steps:
       - agent: implementer
         model: nan/deepseek-v4-flash
@@ -43,13 +43,13 @@ pipelines:
               - parallel:
                   - agent: quality-scorer
                     name: score
-                    models: [nan/glm5.3-flash, openai/gpt-5.6-sol#low]
+                    models: [nan/glm5.3-flash, nan/qwen3.8-flash]
                     reports: none
                     diff: true
                     prdHistory: true
               - agent: quality-score-report
                 name: score-report
-                model: openai/gpt-5.6-sol#low
+                model: nan/glm5.3-flash
                 reports: [score]
                 verify: true
                 diff: true

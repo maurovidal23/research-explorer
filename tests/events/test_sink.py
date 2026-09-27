@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from research_explorer.events.models import RunEvent
 from research_explorer.events.sink import (
     CallbackSink,
@@ -29,6 +31,24 @@ def test_channel_sink_preserves_order_under_capacity() -> None:
     for seq in range(1, 4):
         sink.publish(_event(seq))
     assert [sink.get_nowait().seq for _ in range(3)] == [1, 2, 3]
+
+
+async def test_channel_sink_overflow_keeps_join_consistent() -> None:
+    """Evicted events are acknowledged so ``queue.join()`` cannot hang.
+
+    The runner awaits ``queue.join()`` as its terminal-state barrier, so an
+    overflow must leave the unfinished-task count consistent with what the
+    consumer actually dequeues.
+    """
+    sink = ChannelSink(maxsize=2)
+    for seq in range(1, 6):
+        sink.publish(_event(seq))
+    assert sink.dropped == 3
+
+    while not sink.empty():
+        sink.get_nowait()
+        sink.queue.task_done()
+    await asyncio.wait_for(sink.queue.join(), timeout=1.0)
 
 
 def test_composite_sink_fans_out() -> None:

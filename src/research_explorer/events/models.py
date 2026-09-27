@@ -100,6 +100,41 @@ STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
 
+OUTCOME_COMPLETED = "completed"
+OUTCOME_DEGRADED = "degraded"
+
+# Exactly one primary reason is attached to an empty initial frontier so the
+# terminal state is actionable instead of an opaque ``no_winner``.
+REASON_NO_NEIGHBORS_DISCOVERED = "no_neighbors_discovered"
+REASON_NO_TRAVERSABLE_IDENTIFIERS = "no_traversable_identifiers"
+REASON_REFERENCE_EXTRACTION_FAILED = "reference_extraction_failed"
+REASON_SEED_DISCOVERY_FAILED = "seed_discovery_failed"
+REASON_NO_WINNER = "no_winner"
+
+REASON_TEXT: dict[str, str] = {
+    REASON_NO_NEIGHBORS_DISCOVERED: (
+        "the seed paper exposed no reference or citation neighbors"
+    ),
+    REASON_NO_TRAVERSABLE_IDENTIFIERS: (
+        "discovered neighbors carried no traversable DOI or arXiv identifier"
+    ),
+    REASON_REFERENCE_EXTRACTION_FAILED: (
+        "reference extraction from the seed bibliography produced no usable entries"
+    ),
+    REASON_SEED_DISCOVERY_FAILED: (
+        "seed neighbor discovery failed during colony initialization"
+    ),
+    REASON_NO_WINNER: (
+        "the run finished without a winning narrative"
+    ),
+}
+
+
+def reason_text(code: str) -> str:
+    """Human-readable explanation for a terminal reason code."""
+    return REASON_TEXT.get(code, REASON_TEXT[REASON_NO_WINNER])
+
+
 AGENT_ACTIVE = "active"
 AGENT_EVALUATING = "evaluating"
 AGENT_WAITING = "waiting"
@@ -170,6 +205,10 @@ class RunViewState(BaseModel):
     query: str = ""
     pipeline: str = "aco"
     status: str = STATUS_INITIALIZING
+    outcome: str = OUTCOME_COMPLETED
+    reason_code: str = ""
+    terminal_reason: str = ""
+    total_waves: int = 0
     started_at: str = ""
     elapsed_seconds: float = 0.0
     fetches_used: int = 0

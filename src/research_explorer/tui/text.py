@@ -13,6 +13,7 @@ from research_explorer.events.models import (
     AGENT_EVALUATING,
     AGENT_EXHAUSTED,
     AGENT_FAILED,
+    OUTCOME_DEGRADED,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -82,6 +83,19 @@ def status_mark(status: str) -> str:
     return _STATUS_MARK.get(status, status or "unknown")
 
 
+def status_label(state: RunViewState) -> str:
+    """One status token shared by the header and footer.
+
+    A completed-but-degraded run keeps its terminal status and annotates the
+    outcome in parentheses, rather than concatenating with ``/`` which this UI
+    reserves for ratios (``fetch 3/100``, ``5s/1m00s``).
+    """
+    label = status_mark(state.status)
+    if state.outcome == OUTCOME_DEGRADED:
+        return f"{label} ({OUTCOME_DEGRADED})"
+    return label
+
+
 EVENT_OUTCOMES: tuple[str, ...] = ("", "error", "warning", "info")
 
 _ERROR_OUTCOMES = frozenset({"fatal", "error", "failed"})
@@ -117,8 +131,9 @@ def render_header(state: RunViewState) -> str:
         tokens = f"cost {state.cost:.4f}"
     winner_agent = state.agents.get(state.winner_agent) if state.winner_agent else None
     winner = winner_agent.label if winner_agent is not None else (state.winner_agent or DASH)
+    status_text = status_label(state)
     row1 = (
-        f"run {state.run_id or DASH}  [{status_mark(state.status)}]  "
+        f"run {state.run_id or DASH}  [{status_text}]  "
         f"elapsed {format_duration(state.elapsed_seconds)}  "
         f"fetch {state.fetches_used}/{state.max_fetches}  "
         f"wave {state.current_wave}  turn {state.current_turn}  "
@@ -204,6 +219,9 @@ def render_timeline(state: RunViewState, selected_entry_id: str | None) -> str:
         lines.append(
             f"{marker}{indent}{glyph}{status_mark(entry.status):<10} {entry.label}"
         )
+    if state.terminal_reason:
+        lines.append("")
+        lines.append(f"terminal: {status_label(state)} {DASH} {state.terminal_reason}")
     return "\n".join(lines)
 
 
@@ -444,7 +462,7 @@ def _render_narrative(state: RunViewState, entry: TimelineEntry | None) -> list[
 
 def render_footer(state: RunViewState) -> str:
     if state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
-        return f"[{status_mark(state.status)}] press q to exit, ? for help"
+        return f"[{status_label(state)}] press q to exit, ? for help"
     return (
         "left/right agent  up/down step  enter details  home live\n"
         "e eval  f frontier  p paper  n narrative  l events  r metadata  t panes  ? help  q quit"
@@ -603,6 +621,9 @@ def render_metadata(state: RunViewState) -> str:
         f"status: {status_mark(state.status)}",
         f"seed: {state.seed_paper_id or UNAVAILABLE}",
         f"pipeline: {state.pipeline}",
+        f"outcome: {state.outcome or UNAVAILABLE}",
+        f"terminal_reason: {state.terminal_reason or UNAVAILABLE}",
+        f"reason_code: {state.reason_code or UNAVAILABLE}",
         f"explorer_model: {state.explorer_model or UNAVAILABLE}",
         f"judge_model: {state.judge_model or UNAVAILABLE}",
         f"colony_size: {state.colony_size}",
@@ -610,6 +631,7 @@ def render_metadata(state: RunViewState) -> str:
         f"k_per_turn (papers per evaluation): {state.k_per_turn}",
         f"budget_type: {state.budget_type}",
         f"fetches: {state.fetches_used}/{state.max_fetches}",
+        f"waves: {state.total_waves or state.current_wave}",
         f"elapsed: {format_duration(state.elapsed_seconds)}",
         f"question: {state.query or UNAVAILABLE}",
     ]

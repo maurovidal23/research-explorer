@@ -184,6 +184,20 @@ def test_mark_cancelled_persists_distinct_status(tmp_path) -> None:
     store.close()
 
 
+def test_mark_cancelled_never_relabels_completed_run(tmp_path) -> None:
+    store = RunTraceStore(tmp_path / "replay.db")
+    run_id = store.create_run("seed", "q")
+    store.finish_run(run_id, "completed", best_quality=0.9)
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.run_id = run_id
+    orch.tracer = RunTracer(store, run_id)
+    orch.trace = store
+    orch.mark_cancelled()
+    assert store.get_run(run_id)["status"] == "completed"
+    assert "run_cancelled" not in [e["type"] for e in store.list_events(run_id)]
+    store.close()
+
+
 def test_tui_cancelled_run_does_not_write_report(tmp_path, monkeypatch) -> None:
     class _CancelledApp(_FakeApp):
         def __init__(self, *args, **kwargs):
@@ -230,6 +244,128 @@ def test_tui_incomplete_run_exits_nonzero(tmp_path, monkeypatch) -> None:
     assert result.exit_code != 0
     combined = result.output + str(result.exception or "")
     assert "Run did not complete" in combined
+
+
+class _RunningApp:
+    """Test app that runs the captured runner synchronously, like Textual."""
+
+    review_checks: ClassVar[list] = []
+
+    def __init__(self, projection, queue, runner, can_detach=False):
+        self.projection = projection
+        self.queue = queue
+        self.runner = runner
+        self.can_detach = can_detach
+        self.cancelled = False
+        self.state = SimpleNamespace(status="completed")
+        self.run_result = None
+
+    def run(self):
+        self.run_result = asyncio.run(self.runner())
+        # The app stays open for review after the runner completes; the report
+        # must already be durable at that point.
+        for check in _RunningApp.review_checks:
+            check()
+
+
+def test_tui_output_is_durable_before_review_and_written_once(tmp_path, monkeypatch) -> None:
+    import research_explorer.cli as cli_mod
+
+    out = tmp_path / "report.md"
+    writes: list[str] = []
+    real_write = cli_mod._atomic_write_report
+
+    def counting_write(path, report):
+        writes.append(report)
+        real_write(path, report)
+
+    def assert_durable():
+        assert out.exists()
+        assert out.read_text(encoding="utf-8") == "FAKE REPORT BODY"
+
+    _RunningApp.review_checks = [assert_durable]
+    monkeypatch.setattr(cli_mod, "_atomic_write_report", counting_write)
+    monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _FakeOrch)
+    monkeypatch.setattr("research_explorer.tui.build_app", _RunningApp)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "explore",
+                "10.1/x",
+                "question",
+                "--tui",
+                "--output",
+                str(out),
+                "--config",
+                str(_config(tmp_path)),
+            ],
+        )
+    finally:
+        _RunningApp.review_checks = []
+    assert result.exit_code == 0, result.output
+    assert writes == ["FAKE REPORT BODY"]
+    assert out.read_text(encoding="utf-8") == "FAKE REPORT BODY"
+    assert "Report written to" in result.output
+
+
+def test_tui_atomic_write_failure_redacted_nonzero_and_run_completed(
+    tmp_path, monkeypatch
+) -> None:
+    import research_explorer.cli as cli_mod
+
+    db = tmp_path / "replay.db"
+
+    class _PersistingOrch:
+        def __init__(self, config, event_sink=None):
+            self.event_sink = event_sink
+
+        async def run(self, seed_paper_id, seed_query):
+            store = RunTraceStore(db)
+            run_id = store.create_run(seed_paper_id, seed_query)
+            store.finish_run(run_id, "completed", best_quality=0.0)
+            store.close()
+
+        def generate_report(self, seed_paper_id, seed_query):
+            return "REPORT BODY"
+
+        def generate_obsidian(self, seed_query, output_dir="obsidian"):
+            return None
+
+        async def aclose(self):
+            return None
+
+    def boom(path, report):
+        raise OSError("disk full api_key=sk-sentinel-zzz")
+
+    _RunningApp.review_checks = []
+    monkeypatch.setattr(cli_mod, "_atomic_write_report", boom)
+    monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _PersistingOrch)
+    monkeypatch.setattr("research_explorer.tui.build_app", _RunningApp)
+    out = tmp_path / "report.md"
+    result = runner.invoke(
+        app,
+        [
+            "explore",
+            "10.1/x",
+            "question",
+            "--tui",
+            "--output",
+            str(out),
+            "--config",
+            str(_config(tmp_path)),
+        ],
+    )
+    assert result.exit_code != 0
+    combined = result.output + str(result.exception or "")
+    assert "sk-sentinel-zzz" not in combined
+    assert "failed to write report" in combined
+    assert not out.exists()
+
+    store = RunTraceStore(db)
+    runs = store.list_runs()
+    store.close()
+    assert runs and runs[0]["status"] == "completed"
 
 
 def test_tui_runner_cancels_run_and_closes_resources(tmp_path, monkeypatch) -> None:

@@ -14,14 +14,23 @@ from collections import Counter
 from typing import Literal
 
 from research_explorer.aco.frontier import SharedFrontier
-from research_explorer.agents.explorer import ExplorerAgent
+from research_explorer.agents.explorer import DiscoveryOutcome, ExplorerAgent
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.state import AgentState
 from research_explorer.config import Config
+from research_explorer.events.models import (
+    REASON_NO_NEIGHBORS_DISCOVERED,
+    REASON_NO_TRAVERSABLE_IDENTIFIERS,
+    REASON_REFERENCE_EXTRACTION_FAILED,
+    REASON_SEED_DISCOVERY_FAILED,
+    reason_text,
+)
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
+from research_explorer.redaction import redact_secrets
+from research_explorer.replay.trace import RunTracer
 from research_explorer.resolution.traversal import build_neighbor_expander
 
 log = get_logger("colony")
@@ -62,9 +71,17 @@ class Colony:
         self._best_snapshot_agent: str = ""
         self._best_snapshot_oleada: int = 0
         self._current_oleada: int = 0
+        self.init_reason: str = ""
+        self.init_failures: list[str] = []
 
-    async def initialize(self, seed_id: str, seed_query: str) -> None:
-        """Initialize the colony: N agents at the seed with assigned castes."""
+    async def initialize(
+        self, seed_id: str, seed_query: str, tracer: RunTracer | None = None
+    ) -> None:
+        """Initialize the colony: N agents at the seed with assigned castes.
+
+        The run tracer is attached to every agent *before* seed neighbor
+        discovery so the seed-discovery telemetry is durable and replayable.
+        """
         self.seed_id = seed_id
         self.seed_query = seed_query
 
@@ -109,15 +126,17 @@ class Colony:
                 expander=self.expander,
                 rng=self._agent_rng(i),
             )
+            agent.tracer = tracer
             self.agents.append(agent)
 
         # Each agent reads the seed and discovers its neighbors into its own
         # private graph (per-agent incomplete graph). Done concurrently.
         self.shared_visited.add(seed_id)
-        await asyncio.gather(
-            *(a._discover_neighbors(seed_id) for a in self.agents),
+        results = await asyncio.gather(
+            *(a._discover_neighbors(seed_id, wave=0) for a in self.agents),
             return_exceptions=True,
         )
+        self._classify_seed_discovery(results)
 
         log.info(
             "colony_initialized",
@@ -125,7 +144,46 @@ class Colony:
             budget_per_agent=budget_per_agent,
             castes=dict(Counter(castes)),
             shared_frontier=len(self.shared_frontier),
+            init_reason=self.init_reason or "ok",
         )
+
+    def _classify_seed_discovery(self, results: list) -> None:
+        """Contain initialization failures and classify an empty frontier.
+
+        Exactly one primary reason is recorded so the terminal state stays
+        actionable; per-agent failures are emitted as diagnostics instead of
+        being silently discarded by ``gather(return_exceptions=True)``.
+        """
+        outcomes = [r for r in results if isinstance(r, DiscoveryOutcome)]
+        self.init_failures = []
+        for index, result in enumerate(results):
+            if not isinstance(result, BaseException):
+                continue
+            agent = self.agents[index] if index < len(self.agents) else None
+            agent_id = agent.state.id if agent is not None else ""
+            error = redact_secrets(str(result))
+            self.init_failures.append(f"{agent_id or 'agent'}: {error}")
+        for failure in self.init_failures:
+            log.warning("seed_discovery_failure", detail=failure)
+
+        total_traversable = sum(o.traversable for o in outcomes)
+        total_found = sum(o.found for o in outcomes)
+        extraction_failed = any(o.extraction_failed for o in outcomes)
+
+        if total_traversable > 0:
+            self.init_reason = ""
+        elif self.init_failures or not outcomes:
+            self.init_reason = REASON_SEED_DISCOVERY_FAILED
+        elif total_found > 0:
+            self.init_reason = REASON_NO_TRAVERSABLE_IDENTIFIERS
+        elif extraction_failed:
+            self.init_reason = REASON_REFERENCE_EXTRACTION_FAILED
+        else:
+            self.init_reason = REASON_NO_NEIGHBORS_DISCOVERED
+
+    @property
+    def init_reason_text(self) -> str:
+        return reason_text(self.init_reason) if self.init_reason else ""
 
     def _compute_budget_per_agent(self) -> int:
         """Distribute the global budget across the colony."""
