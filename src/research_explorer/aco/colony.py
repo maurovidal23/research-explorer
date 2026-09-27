@@ -170,7 +170,11 @@ class Colony:
             await agent._discover_neighbors(seed_id)
         except Exception as exc:
             failed = True
-            log.warning("seed_discovery_failed", agent=agent_id, error=str(exc))
+            log.warning(
+                "seed_discovery_failed",
+                agent=agent_id,
+                error=redact_secrets(str(exc)),
+            )
             if tracer is not None:
                 tracer.emit(
                     "neighbor_discovery_failed",
