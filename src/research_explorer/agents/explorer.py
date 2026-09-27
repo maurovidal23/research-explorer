@@ -1,16 +1,16 @@
 """Explorer agent — an ACO "ant" that traverses the citation graph.
 
-Each agent keeps its OWN incomplete, private view of the citation graph
-(local_refs / local_cits in AgentState) and its OWN private pheromone trail.
-Edges and pheromone are not shared across agents.
+Bibliographic facts and graph topology live in the shared GraphStore; each
+agent keeps only its OWN narrative, local_refs/local_cits turn snapshots, and
+private pheromone trail.
 
 Per turn:
   1. If the current paper's neighbors haven't been discovered yet, "read" it:
      - use the provider's native references/citations when available (S2,
        OpenAlex, PubMed), OR
-     - read the full text and have the LLM extract the references from the
-       bibliography (arXiv, which has no citation API).
-     The discovered neighbors go into the agent's private graph + frontier.
+     - read the full text and map the bibliography into the shared graph via
+       the ReferenceGraphBuilder (arXiv, which has no citation API).
+     The discovered neighbors go into the shared graph + frontier.
   2. Choose a direction (ref/cites) based on caste/phase weights.
   3. Choose a next paper via ACO transition (tau^alpha * eta^beta) over the
      agent's private pheromone and frontier.
@@ -51,7 +51,6 @@ from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import (
     evaluate_references,
     integrate,
-    integrate_and_extract,
 )
 from research_explorer.agents.state import AgentState, normalize_narrative
 from research_explorer.config import Config
@@ -64,6 +63,7 @@ from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer
 
 if TYPE_CHECKING:
+    from research_explorer.references.builder import ReferenceGraphBuilder
     from research_explorer.resolution.traversal import ExpansionResult, NeighborExpander
 
 log = get_logger("agent")
@@ -83,6 +83,7 @@ class DiscoveryOutcome:
     found_cits: int = 0
     traversable: int = 0
     extraction_failed: bool = False
+    mapping_incomplete: bool = False
 
     @property
     def found(self) -> int:
@@ -133,80 +134,6 @@ async def _strict_scope(provider: object) -> AsyncIterator[None]:
         yield
 
 
-def _parse_json_response(text: str) -> dict | None:
-    """Best-effort parse of an LLM JSON response (strips code fences).
-
-    Only a top-level JSON object is accepted. Handles truncated JSON by
-    extracting the narrative and any complete reference objects that were
-    returned before truncation.
-    """
-    cleaned = _JSON_FENCE.sub("", text.strip())
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    # Try extracting the JSON object span
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    # Last resort: recover narrative + complete ref objects from truncated JSON
-    return _recover_partial_json(cleaned)
-
-
-def _recover_partial_json(text: str) -> dict | None:
-    """Recover narrative, paper_analysis, and complete reference objects from truncated JSON."""
-    import re
-
-    result: dict = {}
-
-    m = re.search(r'"narrative"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    if m:
-        try:
-            result["narrative"] = m.group(1).encode().decode("unicode_escape")
-        except Exception:
-            result["narrative"] = m.group(1)
-
-    analysis_match = re.search(r'"paper_analysis"\s*:\s*\{', text)
-    if analysis_match:
-        start = analysis_match.end() - 1
-        depth = 0
-        end = start
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if depth == 0:
-            with contextlib.suppress(json.JSONDecodeError):
-                result["paper_analysis"] = json.loads(text[start:end])
-
-    refs: list[dict] = []
-    for m in re.finditer(r'\{[^{}]*?"title"\s*:\s*"[^"]*"[^{}]*?\}', text):
-        try:
-            obj = json.loads(m.group(0))
-            if "title" in obj:
-                refs.append(obj)
-        except json.JSONDecodeError:
-            continue
-    if refs:
-        result["references"] = refs
-
-    if not result:
-        return None
-    return result
-
-
 _PROVIDER_CONFIDENCE = {
     "openalex": 0.95,
     "semantic_scholar": 0.9,
@@ -240,6 +167,7 @@ class ExplorerAgent:
         shared_visited: set[str] | None = None,
         shared_frontier: SharedFrontier | None = None,
         expander: NeighborExpander | None = None,
+        reference_builder: ReferenceGraphBuilder | None = None,
         rng: random.Random | None = None,
     ):
         self.state = state
@@ -254,10 +182,12 @@ class ExplorerAgent:
         self._shared_visited = shared_visited if shared_visited is not None else set()
         self._frontier = shared_frontier if shared_frontier is not None else SharedFrontier()
         self.expander = expander
+        self.reference_builder = reference_builder
         self.tracer: RunTracer | None = None
         self.rng = rng if rng is not None else random.Random()
         self._eta_cache: dict[str, EtaComponents] = {}
         self._llm_priority: dict[str, float] = {}
+        self._mapping_incomplete = False
 
     def _emit(self, type: str, **payload) -> None:
         if self.tracer is not None:
@@ -860,7 +790,7 @@ class ExplorerAgent:
             try:
                 async with _strict_scope(provider):
                     ft = await provider.get_fulltext_and_refs(
-                        native, max_chars=self.cfg.llm.fulltext_max_chars, ref_limit=50
+                        native, max_chars=self.cfg.llm.fulltext_max_chars, ref_limit=0
                     )
             except TransientProviderError:
                 raise
@@ -873,42 +803,53 @@ class ExplorerAgent:
                 log.info("fulltext_unavailable_skip", paper_id=paper_id, provider=provider.name)
                 return None
             paper.fulltext, paper.ref_entries = ft
+            paper.bibliography_error = getattr(ft, "segmentation_error", None)
 
         return paper
 
     async def _integrate(self, paper: Paper) -> tuple[str, list[PaperSummary]]:
-        """Integrate a paper into the narrative; extract refs for full-text papers.
+        """Integrate a paper into this agent's narrative and build shared references.
 
-        Returns (narrative, extracted_references). For providers with native
-        references, extracted is empty and the caller uses paper.references.
-        Also stores the per-paper analysis in state.paper_analyses.
+        Graph construction is delegated to the shared :class:`ReferenceGraphBuilder`
+        (paper-level, single-flight). Narrative generation never owns or gates the
+        reference graph: a narrative failure still leaves committed references
+        intact (FRG-5/FRG-6). Returns (narrative, resolved_reference_summaries).
         """
-        if paper.ref_entries:
-            messages = integrate_and_extract(self.state.narrative, paper, self.seed_query)
-            try:
-                raw = await self.llm.chat(
-                    messages,
-                    model=self.cfg.llm.explorer_model,
-                    temperature=self.cfg.llm.temperature,
-                    max_tokens=self.cfg.llm.max_tokens,
-                    purpose="paper_integration",
+        self._mapping_incomplete = False
+        extracted: list[PaperSummary] = []
+        builder = getattr(self, "reference_builder", None)
+        if builder is not None and (paper.ref_entries or paper.bibliography_error):
+            extracted = await self._build_references(paper, builder)
+        narrative = await self._integrate_narrative(paper)
+        return narrative, extracted
+
+    async def _build_references(
+        self, paper: Paper, builder: ReferenceGraphBuilder
+    ) -> list[PaperSummary]:
+        """Run the shared mapping job and return verified canonical targets."""
+        try:
+            accounting = await builder.build(paper, tracer=self.tracer)
+        except Exception as e:
+            log.warning(
+                "reference_mapping_failed",
+                agent=self.state.id,
+                paper_id=normalize_id(paper.provider, paper.id),
+                error=redact_secrets(str(e)),
+            )
+            self._mapping_incomplete = True
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "reference_mapping_failed",
+                    paper_id=normalize_id(paper.provider, paper.id),
+                    error_code="builder_error",
                 )
-            except Exception as e:
-                log.warning("integrate_extract_failed", agent=self.state.id, error=str(e))
-                return self.state.narrative, []
-            parsed = _parse_json_response(raw)
-            if parsed is None:
-                return self.state.narrative, []
-            narrative = normalize_narrative(parsed.get("narrative"), self.state.narrative)
-            extracted = self._parse_extracted_refs(parsed.get("references") or [])
+            return []
+        if accounting.status in ("failed", "partial", "incomplete"):
+            self._mapping_incomplete = True
+        return list(accounting.resolved_summaries)
 
-            analysis = parsed.get("paper_analysis")
-            if isinstance(analysis, dict):
-                paper_nid = normalize_id(paper.provider, paper.id)
-                self.state.paper_analyses[paper_nid] = analysis
-
-            return narrative, extracted
-
+    async def _integrate_narrative(self, paper: Paper) -> str:
+        """Narrative-only integration (no graph reference extraction)."""
         messages = integrate(self.state.narrative, paper, self.seed_query)
         try:
             narrative = await self.llm.chat(
@@ -920,52 +861,8 @@ class ExplorerAgent:
             )
         except Exception as e:
             log.warning("integrate_failed", agent=self.state.id, error=str(e))
-            return self.state.narrative, []
-        return normalize_narrative(narrative, self.state.narrative), []
-
-    def _parse_extracted_refs(self, refs: list) -> list[PaperSummary]:
-        """Turn the LLM's extracted reference list into PaperSummary candidates.
-
-        Only entries with an arXiv id or DOI are traversable and go into the
-        frontier. Entries with neither are still returned (graph structure) but
-        the caller keeps them out of the frontier.
-        """
-        summaries: list[PaperSummary] = []
-        for r in refs:
-            if not isinstance(r, dict):
-                continue
-            title = (r.get("title") or "").strip()
-            if not title:
-                continue
-            authors = r.get("authors") or []
-            if isinstance(authors, str):
-                authors = [a.strip() for a in authors.split(",") if a.strip()]
-            year = r.get("year")
-            if isinstance(year, str) and year.isdigit():
-                year = int(year)
-            if not isinstance(year, int):
-                year = None
-            arxiv_id = (r.get("arxiv_id") or "").strip() or None
-            doi = (r.get("doi") or "").strip() or None
-            if arxiv_id:
-                summaries.append(PaperSummary(
-                    id=arxiv_id, doi=doi, title=title, year=year,
-                    authors=list(authors), provider="arxiv",
-                ))
-            elif doi:
-                provider = "semantic_scholar" if "semantic_scholar" in self.providers else (
-                    "openalex" if "openalex" in self.providers else self.provider.name
-                )
-                summaries.append(PaperSummary(
-                    id=doi, doi=doi, title=title, year=year,
-                    authors=list(authors), provider=provider,
-                ))
-            else:
-                summaries.append(PaperSummary(
-                    id=title, title=title, year=year,
-                    authors=list(authors), provider="unknown",
-                ))
-        return summaries
+            return self.state.narrative
+        return normalize_narrative(narrative, self.state.narrative)
 
     async def _metadata_transit(
         self, paper_id: str, src: str, mode: str, paper: Paper | None = None
@@ -1025,7 +922,7 @@ class ExplorerAgent:
         extracted: list[PaperSummary] | None = None,
         wave: int | None = None,
     ) -> DiscoveryOutcome:
-        """Read a paper and record its neighbors in the agent's private graph.
+        """Read a paper and record its neighbors in the shared graph.
 
         With an expander attached, both directions come from provider-verified
         canonical expansion (OpenAlex primary, Semantic Scholar fallback) plus
@@ -1104,7 +1001,12 @@ class ExplorerAgent:
         # _fetch_paper already attached fulltext + ref_entries. The seed is read
         # here (its narrative is integrated as a side effect); visited papers
         # pass `extracted` in so we don't integrate twice.
-        if extracted is None and not paper.references and not paper.citations and paper.ref_entries:
+        if (
+            extracted is None
+            and not paper.references
+            and not paper.citations
+            and (paper.ref_entries or paper.bibliography_error)
+        ):
             narrative, extracted = await self._integrate(paper)
             self.state.narrative = narrative
 
@@ -1149,6 +1051,7 @@ class ExplorerAgent:
             found_cits=len(cit_ids),
             traversable=len(ref_frontier) + len(cit_frontier),
             extraction_failed=self._extraction_failed(paper, extracted),
+            mapping_incomplete=getattr(self, "_mapping_incomplete", False),
         )
 
     async def _discover_via_expander(
@@ -1168,7 +1071,7 @@ class ExplorerAgent:
             and paper is not None
             and not paper.references
             and not paper.citations
-            and paper.ref_entries
+            and (paper.ref_entries or paper.bibliography_error)
         ):
             narrative, extracted = await self._integrate(paper)
             self.state.narrative = narrative
@@ -1196,6 +1099,7 @@ class ExplorerAgent:
             found_cits=result.incoming.discovered,
             traversable=traversable,
             extraction_failed=self._extraction_failed(paper, extracted),
+            mapping_incomplete=getattr(self, "_mapping_incomplete", False),
         )
 
     def _extraction_failed(

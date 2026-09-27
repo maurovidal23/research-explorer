@@ -105,6 +105,20 @@ min_author_overlap = 0.34
 min_confidence = 0.75
 year_tolerance = 2
 
+[reference_mapping]
+enabled = true            # paper-level shared bibliography mapping (full-text providers)
+batch_size = 10           # entries per LLM mapping call
+max_concurrent_batches = 2
+max_retries = 2           # retries only for malformed/missing items
+lease_seconds = 300       # SQLite job lease for single-flight ownership
+model = ""                # empty => llm.explorer_model
+max_completion_tokens_per_batch = 1500
+min_parse_confidence = 0.3
+allow_provisional_nodes = true
+max_entries = 0           # 0 = all entries; >0 is an explicit safety ceiling
+mapper_version = "v1"
+prompt_version = "v1"
+
 [storage]
 db_path = "data/explorer.db"
 cache_dir = "data/.cache"

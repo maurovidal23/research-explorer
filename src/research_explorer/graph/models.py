@@ -14,6 +14,7 @@ class PaperSummary(BaseModel):
     id: str = Field(description="Native provider ID (e.g. S2 paperId, OpenAlex W-id, PMID)")
     doi: str | None = None
     arxiv_id: str | None = None
+    pmid: str | None = None
     title: str
     year: int | None = None
     authors: list[str] = Field(default_factory=list)
@@ -35,6 +36,10 @@ class Paper(PaperSummary):
     ref_entries: list[str] = Field(
         default_factory=list,
         description="Raw bibliography entry strings (for LLM reference extraction)",
+    )
+    bibliography_error: str | None = Field(
+        default=None,
+        description="Distinct failure code when bibliography segmentation failed (§9)",
     )
 
 

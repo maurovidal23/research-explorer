@@ -1,8 +1,8 @@
 """Colony — manages the population of ACO agents.
 
 Initializes N agents at the seed, assigns castes, and tracks the best agent.
-Each agent keeps its own private graph; the seed's neighbors are discovered
-per-agent (reading the seed) during initialization.
+Bibliographic facts and topology live in the shared GraphStore; the seed's
+neighbors are discovered concurrently during initialization.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from research_explorer.events.models import (
     REASON_NO_NEIGHBORS_DISCOVERED,
     REASON_NO_TRAVERSABLE_IDENTIFIERS,
     REASON_REFERENCE_EXTRACTION_FAILED,
+    REASON_REFERENCE_MAPPING_INCOMPLETE,
     REASON_SEED_DISCOVERY_FAILED,
     reason_text,
 )
@@ -30,6 +31,7 @@ from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import ResilientProvider
 from research_explorer.redaction import redact_secrets
+from research_explorer.references.builder import build_reference_builder
 from research_explorer.replay.trace import RunTracer
 from research_explorer.resolution.traversal import build_neighbor_expander
 
@@ -65,6 +67,14 @@ class Colony:
         self.seed_embedding: list[float] | None = None
         self.shared_visited: set[str] = set()
         self.shared_frontier = SharedFrontier()
+        self.reference_builder = build_reference_builder(
+            config,
+            self.providers,
+            graph,
+            llm,
+            frontier=self.shared_frontier,
+            visited=self.shared_visited,
+        )
         self._best_agent: ExplorerAgent | None = None
         self._best_quality: float = 0.0
         self._best_narrative: str = ""
@@ -124,13 +134,14 @@ class Colony:
                 shared_visited=self.shared_visited,
                 shared_frontier=self.shared_frontier,
                 expander=self.expander,
+                reference_builder=self.reference_builder,
                 rng=self._agent_rng(i),
             )
             agent.tracer = tracer
             self.agents.append(agent)
 
-        # Each agent reads the seed and discovers its neighbors into its own
-        # private graph (per-agent incomplete graph). Done concurrently.
+        # Each agent reads the seed and discovers its neighbors into the shared
+        # graph. Done concurrently.
         self.shared_visited.add(seed_id)
         results = await asyncio.gather(
             *(a._discover_neighbors(seed_id, wave=0) for a in self.agents),
@@ -169,6 +180,7 @@ class Colony:
         total_traversable = sum(o.traversable for o in outcomes)
         total_found = sum(o.found for o in outcomes)
         extraction_failed = any(o.extraction_failed for o in outcomes)
+        mapping_incomplete = any(o.mapping_incomplete for o in outcomes)
 
         if total_traversable > 0:
             self.init_reason = ""
@@ -178,6 +190,8 @@ class Colony:
             self.init_reason = REASON_NO_TRAVERSABLE_IDENTIFIERS
         elif extraction_failed:
             self.init_reason = REASON_REFERENCE_EXTRACTION_FAILED
+        elif mapping_incomplete:
+            self.init_reason = REASON_REFERENCE_MAPPING_INCOMPLETE
         else:
             self.init_reason = REASON_NO_NEIGHBORS_DISCOVERED
 

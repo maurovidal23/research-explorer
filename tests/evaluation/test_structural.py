@@ -72,6 +72,24 @@ def test_coherence_single(store: GraphStore) -> None:
     assert m._coherence(state) == 1.0
 
 
+def test_coherence_reads_shared_topology_not_local_snapshots(store: GraphStore) -> None:
+    store.record_edge("s2:seed", "s2:a", "semantic_scholar", "references")
+    store.commit()
+    # Agent-local snapshots are intentionally empty: coherence must come from
+    # the shared graph (FRG-5).
+    state = AgentState(id="a1", pos="s2:seed", visited=["s2:seed", "s2:a"])
+    m = StructuralMetrics(store)
+    assert m._coherence(state) == 1.0
+
+
+def test_coherence_ignores_agent_local_edges(store: GraphStore) -> None:
+    state = AgentState(id="a1", pos="s2:seed", visited=["s2:seed", "s2:a"])
+    state.set_local_neighbors("s2:seed", ["s2:a"], [])
+    m = StructuralMetrics(store)
+    # Local turn snapshots cease to be authoritative for structural evaluation.
+    assert m._coherence(state) == 0.5
+
+
 def test_compute_empty(store: GraphStore) -> None:
     state = AgentState(id="a1", pos="s2:seed")
     m = StructuralMetrics(store)

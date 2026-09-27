@@ -721,6 +721,86 @@ class RunProjection:
         else:
             existing.status = NODE_FAILED
 
+    def _on_reference_mapping(self, event: RunEvent) -> None:
+        """Surface paper-level reference mapping progress and outages."""
+        p = event.payload
+        paper_id = str(p.get("paper_id") or "")
+        job_id = str(p.get("job_id") or "")
+        status = str(p.get("status") or "")
+        observed = _as_int(p.get("observed"), 0)
+        mapped = _as_int(p.get("mapped"), 0)
+        resolved = _as_int(p.get("resolved"), 0)
+        provisional = _as_int(p.get("provisional"), 0)
+        failed = _as_int(p.get("failed"), 0)
+        reused = bool(p.get("reused"))
+        is_failure = event.canonical_type() == EventType.REFERENCE_MAPPING_FAILED
+        degraded = status in ("partial", "incomplete")
+        if is_failure or status == "failed":
+            error = redact_secrets(str(p.get("error") or p.get("error_code") or "")).strip()
+            message = f"{paper_id or 'paper'}: reference mapping failed"
+            if error:
+                message += f" ({error})"
+            if message not in self.state.failures:
+                self.state.failures.append(message)
+        elif degraded and observed > 0:
+            message = (
+                f"reference mapping {status} for {paper_id or 'paper'}: "
+                f"mapped={mapped} resolved={resolved} provisional={provisional} failed={failed}"
+            )
+            if message not in self.state.warnings:
+                self.state.warnings.append(message)
+        if is_failure or status == "failed":
+            entry_status = NODE_FAILED
+        elif degraded or status == "completed":
+            # Partial/incomplete mapping is terminal (no further progress will
+            # arrive); the degraded annotation in the label keeps it honest
+            # instead of showing an indefinite "active" step or a clean check.
+            entry_status = NODE_COMPLETED
+        else:
+            entry_status = NODE_ACTIVE
+        label = (
+            f"map references {paper_id or 'paper'} "
+            f"(observed={observed} mapped={mapped} resolved={resolved})"
+        )
+        if degraded:
+            label += " [degraded]"
+        if reused:
+            label += " [reused]"
+        agent_id = self._agent_id(event)
+        wave = self.state.current_wave
+        turn = self.state.current_turn
+        entry_id = f"reference:{job_id or paper_id or event.seq}"
+        detail = {
+            "observed": observed,
+            "mapped": mapped,
+            "resolved": resolved,
+            "provisional": provisional,
+            "failed": failed,
+            "status": status,
+            "reused": reused,
+        }
+        existing = self.state.entry_by_id(entry_id)
+        if existing is None:
+            self._add_entry(
+                TimelineEntry(
+                    entry_id=entry_id,
+                    kind="reference_mapping",
+                    label=label,
+                    status=entry_status,
+                    wave=wave,
+                    turn=turn,
+                    agent_id=agent_id,
+                    paper_id=paper_id,
+                    parent_id=self._parent_for(wave, turn, agent_id),
+                    seq=event.seq,
+                    detail=detail,
+                )
+            )
+        else:
+            existing.status = entry_status
+            existing.label = label
+            existing.detail.update(detail)
+
     def _on_frontier_started(self, event: RunEvent) -> None:
         p = event.payload
         agent_id = self._agent_id(event)
@@ -1000,6 +1080,10 @@ _HANDLERS: dict[str, Any] = {
     EventType.FRONTIER_EVAL_STARTED: RunProjection._on_frontier_started,
     EventType.FRONTIER_EVAL_COMPLETED: RunProjection._on_frontier_completed,
     EventType.FRONTIER_EVAL_FAILED: RunProjection._on_frontier_failed,
+    EventType.REFERENCE_MAPPING_STARTED: RunProjection._on_reference_mapping,
+    EventType.REFERENCE_MAPPING_COMPLETED: RunProjection._on_reference_mapping,
+    EventType.REFERENCE_MAPPING_REUSED: RunProjection._on_reference_mapping,
+    EventType.REFERENCE_MAPPING_FAILED: RunProjection._on_reference_mapping,
     EventType.RUN_COMPLETED: RunProjection._on_run_completed,
     EventType.RUN_FAILED: RunProjection._on_run_failed,
     EventType.RUN_CANCELLED: RunProjection._on_run_cancelled,

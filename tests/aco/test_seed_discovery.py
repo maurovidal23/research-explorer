@@ -15,6 +15,7 @@ from research_explorer.events.models import (
     REASON_NO_NEIGHBORS_DISCOVERED,
     REASON_NO_TRAVERSABLE_IDENTIFIERS,
     REASON_REFERENCE_EXTRACTION_FAILED,
+    REASON_REFERENCE_MAPPING_INCOMPLETE,
     REASON_SEED_DISCOVERY_FAILED,
 )
 from research_explorer.events.projection import RunProjection
@@ -231,6 +232,59 @@ def test_classification_prefers_failure_only_without_frontier(tmp_path) -> None:
     assert colony.init_reason == ""
     colony._classify_seed_discovery([RuntimeError("boom"), DiscoveryOutcome()])
     assert colony.init_reason == REASON_SEED_DISCOVERY_FAILED
+    graph.close()
+
+
+def test_classification_reports_incomplete_seed_mapping(tmp_path) -> None:
+    """A pending/partial seed mapping is its own terminal reason, not 'no neighbors'."""
+    from research_explorer.agents.explorer import DiscoveryOutcome
+
+    colony, graph = _colony(tmp_path, _SeedProvider(None), _FakeLLM())
+    colony._classify_seed_discovery([DiscoveryOutcome(mapping_incomplete=True)])
+    assert colony.init_reason == REASON_REFERENCE_MAPPING_INCOMPLETE
+    graph.close()
+
+
+async def test_seed_mapping_incomplete_is_reported(tmp_path) -> None:
+    """A partial seed mapping must survive into the colony terminal reason."""
+    from research_explorer.references.models import ReferenceAccounting
+
+    class _PartialBuilder:
+        async def build(self, paper, tracer=None) -> ReferenceAccounting:
+            return ReferenceAccounting(
+                source_id=SEED_NID,
+                job_id="j",
+                status="partial",
+                observed=1,
+                processed=1,
+                mapped=1,
+                provisional=1,
+                resolved_summaries=[
+                    PaperSummary(id="Wkept", title="Kept", provider="openalex")
+                ],
+            )
+
+    class _EmptyExpander:
+        async def expand(self, node_id, paper=None, extracted=None, tracer=None):
+            empty = SimpleNamespace(
+                node_ids=[], discovered=0, rejected=0, provider=None,
+                fallback_used=False,
+            )
+            return SimpleNamespace(
+                node_id=node_id,
+                incoming=SimpleNamespace(**vars(empty), direction="incoming"),
+                outgoing=SimpleNamespace(**vars(empty), direction="outgoing"),
+            )
+
+    paper = _seed_paper()
+    provider = _SeedProvider(paper, ref_entries=["Author. A reference. 2020."])
+    colony, graph = _colony(tmp_path, provider, _FakeLLM())
+    colony.reference_builder = _PartialBuilder()
+    colony.expander = _EmptyExpander()
+
+    await colony.initialize(SEED_NID, "q")
+
+    assert colony.init_reason == REASON_REFERENCE_MAPPING_INCOMPLETE
     graph.close()
 
 

@@ -317,3 +317,19 @@ def test_edge_provenance_filtering(store: GraphStore) -> None:
     assert [r["dst"] for r in store.get_edge_provenance(src="c")] == ["b"]
     assert [r["provider"] for r in store.get_edge_provenance(src="a", dst="b")] == ["openalex"]
     assert store.get_edge_provenance(src="missing") == []
+
+
+def test_claim_mapping_job_is_atomic_and_lease_guarded(store: GraphStore) -> None:
+    store.ensure_mapping_job("live", "arxiv:seed", "hash", "v1", "p1")
+    assert store.claim_mapping_job("live", "owner-a", lease_seconds=300) is True
+    # A different owner cannot win while the lease is live...
+    assert store.claim_mapping_job("live", "owner-b", lease_seconds=300) is False
+    assert store.get_mapping_job("live")["owner"] == "owner-a"
+    # ...but the holder can refresh its own lease.
+    assert store.claim_mapping_job("live", "owner-a", lease_seconds=300) is True
+
+    store.ensure_mapping_job("expired", "arxiv:other", "hash2", "v1", "p1")
+    assert store.claim_mapping_job("expired", "owner-a", lease_seconds=0) is True
+    # An expired lease frees the job for another worker.
+    assert store.claim_mapping_job("expired", "owner-b", lease_seconds=300) is True
+    assert store.get_mapping_job("expired")["owner"] == "owner-b"

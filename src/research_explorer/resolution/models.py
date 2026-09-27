@@ -13,6 +13,7 @@ class ResolutionMethod(str, Enum):
     ALIAS_CACHE = "alias_cache"
     DOI_LOOKUP = "doi_lookup"
     ARXIV_LOOKUP = "arxiv_lookup"
+    PMID_LOOKUP = "pmid_lookup"
     TITLE_SEARCH = "title_search"
 
 
@@ -46,6 +47,7 @@ class BibliographicEntry(BaseModel):
     year: int | None = None
     doi: str | None = None
     arxiv_id: str | None = None
+    pmid: str | None = None
     source: EntrySource = EntrySource.BIBLIOGRAPHY
 
 
@@ -57,6 +59,7 @@ class RecordMetadata(BaseModel):
     year: int | None = None
     doi: str | None = None
     arxiv_id: str | None = None
+    pmid: str | None = None
 
 
 class CandidateScore(BaseModel):
@@ -123,4 +126,5 @@ def record_from_summary(summary: PaperSummary) -> RecordMetadata:
         year=summary.year,
         doi=summary.doi,
         arxiv_id=summary.arxiv_id,
+        pmid=summary.pmid,
     )

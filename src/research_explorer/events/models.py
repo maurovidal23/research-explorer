@@ -70,6 +70,18 @@ class EventType:
     LLM_STARTED = "llm_operation_started"
     LLM_COMPLETED = "llm_operation_completed"
     LLM_FAILED = "llm_operation_failed"
+    REFERENCE_MAPPING_STARTED = "reference_mapping_started"
+    REFERENCE_MAPPING_REUSED = "reference_mapping_reused"
+    REFERENCE_BATCH_STARTED = "reference_batch_started"
+    REFERENCE_BATCH_COMPLETED = "reference_batch_completed"
+    REFERENCE_BATCH_FAILED = "reference_batch_failed"
+    REFERENCE_ENTRY_MAPPED = "reference_entry_mapped"
+    REFERENCE_ENTRY_UNPARSED = "reference_entry_unparsed"
+    REFERENCE_RESOLVED = "reference_resolved"
+    REFERENCE_PROVISIONAL = "reference_provisional"
+    REFERENCE_GRAPH_COMMITTED = "reference_graph_committed"
+    REFERENCE_MAPPING_COMPLETED = "reference_mapping_completed"
+    REFERENCE_MAPPING_FAILED = "reference_mapping_failed"
     ARTIFACT_SAVED = "artifact_saved"
     WARNING = "warning"
 
@@ -108,6 +120,7 @@ OUTCOME_DEGRADED = "degraded"
 REASON_NO_NEIGHBORS_DISCOVERED = "no_neighbors_discovered"
 REASON_NO_TRAVERSABLE_IDENTIFIERS = "no_traversable_identifiers"
 REASON_REFERENCE_EXTRACTION_FAILED = "reference_extraction_failed"
+REASON_REFERENCE_MAPPING_INCOMPLETE = "reference_mapping_incomplete"
 REASON_SEED_DISCOVERY_FAILED = "seed_discovery_failed"
 REASON_NO_WINNER = "no_winner"
 
@@ -120,6 +133,9 @@ REASON_TEXT: dict[str, str] = {
     ),
     REASON_REFERENCE_EXTRACTION_FAILED: (
         "reference extraction from the seed bibliography produced no usable entries"
+    ),
+    REASON_REFERENCE_MAPPING_INCOMPLETE: (
+        "bibliography mapping was pending, partial, failed, or incomplete"
     ),
     REASON_SEED_DISCOVERY_FAILED: (
         "seed neighbor discovery failed during colony initialization"

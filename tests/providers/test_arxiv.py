@@ -198,3 +198,13 @@ def test_extract_bib_entries_strips_tags() -> None:
 
 def test_supports_fulltext_flag() -> None:
     assert ArxivProvider.supports_fulltext is True
+
+
+def test_pdf_parse_failure_is_a_distinct_signal() -> None:
+    """An unreadable document must not look like a paper with zero references (§9)."""
+    p = ArxivProvider.__new__(ArxivProvider)
+    result = p._pdf_to_text_and_refs(b"definitely not a pdf", max_chars=100, ref_limit=0)
+
+    text, refs = result
+    assert text == "" and refs == []
+    assert result.segmentation_error == "pdf_parse_failed"

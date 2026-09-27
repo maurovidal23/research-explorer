@@ -38,6 +38,7 @@ log = get_logger("resolution")
 
 DOI_ALIAS_PREFIX = "doi:"
 ARXIV_ALIAS_PREFIX = "arxiv:"
+PMID_ALIAS_PREFIX = "pmid:"
 
 _DOI_URL_PREFIXES = (
     "https://doi.org/",
@@ -61,6 +62,8 @@ _ARXIV_VERSION_SUFFIX = re.compile(r"v\d+$", re.IGNORECASE)
 _ARXIV_NEW_STYLE = re.compile(r"^\d{4}\.\d{4,5}$")
 _ARXIV_OLD_STYLE = re.compile(r"^[a-z-]+(?:\.[a-z-]+)?/\d{7}$")
 _DOI_SHAPE = re.compile(r"^10\.\d{4,9}/\S+$")
+_PMID_SHAPE = re.compile(r"^\d{1,9}$")
+_PMID_PREFIX = re.compile(r"^\s*pmid:\s*", re.IGNORECASE)
 
 _REJECT_PRIORITY: tuple[RejectReason, ...] = (
     RejectReason.UNVERIFIABLE_IDENTIFIER,
@@ -126,6 +129,21 @@ def alias_key_for_arxiv(arxiv_id: str) -> str | None:
     return f"{ARXIV_ALIAS_PREFIX}{normalized}" if is_valid_arxiv(normalized) else None
 
 
+def normalize_pmid(raw: str) -> str:
+    """Normalize a PubMed identifier to bare digits."""
+    text = _PMID_PREFIX.sub("", re.sub(r"\s+", "", raw))
+    return text.lower()
+
+
+def is_valid_pmid(pmid: str) -> bool:
+    return bool(_PMID_SHAPE.match(pmid))
+
+
+def alias_key_for_pmid(pmid: str) -> str | None:
+    normalized = normalize_pmid(pmid)
+    return f"{PMID_ALIAS_PREFIX}{normalized}" if is_valid_pmid(normalized) else None
+
+
 def alias_keys_for_entry(entry: BibliographicEntry) -> list[str]:
     keys = []
     if entry.doi:
@@ -134,6 +152,10 @@ def alias_keys_for_entry(entry: BibliographicEntry) -> list[str]:
             keys.append(key)
     if entry.arxiv_id:
         key = alias_key_for_arxiv(entry.arxiv_id)
+        if key:
+            keys.append(key)
+    if entry.pmid:
+        key = alias_key_for_pmid(entry.pmid)
         if key:
             keys.append(key)
     return keys
@@ -147,6 +169,10 @@ def alias_keys_for_summary(summary: PaperSummary) -> list[str]:
             keys.append(key)
     if summary.arxiv_id:
         key = alias_key_for_arxiv(summary.arxiv_id)
+        if key:
+            keys.append(key)
+    if summary.pmid:
+        key = alias_key_for_pmid(summary.pmid)
         if key:
             keys.append(key)
     return keys
@@ -220,6 +246,7 @@ class IdentityResolver:
             year=entry.year,
             doi=entry.doi,
             arxiv_id=entry.arxiv_id,
+            pmid=entry.pmid,
         )
         attempts: list[ResolutionAttempt] = []
         evidence: list[ResolutionEvidence] = []
@@ -250,6 +277,8 @@ class IdentityResolver:
         evidence.extend(await self._doi_stage(entry, attempts))
         if not any(ev.accepted for ev in evidence):
             evidence.extend(await self._arxiv_stage(entry, attempts))
+        if not any(ev.accepted for ev in evidence):
+            evidence.extend(await self._pmid_stage(entry, attempts))
         if not any(ev.accepted for ev in evidence):
             evidence.extend(await self._title_stage(entry, attempts))
 
@@ -373,6 +402,65 @@ class IdentityResolver:
                 break
         return evidence
 
+    async def _pmid_stage(
+        self, entry: BibliographicEntry, attempts: list[ResolutionAttempt]
+    ) -> list[ResolutionEvidence]:
+        """Optional PMID lookup; skipped when no provider implements it.
+
+        Lack of PMID support must never block title-based resolution (FRG-3).
+        """
+        evidence: list[ResolutionEvidence] = []
+        if not entry.pmid:
+            return evidence
+        normalized = normalize_pmid(entry.pmid)
+        if not is_valid_pmid(normalized):
+            attempts.append(
+                ResolutionAttempt(
+                    method=ResolutionMethod.PMID_LOOKUP,
+                    status=ResolutionStatus.REJECTED,
+                    reject_reason=RejectReason.UNVERIFIABLE_IDENTIFIER,
+                )
+            )
+            return evidence
+        for provider in self.providers:
+            lookup = getattr(provider, "lookup_pmid", None)
+            if lookup is None:
+                continue
+            try:
+                candidate = await lookup(normalized)
+            except Exception as exc:
+                attempts.append(
+                    ResolutionAttempt(
+                        method=ResolutionMethod.PMID_LOOKUP,
+                        provider=provider.name,
+                        status=ResolutionStatus.REJECTED,
+                        reject_reason=RejectReason.PROVIDER_UNAVAILABLE,
+                        error=str(exc),
+                    )
+                )
+                continue
+            if candidate is None:
+                attempts.append(
+                    ResolutionAttempt(
+                        method=ResolutionMethod.PMID_LOOKUP,
+                        provider=provider.name,
+                        status=ResolutionStatus.REJECTED,
+                        reject_reason=RejectReason.NO_PROVIDER_MATCH,
+                    )
+                )
+                continue
+            evidence.append(
+                self._verify(
+                    entry,
+                    candidate,
+                    method=ResolutionMethod.PMID_LOOKUP,
+                    provider_name=provider.name,
+                )
+            )
+            if any(ev.accepted for ev in evidence):
+                break
+        return evidence
+
     async def _title_stage(
         self, entry: BibliographicEntry, attempts: list[ResolutionAttempt]
     ) -> list[ResolutionEvidence]:
@@ -434,6 +522,10 @@ class IdentityResolver:
             candidate_doi = candidate.doi
             if candidate_doi and normalize_doi(candidate_doi) == f"10.48550/arxiv.{normalized}":
                 return True
+        if entry.pmid:
+            candidate_pmid = candidate.pmid
+            if candidate_pmid and normalize_pmid(candidate_pmid) == normalize_pmid(entry.pmid):
+                return True
         return False
 
     def _verify(
@@ -466,6 +558,7 @@ class IdentityResolver:
         identifier_match = method in (
             ResolutionMethod.DOI_LOOKUP,
             ResolutionMethod.ARXIV_LOOKUP,
+            ResolutionMethod.PMID_LOOKUP,
         ) and self._identifier_match(entry, candidate)
         if not descriptive_checked and identifier_match:
             # Exact identifier lookup is sufficient evidence on its own,
@@ -502,7 +595,11 @@ class IdentityResolver:
         identifier_match = (
             1
             if evidence.method
-            in (ResolutionMethod.DOI_LOOKUP, ResolutionMethod.ARXIV_LOOKUP)
+            in (
+                ResolutionMethod.DOI_LOOKUP,
+                ResolutionMethod.ARXIV_LOOKUP,
+                ResolutionMethod.PMID_LOOKUP,
+            )
             else 0
         )
         return (

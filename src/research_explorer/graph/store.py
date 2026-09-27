@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +80,116 @@ CREATE TABLE IF NOT EXISTS edge_provenance (
 );
 CREATE INDEX IF NOT EXISTS idx_edge_provenance_src ON edge_provenance(src);
 CREATE INDEX IF NOT EXISTS idx_edge_provenance_dst ON edge_provenance(dst);
+
+CREATE TABLE IF NOT EXISTS edge_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    provider TEXT,
+    source_id TEXT,
+    entry_id TEXT,
+    mapping_revision TEXT,
+    method TEXT,
+    confidence REAL,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_edge_observations_src ON edge_observations(src);
+CREATE INDEX IF NOT EXISTS idx_edge_observations_dst ON edge_observations(dst);
+
+CREATE TABLE IF NOT EXISTS reference_mapping_jobs (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    source_content_hash TEXT NOT NULL,
+    mapper_version TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    owner TEXT,
+    lease_expires_at TEXT,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    mapped_count INTEGER NOT NULL DEFAULT 0,
+    unparsed_count INTEGER NOT NULL DEFAULT 0,
+    resolved_count INTEGER NOT NULL DEFAULT 0,
+    provisional_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    traversable_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (source_id, source_content_hash, mapper_version, prompt_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_mapping_jobs_source ON reference_mapping_jobs(source_id);
+
+CREATE TABLE IF NOT EXISTS bibliography_entries (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    raw_text TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    entry_type TEXT,
+    title TEXT,
+    authors TEXT,
+    year INTEGER,
+    venue TEXT,
+    volume TEXT,
+    issue TEXT,
+    pages TEXT,
+    doi TEXT,
+    arxiv_id TEXT,
+    pmid TEXT,
+    parse_confidence REAL,
+    parse_notes TEXT,
+    mapping_status TEXT NOT NULL DEFAULT 'pending',
+    batch_index INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    resolution_status TEXT,
+    canonical_id TEXT,
+    resolution_confidence REAL,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (job_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_bib_entries_job ON bibliography_entries(job_id);
+
+CREATE TABLE IF NOT EXISTS reference_resolution_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id TEXT NOT NULL,
+    method TEXT,
+    provider TEXT,
+    candidate_id TEXT,
+    status TEXT,
+    confidence REAL,
+    reject_reason TEXT,
+    expected_json TEXT,
+    actual_json TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_resolution_attempts_entry
+    ON reference_resolution_attempts(entry_id);
+
+CREATE TABLE IF NOT EXISTS provisional_nodes (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    title TEXT,
+    authors TEXT,
+    year INTEGER,
+    raw_text TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_provisional_nodes_source
+    ON provisional_nodes(source_id);
+
+CREATE TABLE IF NOT EXISTS provisional_edges (
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    entry_id TEXT,
+    created_at TEXT,
+    PRIMARY KEY (src, dst)
+);
+CREATE INDEX IF NOT EXISTS idx_provisional_edges_src ON provisional_edges(src);
 """
 
 
@@ -263,11 +373,28 @@ class GraphStore:
 
     # ---- Edge provenance ---------------------------------------------------
 
-    def record_edge(self, src: str, dst: str, provider: str, direction: str) -> None:
+    def record_edge(
+        self,
+        src: str,
+        dst: str,
+        provider: str,
+        direction: str,
+        *,
+        evidence_type: str = "provider",
+        source_id: str | None = None,
+        entry_id: str | None = None,
+        mapping_revision: str | None = None,
+        method: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
         """Insert an edge (src cites dst) with provider provenance.
 
         direction: 'references' (learned from src's bibliography) or
         'cited_by' (learned from dst's incoming-citation list).
+
+        ``edges`` remains the deduplicated topology used for traversal; every
+        call additionally appends an observation row so multiple evidence
+        sources for one logical edge are preserved (FRG-5).
         """
         self._conn.execute(
             "INSERT OR IGNORE INTO edges (src, dst) VALUES (?, ?)", (src, dst)
@@ -276,6 +403,53 @@ class GraphStore:
             """INSERT OR IGNORE INTO edge_provenance (src, dst, direction, provider, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (src, dst, direction, provider, _utcnow()),
+        )
+        self.record_edge_observation(
+            src,
+            dst,
+            direction,
+            evidence_type,
+            provider=provider,
+            source_id=source_id,
+            entry_id=entry_id,
+            mapping_revision=mapping_revision,
+            method=method,
+            confidence=confidence,
+        )
+
+    def record_edge_observation(
+        self,
+        src: str,
+        dst: str,
+        direction: str,
+        evidence_type: str,
+        *,
+        provider: str | None = None,
+        source_id: str | None = None,
+        entry_id: str | None = None,
+        mapping_revision: str | None = None,
+        method: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        """Append an evidence observation for a citation edge (append-only)."""
+        self._conn.execute(
+            """INSERT INTO edge_observations
+               (src, dst, direction, evidence_type, provider, source_id, entry_id,
+                mapping_revision, method, confidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                src,
+                dst,
+                direction,
+                evidence_type,
+                provider,
+                source_id,
+                entry_id,
+                mapping_revision,
+                method,
+                confidence,
+                _utcnow(),
+            ),
         )
 
     def get_edge_provenance(self, src: str | None = None, dst: str | None = None) -> list[dict]:
@@ -292,6 +466,295 @@ class GraphStore:
         query += " ORDER BY src, dst, direction"
         rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    def get_edge_observations(
+        self,
+        src: str | None = None,
+        dst: str | None = None,
+        evidence_type: str | None = None,
+    ) -> list[dict]:
+        """Return append-only edge observations, newest last."""
+        query = "SELECT * FROM edge_observations"
+        conditions, params = [], []
+        if src is not None:
+            conditions.append("src = ?")
+            params.append(src)
+        if dst is not None:
+            conditions.append("dst = ?")
+            params.append(dst)
+        if evidence_type is not None:
+            conditions.append("evidence_type = ?")
+            params.append(evidence_type)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id"
+        rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- Reference mapping jobs / bibliography ----------------------------
+
+    def ensure_mapping_job(
+        self,
+        job_id: str,
+        source_id: str,
+        source_content_hash: str,
+        mapper_version: str,
+        prompt_hash: str,
+    ) -> str:
+        """Insert-if-missing a mapping job keyed by revision; return its id."""
+        now = _utcnow()
+        self._conn.execute(
+            """INSERT OR IGNORE INTO reference_mapping_jobs
+               (id, source_id, source_content_hash, mapper_version, prompt_hash,
+                status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (job_id, source_id, source_content_hash, mapper_version, prompt_hash, now, now),
+        )
+        self._conn.commit()
+        return job_id
+
+    def get_mapping_job(self, job_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM reference_mapping_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_mapping_job(
+        self,
+        source_id: str,
+        source_content_hash: str,
+        mapper_version: str,
+        prompt_hash: str,
+    ) -> dict | None:
+        row = self._conn.execute(
+            """SELECT * FROM reference_mapping_jobs
+               WHERE source_id = ? AND source_content_hash = ?
+                 AND mapper_version = ? AND prompt_hash = ?""",
+            (source_id, source_content_hash, mapper_version, prompt_hash),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_mapping_job(self, job_id: str, **fields: object) -> None:
+        allowed = {
+            "status",
+            "owner",
+            "lease_expires_at",
+            "entry_count",
+            "mapped_count",
+            "unparsed_count",
+            "resolved_count",
+            "provisional_count",
+            "failed_count",
+            "traversable_count",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = _utcnow()
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        self._conn.execute(
+            f"UPDATE reference_mapping_jobs SET {assignments} WHERE id = ?",
+            (*updates.values(), job_id),
+        )
+        self._conn.commit()
+
+    def claim_mapping_job(
+        self, job_id: str, owner: str, lease_seconds: int, now: str | None = None
+    ) -> bool:
+        """Atomically claim/refresh a mapping job lease.
+
+        A job is claimable when it has no owner, the caller already owns it, or
+        its lease has expired. The claim is a single guarded ``UPDATE`` so
+        concurrent processes cannot both win the same lease (FRG-6): SQLite
+        evaluates the predicate and applies the write atomically.
+        """
+        now_dt = datetime.now(timezone.utc)
+        now = now or now_dt.isoformat()
+        expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        cursor = self._conn.execute(
+            """UPDATE reference_mapping_jobs
+               SET owner = ?, lease_expires_at = ?, updated_at = ?
+               WHERE id = ?
+                 AND (owner IS NULL OR owner = ?
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= ?)""",
+            (owner, expires, now, job_id, owner, now),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def upsert_bibliography_entries(
+        self,
+        job_id: str,
+        source_id: str,
+        entries: list[dict],
+    ) -> None:
+        """Insert raw bibliography entries (idempotent by job + ordinal)."""
+        now = _utcnow()
+        for entry in entries:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO bibliography_entries
+                   (id, job_id, source_id, ordinal, raw_text, raw_hash,
+                    mapping_status, attempt_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
+                (
+                    entry["id"],
+                    job_id,
+                    source_id,
+                    entry["ordinal"],
+                    entry["raw_text"],
+                    entry["raw_hash"],
+                    now,
+                    now,
+                ),
+            )
+        self._conn.commit()
+
+    def get_bibliography_entries(self, job_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM bibliography_entries WHERE job_id = ? ORDER BY ordinal",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_bibliography_entry(self, entry_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM bibliography_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_bibliography_entry(self, entry_id: str, **fields: object) -> None:
+        allowed = {
+            "entry_type",
+            "title",
+            "authors",
+            "year",
+            "venue",
+            "volume",
+            "issue",
+            "pages",
+            "doi",
+            "arxiv_id",
+            "pmid",
+            "parse_confidence",
+            "parse_notes",
+            "mapping_status",
+            "batch_index",
+            "attempt_count",
+            "error_code",
+            "resolution_status",
+            "canonical_id",
+            "resolution_confidence",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = _utcnow()
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        self._conn.execute(
+            f"UPDATE bibliography_entries SET {assignments} WHERE id = ?",
+            (*updates.values(), entry_id),
+        )
+        self._conn.commit()
+
+    def record_resolution_attempt(
+        self,
+        entry_id: str,
+        *,
+        method: str | None = None,
+        provider: str | None = None,
+        candidate_id: str | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+        reject_reason: str | None = None,
+        expected_json: str | None = None,
+        actual_json: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO reference_resolution_attempts
+               (entry_id, method, provider, candidate_id, status, confidence,
+                reject_reason, expected_json, actual_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                entry_id,
+                method,
+                provider,
+                candidate_id,
+                status,
+                confidence,
+                reject_reason,
+                expected_json,
+                actual_json,
+                _utcnow(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_resolution_attempts(self, entry_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM reference_resolution_attempts WHERE entry_id = ? ORDER BY id",
+            (entry_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- Provisional reference nodes --------------------------------------
+
+    def add_provisional_node(
+        self,
+        node_id: str,
+        source_id: str,
+        raw_hash: str,
+        *,
+        title: str | None = None,
+        authors: list[str] | None = None,
+        year: int | None = None,
+        raw_text: str | None = None,
+    ) -> None:
+        """Insert a synthetic (unresolved) reference node; never provider-fetchable."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO provisional_nodes
+               (id, source_id, raw_hash, title, authors, year, raw_text, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                node_id,
+                source_id,
+                raw_hash,
+                title,
+                json.dumps(authors or []),
+                year,
+                raw_text,
+                _utcnow(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_provisional_node(self, node_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM provisional_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_provisional_edge(
+        self, src: str, dst: str, entry_id: str | None = None
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR IGNORE INTO provisional_edges (src, dst, entry_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (src, dst, entry_id, _utcnow()),
+        )
+        self._conn.commit()
+
+    def get_provisional_references(self, src: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT dst FROM provisional_edges WHERE src = ? ORDER BY dst", (src,)
+        ).fetchall()
+        return [r["dst"] for r in rows]
+
+    def get_provisional_citants(self, dst: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT src FROM provisional_edges WHERE dst = ? ORDER BY src", (dst,)
+        ).fetchall()
+        return [r["src"] for r in rows]
 
     # ---- Integration status ------------------------------------------------
 

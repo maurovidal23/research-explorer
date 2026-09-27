@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from research_explorer.aco.frontier import SharedFrontier
 from research_explorer.aco.scheduler import Scheduler
-from research_explorer.agents.explorer import ExplorerAgent, _parse_json_response
+from research_explorer.agents.explorer import ExplorerAgent
 from research_explorer.agents.state import AgentState
 from research_explorer.config import Config
 
@@ -15,15 +15,6 @@ SENTINEL = "SENTINEL-SECRET-XYZ"
 
 def _agent() -> ExplorerAgent:
     return ExplorerAgent.__new__(ExplorerAgent)
-
-
-def test_parse_json_response_rejects_non_object() -> None:
-    assert _parse_json_response("[1, 2, 3]") is None
-    assert _parse_json_response("not json at all") is None
-
-
-def test_parse_json_response_accepts_object() -> None:
-    assert _parse_json_response('{"narrative": "hi"}') == {"narrative": "hi"}
 
 
 def test_parse_eval_response_ignores_non_list_scores() -> None:

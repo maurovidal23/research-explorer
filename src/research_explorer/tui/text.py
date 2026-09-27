@@ -184,6 +184,7 @@ _TIMELINE_GLYPH = {
     "paper": "\u2502  ",
     "discovery": "\u2502  ",
     "frontier": "\u2502  ",
+    "reference_mapping": "\u2502  ",
     "evaluation": "\u2502  ",
     "warning": "! ",
 }

@@ -2,10 +2,11 @@
 
 The durable timeline is grouped wave-first so replay and reports stay stable.
 The dashboard, however, navigates agent-first: each colony agent is a root whose
-children are waves, turns, and the papers, discoveries, frontiers, evaluations,
-and warnings recorded beneath them. This module derives that view from the
-projected :class:`~research_explorer.events.models.RunViewState` without
-introducing durable events or a second source of truth.
+children are waves, turns, and the papers, discoveries, frontiers, reference
+mappings, evaluations, and warnings recorded beneath them. This module derives
+that view from the projected
+:class:`~research_explorer.events.models.RunViewState` without introducing
+durable events or a second source of truth.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ TURN_NODE = "turn"
 LEAF_NODE = "leaf"
 
 _TERMINAL_NODE_STATUSES = frozenset({NODE_COMPLETED, NODE_FAILED, NODE_SKIPPED})
-_LEAF_KINDS = frozenset({"paper", "discovery", "frontier", "evaluation", "warning"})
+_LEAF_KINDS = frozenset(
+    {"paper", "discovery", "frontier", "reference_mapping", "evaluation", "warning"}
+)
 
 
 class NavNode(BaseModel):

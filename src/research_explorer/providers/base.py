@@ -83,6 +83,24 @@ RETRYABLE = (
 )
 
 
+class FullTextResult(tuple):
+    """``(full text, raw bibliography entries)`` with an optional failure signal.
+
+    A two-element tuple subclass so existing ``text, refs = result`` unpacking
+    keeps working, while ``segmentation_error`` distinguishes an unreadable
+    document from a paper that genuinely has no bibliography (FRG-1/§9).
+    """
+
+    segmentation_error: str | None
+
+    def __new__(
+        cls, text: str, refs: list[str], segmentation_error: str | None = None
+    ) -> FullTextResult:
+        obj = super().__new__(cls, (text, refs))
+        obj.segmentation_error = segmentation_error
+        return obj
+
+
 def _raise_for_retryable(response: httpx.Response) -> None:
     """Raise RetryableHTTPError on 429/5xx.
 
@@ -134,9 +152,16 @@ class ResilientProvider:
         raise NotImplementedError
 
     async def get_fulltext_and_refs(
-        self, paper_id: str, max_chars: int = 16000, ref_limit: int = 100
-    ) -> tuple[str, list[str]] | None:
-        """Return (truncated full text, raw bibliography entries) or None if unsupported."""
+        self, paper_id: str, max_chars: int = 16000, ref_limit: int = 0
+    ) -> FullTextResult | None:
+        """Return (truncated full text, raw bibliography entries) or None.
+
+        ``ref_limit <= 0`` means no cap: providers return every bibliography
+        entry found in the acquired document (FRG-1). A positive value is an
+        explicit, opt-in ceiling. ``FullTextResult.segmentation_error`` carries a
+        distinct failure code when the document could not be parsed, so callers
+        do not mistake it for a paper with no bibliography (§9).
+        """
         return None
 
     def __init__(

@@ -116,6 +116,24 @@ class ResolutionConfig:
 
 
 @dataclass
+class ReferenceMappingConfig:
+    """Paper-level shared bibliography mapping (see FRG-1..FRG-6)."""
+
+    enabled: bool = True
+    batch_size: int = 10
+    max_concurrent_batches: int = 2
+    max_retries: int = 2
+    lease_seconds: int = 300
+    model: str = ""  # empty => use llm.explorer_model
+    max_completion_tokens_per_batch: int = 1500
+    min_parse_confidence: float = 0.3
+    allow_provisional_nodes: bool = True
+    max_entries: int = 0  # 0 = all entries; >0 = explicit safety ceiling
+    mapper_version: str = "v1"
+    prompt_version: str = "v1"
+
+
+@dataclass
 class BudgetConfig:
     type: str = "fetches"  # "fetches" | "time" | "convergence"
     max_fetches: int = 500
@@ -191,6 +209,7 @@ class Config:
     heuristica: HeuristicaConfig = field(default_factory=HeuristicaConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     resolution: ResolutionConfig = field(default_factory=ResolutionConfig)
+    reference_mapping: ReferenceMappingConfig = field(default_factory=ReferenceMappingConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     convergence: ConvergenceConfig = field(default_factory=ConvergenceConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
@@ -329,6 +348,36 @@ def load_config(path: str | Path) -> Config:
             min_author_overlap=r.get("min_author_overlap", cfg.resolution.min_author_overlap),
             min_confidence=r.get("min_confidence", cfg.resolution.min_confidence),
             year_tolerance=r.get("year_tolerance", cfg.resolution.year_tolerance),
+        )
+
+    if "reference_mapping" in data:
+        rm = data["reference_mapping"]
+        cfg.reference_mapping = ReferenceMappingConfig(
+            enabled=rm.get("enabled", cfg.reference_mapping.enabled),
+            batch_size=rm.get("batch_size", cfg.reference_mapping.batch_size),
+            max_concurrent_batches=rm.get(
+                "max_concurrent_batches", cfg.reference_mapping.max_concurrent_batches
+            ),
+            max_retries=rm.get("max_retries", cfg.reference_mapping.max_retries),
+            lease_seconds=rm.get("lease_seconds", cfg.reference_mapping.lease_seconds),
+            model=rm.get("model", cfg.reference_mapping.model),
+            max_completion_tokens_per_batch=rm.get(
+                "max_completion_tokens_per_batch",
+                cfg.reference_mapping.max_completion_tokens_per_batch,
+            ),
+            min_parse_confidence=rm.get(
+                "min_parse_confidence", cfg.reference_mapping.min_parse_confidence
+            ),
+            allow_provisional_nodes=rm.get(
+                "allow_provisional_nodes", cfg.reference_mapping.allow_provisional_nodes
+            ),
+            max_entries=rm.get("max_entries", cfg.reference_mapping.max_entries),
+            mapper_version=rm.get(
+                "mapper_version", cfg.reference_mapping.mapper_version
+            ),
+            prompt_version=rm.get(
+                "prompt_version", cfg.reference_mapping.prompt_version
+            ),
         )
 
     if "budget" in data:

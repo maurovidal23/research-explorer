@@ -38,10 +38,12 @@ from research_explorer.graph.models import Paper, PaperSummary
 from research_explorer.logging_setup import get_logger
 from research_explorer.providers.base import (
     RETRYABLE,
+    FullTextResult,
     ResilientProvider,
     _raise_for_retryable,
     _wait_retry_after,
 )
+from research_explorer.references.bibliography import segment_bibliography
 
 log = get_logger("providers")
 
@@ -64,10 +66,6 @@ _BIB_SECTION = re.compile(
 _BIB_ITEM = re.compile(
     r'<li[^>]*class="ltx_bibitem"[^>]*>(.*?)</li>', re.DOTALL
 )
-_REF_HEADING = re.compile(r'\n[ \t]*References[ \t]*\n', re.IGNORECASE)
-_BRACKET_REF = re.compile(r'\n\s*\[1\]\s*')
-_BRACKET_SPLIT = re.compile(r'\n\s*\[\d+\]\s*')
-_DOT_SPLIT = re.compile(r'\n\s*\d+\.\s+')
 
 
 class ArxivProvider(ResilientProvider):
@@ -141,16 +139,22 @@ class ArxivProvider(ResilientProvider):
         return paper.abstract if paper else None
 
     async def get_fulltext_and_refs(
-        self, paper_id: str, max_chars: int = 16000, ref_limit: int = 100
-    ) -> tuple[str, list[str]] | None:
+        self, paper_id: str, max_chars: int = 16000, ref_limit: int = 0
+    ) -> FullTextResult | None:
         """Fetch the full text and return (truncated plain text, reference entries).
+
+        ``ref_limit <= 0`` returns every bibliography entry found (no cap); a
+        positive value is an explicit ceiling. Reference mapping must not
+        silently drop entries beyond an implicit 50 (FRG-1).
 
         Strategy:
           1. Try the LaTeXML HTML rendering (clean bibliography, ~30% of papers).
-          2. Fall back to the PDF (100% of papers) — extract text with pypdf
-             and parse the references section with regex.
+          2. Fall back to the PDF (100% of papers) — extract text with pypdf,
+             then run the shared bounded bibliography segmentation stage.
 
-        Returns None only if both HTML and PDF are unavailable.
+        Returns None only if both HTML and PDF are unavailable. An unreadable
+        document returns a ``FullTextResult`` with ``segmentation_error`` set so
+        the ingestion path can mark the mapping failed rather than empty (§9).
         """
         aid = self._format_id(paper_id, "auto")
 
@@ -228,80 +232,38 @@ class ArxivProvider(ResilientProvider):
 
     def _pdf_to_text_and_refs(
         self, pdf_bytes: bytes, max_chars: int, ref_limit: int
-    ) -> tuple[str, list[str]]:
-        """Extract text and references from a PDF via pypdf."""
+    ) -> FullTextResult:
+        """Extract text and references from a PDF via pypdf.
+
+        The ``References`` boundaries are recovered by the shared, bounded
+        ``segment_bibliography`` stage rather than a provider-local copy of the
+        splitting rules (FRG-1).
+        """
         try:
             reader = PdfReader(io.BytesIO(pdf_bytes))
         except Exception as e:
             log.warning("pdf_parse_failed", error=str(e))
-            return "", []
+            return FullTextResult("", [], segmentation_error="pdf_parse_failed")
         full_text = ""
         for page in reader.pages:
             try:
                 full_text += page.extract_text() + "\n"
             except Exception:
                 continue
-        refs = self._extract_pdf_refs(full_text, ref_limit)
+        refs = segment_bibliography(full_text, max_entries=ref_limit)
         body = _WHITESPACE.sub(" ", full_text).strip()[:max_chars]
-        return body, refs
-
-    def _extract_pdf_refs(self, text: str, ref_limit: int) -> list[str]:
-        """Parse references from PDF-extracted text using multiple strategies."""
-        ref_section = self._find_pdf_ref_section(text)
-        if ref_section is None:
-            return []
-
-        # Strategy 1: split by [N] bracket numbering
-        entries = _BRACKET_SPLIT.split(ref_section)
-        refs = [re.sub(r"\s+", " ", e).strip() for e in entries if e.strip() and len(e.strip()) > 20]
-
-        # Strategy 2: split by N. dot numbering
-        if len(refs) <= 1:
-            entries = _DOT_SPLIT.split(ref_section)
-            refs = [re.sub(r"\s+", " ", e).strip() for e in entries if e.strip() and len(e.strip()) > 20]
-
-        # Strategy 3: split by double newline (paragraph-style references)
-        if len(refs) <= 1:
-            refs = [
-                re.sub(r"\s+", " ", p).strip()
-                for p in ref_section.split("\n\n")
-                if p.strip() and len(p.strip()) > 20
-            ]
-
-        return [r for r in refs if r][:ref_limit]
-
-    def _find_pdf_ref_section(self, text: str) -> str | None:
-        """Locate the references section in PDF-extracted text."""
-        # Strategy 1: find "References" heading, take everything after the last one
-        matches = list(_REF_HEADING.finditer(text))
-        for m in reversed(matches):
-            after = text[m.end():]
-            # Verify this is actually the references section (contains [1] or 1. soon after)
-            if _BRACKET_REF.search(after[:500]) or re.search(r'\n\s*1\.\s+', after[:500]):
-                return after
-
-        # Strategy 2: find [1] in the last 50% of the text
-        search_start = int(len(text) * 0.5)
-        bracket_match = _BRACKET_REF.search(text[search_start:])
-        if bracket_match:
-            return text[search_start + bracket_match.start():]
-
-        # Strategy 3: find "References" heading without verification (last match)
-        if matches:
-            return text[matches[-1].end():]
-
-        return None
+        return FullTextResult(body, refs)
 
     def _html_to_text_and_refs(
         self, html: str, max_chars: int, ref_limit: int
-    ) -> tuple[str, list[str]]:
+    ) -> FullTextResult:
         body = _HEAD.sub(" ", html)
         body = _SCRIPT.sub(" ", body)
         plain = _WHITESPACE.sub(" ", _TAG.sub(" ", body)).strip()
         if len(plain) > max_chars:
             plain = plain[:max_chars]
         refs = self._extract_bib_entries(html, ref_limit)
-        return plain, refs
+        return FullTextResult(plain, refs)
 
     def _extract_bib_entries(self, html: str, ref_limit: int) -> list[str]:
         section = _BIB_SECTION.search(html)
@@ -312,7 +274,7 @@ class ArxivProvider(ResilientProvider):
             raw = _WHITESPACE.sub(" ", _TAG.sub(" ", m.group(1))).strip()
             if raw:
                 entries.append(raw)
-            if len(entries) >= ref_limit:
+            if ref_limit > 0 and len(entries) >= ref_limit:
                 break
         return entries
 

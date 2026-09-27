@@ -97,7 +97,7 @@ class StructuralMetrics:
         return _sigmoid(math.log1p(avg) / 5.0)
 
     def _coherence(self, state: AgentState) -> float:
-        """Coherence = fraction of V_a reachable from seed via the agent's private edges."""
+        """Coherence = fraction of V_a reachable from the seed via shared edges."""
         if not state.visited:
             return 0.0
         if len(state.visited) <= 1:
@@ -108,8 +108,7 @@ class StructuralMetrics:
         queue: list[str] = [seed]
         while queue:
             node = queue.pop(0)
-            refs = state.local_references(node)
-            cits = state.local_citants(node)
+            refs, cits = self.graph.get_neighbors(node)
             for n in refs + cits:
                 if n in visited_set and n not in reachable:
                     reachable.add(n)
