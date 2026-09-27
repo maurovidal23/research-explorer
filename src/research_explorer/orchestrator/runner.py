@@ -16,7 +16,12 @@ from research_explorer.aco.scheduler import Scheduler
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.config import Config, get_api_key
 from research_explorer.evaluation.structural import StructuralMetrics
-from research_explorer.events.models import REASON_LABELS
+from research_explorer.events.models import (
+    OUTCOME_DEGRADED,
+    OUTCOME_OK,
+    REASON_LABELS,
+    STATUS_COMPLETED,
+)
 from research_explorer.events.sink import EventSink
 from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.feromone import PheromoneManager
@@ -89,6 +94,7 @@ class Orchestrator:
         # Evaluation replay trace store (lazily opened)
         self.trace = RunTraceStore(config.storage.trace_db_path)
         self.tracer: RunTracer | None = None
+        self._elapsed: float = 0.0
         self._terminal_reason_code: str = ""
         self._run_outcome: str = ""
 
@@ -225,7 +231,7 @@ class Orchestrator:
 
         if winner is None:
             log.warning("no_winner")
-            self._run_outcome = "degraded"
+            self._run_outcome = OUTCOME_DEGRADED
             reason_code = self._terminal_reason_code
             reason = REASON_LABELS.get(reason_code, "") if reason_code else ""
             if reason:
@@ -239,8 +245,8 @@ class Orchestrator:
             tracer.emit(
                 "no_winner",
                 run_id=run_id,
-                status="completed",
-                outcome="degraded",
+                status=STATUS_COMPLETED,
+                outcome=OUTCOME_DEGRADED,
                 reason_code=reason_code,
                 reason=reason,
                 elapsed=round(self._elapsed, 1),
@@ -248,7 +254,7 @@ class Orchestrator:
                 waves=self.scheduler.oleada_count,
             )
         else:
-            self._run_outcome = "ok"
+            self._run_outcome = OUTCOME_OK
             log.info(
                 "orchestrator_complete",
                 winner=self.colony.best_snapshot_agent,
@@ -262,7 +268,7 @@ class Orchestrator:
             tracer.emit(
                 "orchestrator_complete",
                 run_id=run_id,
-                status="completed",
+                status=STATUS_COMPLETED,
                 winner=self.colony.best_snapshot_agent,
                 best_Q=round(winner.state.quality, 4),
                 peak_Q=round(self.colony.best_quality, 4),
@@ -296,7 +302,7 @@ class Orchestrator:
         """Build a full markdown exploration report after run() has completed."""
         from research_explorer.orchestrator.report import build_report
 
-        reason_code = getattr(self, "_terminal_reason_code", "")
+        reason_code = self._terminal_reason_code
         return build_report(
             config=self.cfg,
             colony=self.colony,
@@ -305,8 +311,8 @@ class Orchestrator:
             graph=self.graph,
             seed_paper_id=seed_paper_id,
             seed_query=seed_query,
-            elapsed=getattr(self, "_elapsed", 0.0),
-            outcome=getattr(self, "_run_outcome", ""),
+            elapsed=self._elapsed,
+            outcome=self._run_outcome,
             terminal_reason=REASON_LABELS.get(reason_code, "") if reason_code else "",
         )
 

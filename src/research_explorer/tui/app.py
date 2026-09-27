@@ -28,7 +28,7 @@ from research_explorer.events.models import (
     TimelineEntry,
 )
 from research_explorer.events.projection import RunProjection
-from research_explorer.events.sink import QueueMarker
+from research_explorer.events.sink import QueueMarker, await_acknowledgement
 from research_explorer.redaction import redact_secrets
 from research_explorer.tui import text as render
 
@@ -269,8 +269,7 @@ class ResearchTUIApp(App[None]):
             if item is None:
                 break
             if isinstance(item, QueueMarker):
-                if item.future is not None and not item.future.done():
-                    item.future.set_result(None)
+                item.resolve()
                 continue
             self.projection.apply(item)
             self.refresh_view()
@@ -281,19 +280,8 @@ class ResearchTUIApp(App[None]):
         A FIFO marker is appended behind the queued events; the consumer
         resolves it only after applying them all. No sleeps, no polling.
         """
-        queue = self._queue
-        if queue is None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        marker = QueueMarker(loop.create_future())
-        await queue.put(marker)
-        future = marker.future
-        assert future is not None
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.shield(future)
+        if self._queue is not None:
+            await await_acknowledgement(self._queue)
 
     async def _run_runner(self) -> None:
         if self._runner is None:

@@ -29,7 +29,6 @@ class TUIController:
         while not self.channel.empty():
             item = self.channel.get_nowait()
             if isinstance(item, QueueMarker):
-                if item.future is not None and not item.future.done():
-                    item.future.set_result(None)
+                item.resolve()
                 continue
             self.projection.apply(item)

@@ -124,7 +124,8 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
 
     controller = TUIController()
     orch = Orchestrator(cfg, event_sink=controller.event_sink)
-    write_state: dict[str, object] = {"done": False, "error": None}
+    report_written = False
+    report_error: str | None = None
 
     async def runner() -> tuple[str, str | None]:
         try:
@@ -140,15 +141,16 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
 
     def persist_report(result: tuple[str, str | None]) -> None:
         """Persist the report once the backend finishes, before review waits."""
-        if not output or write_state["done"]:
+        nonlocal report_written, report_error
+        if not output or report_written:
             return
         report, _obsidian = result
         try:
             _write_report_atomic(report, output)
         except Exception as exc:
-            write_state["error"] = redact_secrets(str(exc))
+            report_error = redact_secrets(str(exc))
             return
-        write_state["done"] = True
+        report_written = True
 
     app = build_app(
         controller.projection,
@@ -167,10 +169,10 @@ def _run_aco_tui(cfg, seed_paper_id: str, seed_query: str, output: str | None) -
         raise typer.Exit(1)
     report, obsidian_dir = app.run_result
     # Fallback for apps that do not invoke the completion hook.
-    if output and not write_state["done"] and not write_state["error"]:
+    if output and not report_written and report_error is None:
         persist_report(app.run_result)
-    if write_state["error"]:
-        typer.echo(f"Report write failed: {write_state['error']}", err=True)
+    if report_error is not None:
+        typer.echo(f"Report write failed: {report_error}", err=True)
         raise typer.Exit(1)
     if output:
         typer.echo(f"Report written to {output}")

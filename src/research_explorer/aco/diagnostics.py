@@ -28,15 +28,6 @@ class SeedDiscovery:
     failed: bool = False
     fulltext_seed: bool = False
 
-    def as_event_payload(self) -> dict:
-        return {
-            "agent_id": self.agent_id,
-            "refs": self.refs,
-            "cits": self.cits,
-            "traversable": self.traversable,
-            "failed": self.failed,
-        }
-
 
 def classify_empty_frontier(records: list[SeedDiscovery]) -> str | None:
     """Return the single primary reason an initial frontier is empty.

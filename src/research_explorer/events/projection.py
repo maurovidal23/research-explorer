@@ -944,7 +944,6 @@ _HANDLERS: dict[str, Any] = {
     EventType.LLM_COMPLETED: RunProjection._on_llm_completed,
     EventType.LLM_FAILED: RunProjection._on_llm_failed,
     EventType.NEIGHBOR_DISCOVERY_STARTED: RunProjection._on_discovery_started,
-    EventType.NEIGHBOR_DISCOVERY_STARTED: RunProjection._on_discovery_started,
     EventType.NEIGHBOR_DISCOVERY_COMPLETED: RunProjection._on_discovery_completed,
     EventType.NEIGHBOR_DISCOVERY_FAILED: RunProjection._on_discovery_failed,
     EventType.FRONTIER_EVAL_STARTED: RunProjection._on_frontier_started,
