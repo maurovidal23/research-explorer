@@ -624,12 +624,13 @@ class RunProjection:
         refs = _as_int(p.get("refs"), 0)
         cits = _as_int(p.get("cits"), 0)
         entry_id = f"discovery:{agent_id}:{wave}:{turn}:{paper_id}"
-        label = f"discover {paper_id or 'paper'} (refs={refs} cits={cits})"
+        label = f"discover {paper_id or 'paper'} (refs={refs} cits={cits}"
         detail: dict[str, Any] = {"refs": refs, "cits": cits}
         if "traversable" in p:
             traversable = _as_int(p.get("traversable"), 0)
             label += f" traversable={traversable}"
             detail["traversable"] = traversable
+        label += ")"
         existing = self.state.entry_by_id(entry_id)
         if existing is None:
             self._add_entry(

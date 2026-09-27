@@ -13,6 +13,7 @@ from research_explorer.events.models import (
     AGENT_EVALUATING,
     AGENT_EXHAUSTED,
     AGENT_FAILED,
+    OUTCOME_OK,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -118,7 +119,7 @@ def render_header(state: RunViewState) -> str:
     winner_agent = state.agents.get(state.winner_agent) if state.winner_agent else None
     winner = winner_agent.label if winner_agent is not None else (state.winner_agent or DASH)
     status_text = status_mark(state.status)
-    if state.outcome and state.outcome != "ok":
+    if state.outcome and state.outcome != OUTCOME_OK:
         status_text = f"{status_text}/{state.outcome}"
     row1 = (
         f"run {state.run_id or DASH}  [{status_text}]  "
@@ -447,9 +448,12 @@ def _render_narrative(state: RunViewState, entry: TimelineEntry | None) -> list[
 
 def render_footer(state: RunViewState) -> str:
     if state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
-        line = f"[{status_mark(state.status)}]"
+        status_text = status_mark(state.status)
+        if state.outcome and state.outcome != OUTCOME_OK:
+            status_text = f"{status_text}/{state.outcome}"
+        line = f"[{status_text}]"
         if state.terminal_reason:
-            line += f" {state.terminal_reason}"
+            return f"{line} {state.terminal_reason}\npress q to exit, ? for help"
         return f"{line} press q to exit, ? for help"
     return (
         "left/right agent  up/down step  enter details  home live\n"
