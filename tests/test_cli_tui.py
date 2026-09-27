@@ -156,6 +156,40 @@ def test_tui_output_still_writes_report(tmp_path, monkeypatch) -> None:
     assert out.read_text(encoding="utf-8") == "TUI REPORT BODY"
 
 
+def test_tui_output_confirms_path_and_writes_report_once(tmp_path, monkeypatch) -> None:
+    from research_explorer import cli as cli_module
+
+    monkeypatch.setattr("research_explorer.orchestrator.runner.Orchestrator", _FakeOrch)
+    monkeypatch.setattr("research_explorer.tui.build_app", _FakeApp)
+
+    real_write = cli_module._write_report_atomic
+    calls: list[str] = []
+
+    def counting(report: str, output: str) -> None:
+        calls.append(output)
+        real_write(report, output)
+
+    monkeypatch.setattr(cli_module, "_write_report_atomic", counting)
+    out = tmp_path / "report.md"
+    result = runner.invoke(
+        app,
+        [
+            "explore",
+            "10.1/x",
+            "question",
+            "--tui",
+            "--output",
+            str(out),
+            "--config",
+            str(_config(tmp_path)),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert f"Report written to {out}" in result.output
+    assert calls == [str(out)]
+    assert out.read_text(encoding="utf-8") == "TUI REPORT BODY"
+
+
 class _CancelledApp(_FakeApp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

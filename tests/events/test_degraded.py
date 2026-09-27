@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+import time
+
+import pytest
+
+from research_explorer.config import Config
 from research_explorer.events.models import (
     GENERIC_NO_WINNER_REASON,
+    REASON_LABELS,
+    REASON_NO_NEIGHBORS_DISCOVERED,
     REASON_NO_TRAVERSABLE_IDENTIFIERS,
+    REASON_REFERENCE_EXTRACTION_FAILED,
+    REASON_SEED_DISCOVERY_FAILED,
     RunEvent,
 )
 from research_explorer.events.projection import RunProjection
 from research_explorer.events.sink import CallbackSink
+from research_explorer.graph.models import Paper
+from research_explorer.orchestrator.runner import Orchestrator
+from research_explorer.providers.routing import SeedKind, SeedRef
 from research_explorer.replay.trace import RunTracer, RunTraceStore
 from research_explorer.tui import text as render
 
@@ -161,3 +173,143 @@ def test_degraded_live_and_replay_projections_are_equivalent(tmp_path) -> None:
     assert replayed.state.winner_agent == ""
     assert len(replayed.state.warnings) == 1
     store.close()
+
+
+# ---- Orchestrator completion telemetry (TUI-REL-5, required test 5) -----------
+
+
+class _FakeGraph:
+    def __init__(self) -> None:
+        self.cached: list[Paper] = []
+
+    def cache_paper(self, paper: Paper) -> None:
+        self.cached.append(paper)
+
+    def get_paper(self, paper_id: str) -> None:
+        return None
+
+
+class _FakeProvider:
+    name = "arxiv"
+    supports_fulltext = False
+
+    def __init__(self, paper: Paper) -> None:
+        self._paper = paper
+
+    async def get_paper(self, key: str) -> Paper:
+        return self._paper
+
+
+class _FakeColony:
+    def __init__(self, reason_code: str) -> None:
+        self.agents: list = []
+        self._reason = reason_code
+        self.best_agent = None
+        self.best_quality = 0.0
+        self.best_narrative = ""
+        self.best_snapshot_agent = ""
+        self.best_snapshot_oleada = 0
+        self.seed_id = ""
+
+    async def initialize(self, seed_id: str, seed_query: str, tracer=None) -> None:
+        self.seed_id = seed_id
+        self.tracer_seen = tracer
+
+    def empty_frontier_reason(self) -> str:
+        return self._reason
+
+    def active_candidates(self) -> list:
+        return []
+
+    def pheromone_concentration(self) -> float:
+        return 0.0
+
+
+class _FakeConvergence:
+    def should_stop(self, *args) -> bool:
+        return True
+
+
+class _FakeScheduler:
+    total_fetches = 3
+    oleada_count = 1
+
+
+async def _run_degraded(reason_code: str, tmp_path) -> list[RunEvent]:
+    store = RunTraceStore(tmp_path / "trace.db")
+    run_id = store.create_run("arxiv:2401.12345", "q")
+    live: list[RunEvent] = []
+    tracer = RunTracer(store, run_id, sink=CallbackSink(live.append))
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.cfg = Config()
+    orch.graph = _FakeGraph()
+    orch.colony = _FakeColony(reason_code)
+    orch.scheduler = _FakeScheduler()
+    orch.convergence = _FakeConvergence()
+    orch.trace = store
+    orch.tracer = tracer
+    orch._elapsed = 0.0
+    orch._terminal_reason_code = ""
+    orch._run_outcome = ""
+    paper = Paper(id="2401.12345", title="Seed", provider="arxiv")
+    seed_ref = SeedRef(SeedKind.ARXIV, "arxiv:2401.12345", "2401.12345", "2401.12345")
+
+    await orch._run_impl(
+        "arxiv:2401.12345",
+        "q",
+        time.monotonic(),
+        run_id,
+        tracer,
+        _FakeProvider(paper),
+        seed_ref,
+    )
+    assert orch._run_outcome == "degraded"
+    assert orch._terminal_reason_code == reason_code
+    # The durable run finishes completed even when degraded.
+    assert store.get_run(run_id)["status"] == "completed"
+    store.close()
+    return live
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        REASON_NO_NEIGHBORS_DISCOVERED,
+        REASON_NO_TRAVERSABLE_IDENTIFIERS,
+        REASON_REFERENCE_EXTRACTION_FAILED,
+        REASON_SEED_DISCOVERY_FAILED,
+    ],
+)
+async def test_orchestrator_emits_enriched_no_winner_per_reason(
+    reason_code: str, tmp_path
+) -> None:
+    live = await _run_degraded(reason_code, tmp_path)
+
+    warnings = [e for e in live if e.type == "warning"]
+    no_winners = [e for e in live if e.type == "no_winner"]
+    assert len(warnings) == 1
+    assert len(no_winners) == 1
+
+    warning = warnings[0]
+    assert warning.payload["reason_code"] == reason_code
+    assert warning.payload["reason"] == REASON_LABELS[reason_code]
+    assert warning.payload["classification"] == "degraded"
+    assert warning.payload["phase"] == "seed_discovery"
+
+    payload = no_winners[0].payload
+    assert payload["run_id"]
+    assert payload["status"] == "completed"
+    assert payload["outcome"] == "degraded"
+    assert payload["reason_code"] == reason_code
+    assert payload["reason"] == REASON_LABELS[reason_code]
+    assert payload["elapsed"] >= 0.0
+    assert payload["total_fetches"] == 3
+    assert payload["waves"] == 1
+
+    state = RunProjection.from_events(live).state
+    assert state.status == "completed"
+    assert state.outcome == "degraded"
+    assert state.terminal_reason_code == reason_code
+    assert len(state.warnings) == 1
+    assert not state.failures

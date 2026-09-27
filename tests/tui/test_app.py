@@ -876,6 +876,55 @@ async def test_report_write_failure_keeps_run_completed() -> None:
         assert "sk-sentinel-4242" not in app.report_error
 
 
+async def test_durable_failure_is_not_duplicated_by_synthetic_fallback() -> None:
+    controller = TUIController()
+
+    async def runner() -> str:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "fail-run"})
+        )
+        controller.event_sink.publish(
+            RunEvent(
+                seq=2,
+                type="run_failed",
+                payload={"error": "boom api_key=sk-sentinel-7777"},
+            )
+        )
+        raise RuntimeError("boom api_key=sk-sentinel-7777")
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if app._runner_finished:
+                break
+        assert app._runner_finished
+        assert app.state.status == "failed"
+        assert len(app.state.failures) == 1
+        assert "sk-sentinel-7777" not in " ".join(app.state.failures)
+
+
+async def test_unreported_runner_failure_falls_back_to_failed_projection() -> None:
+    controller = TUIController()
+
+    async def runner() -> str:
+        controller.event_sink.publish(
+            RunEvent(seq=1, type="orchestrator_start", payload={"run_id": "no-event"})
+        )
+        raise RuntimeError("boom api_key=sk-sentinel-8888")
+
+    app = build_app(controller.projection, queue=controller.queue, runner=runner)
+    async with app.run_test(size=(120, 40)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            if app._runner_finished:
+                break
+        assert app._runner_finished
+        assert app.state.status == "failed"
+        assert len(app.state.failures) == 1
+        assert "sk-sentinel-8888" not in " ".join(app.state.failures)
+
+
 async def test_event_outcome_filter_cycles_in_pilot() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:

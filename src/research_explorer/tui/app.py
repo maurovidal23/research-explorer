@@ -286,23 +286,23 @@ class ResearchTUIApp(App[None]):
     async def _run_runner(self) -> None:
         if self._runner is None:
             return
+        error: str | None = None
         try:
             self.run_result = await self._runner()
         except asyncio.CancelledError:
             self.cancelled = True
         except Exception as exc:
-            self.projection.apply(
-                RunEvent(
-                    seq=0,
-                    type="run_failed",
-                    payload={"error": redact_secrets(str(exc))},
-                )
-            )
+            error = redact_secrets(str(exc))
         # Terminal-state synchronization: a runner result is only complete once
         # every event published before it has been applied to the projection.
-        # Durable failure/cancellation events already in the channel take
-        # precedence; no synthetic terminal event is fabricated here.
         await self._acknowledge_events()
+        # A durable failure/cancellation event already in the channel takes
+        # precedence; only fabricate a fallback when the stream reported no
+        # terminal state for this runner.
+        if error is not None and not self._terminal():
+            self.projection.apply(
+                RunEvent(seq=0, type="run_failed", payload={"error": error})
+            )
         self._runner_finished = True
         if self.run_result is not None and self.on_result is not None:
             try:
