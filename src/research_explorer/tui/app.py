@@ -811,7 +811,9 @@ class ResearchTUIApp(App[None]):
 
     def action_view_events(self) -> None:
         scope = self._events_scope_agent()
-        body = render.render_events_tab(self.state, scope, self.session.event_outcome)
+        body = render.render_events_tab(
+            self.state, scope, self.session.event_outcome, page=self.session.event_page
+        )
         self._open_viewer("Events", body)
 
     def action_view_metadata(self) -> None:
@@ -828,7 +830,11 @@ class ResearchTUIApp(App[None]):
         self.action_select_tab(TAB_EVENTS)
 
     def action_events_older(self) -> None:
-        self.session.event_page += 1
+        scoped = render.filter_events(
+            self.state, self._events_scope_agent(), self.session.event_outcome
+        )
+        last_page = render.event_page_count(len(scoped)) - 1
+        self.session.event_page = min(self.session.event_page + 1, last_page)
         self.action_select_tab(TAB_EVENTS)
 
     def action_events_newer(self) -> None:

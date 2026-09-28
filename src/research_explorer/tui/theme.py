@@ -19,6 +19,7 @@ from research_explorer.events.models import (
     STATUS_EVALUATING,
     STATUS_FAILED,
     STATUS_INITIALIZING,
+    STATUS_INTERRUPTED,
     STATUS_RUNNING,
 )
 
@@ -47,6 +48,7 @@ STATUS_GLYPHS: dict[str, tuple[str, str]] = {
     STATUS_CANCELLED: ("⊘", COLOR_WARN),
     AGENT_FAILED: ("✖", COLOR_BAD),
     STATUS_FAILED: ("✖", COLOR_BAD),
+    STATUS_INTERRUPTED: ("⊗", COLOR_WARN),
     "converged": ("◆", COLOR_GOOD),
     "exhausted": ("■", COLOR_WARN),
     "pending": ("·", COLOR_MUTED),
