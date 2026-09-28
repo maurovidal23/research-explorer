@@ -16,6 +16,7 @@ from research_explorer.events.navigation import (
     NavNode,
     active_agent_id,
     build_agent_navigation,
+    build_wave_navigation,
     find_node,
     flatten_navigation,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "TimelineEntry",
     "active_agent_id",
     "build_agent_navigation",
+    "build_wave_navigation",
     "find_node",
     "flatten_navigation",
 ]

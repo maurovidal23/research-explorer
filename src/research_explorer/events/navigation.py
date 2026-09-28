@@ -1,11 +1,11 @@
-"""Derived agent-first navigation data.
+"""Derived navigation trees over the projected run view state.
 
-The durable timeline is grouped wave-first so replay and reports stay stable.
-The dashboard, however, navigates agent-first: each colony agent is a root whose
-children are waves, turns, and the papers, discoveries, frontiers, reference
-mappings, evaluations, and warnings recorded beneath them. This module derives
-that view from the projected
-:class:`~research_explorer.events.models.RunViewState` without introducing
+The default dashboard hierarchy is wave-first: ``Setup``, one root per wave with
+Research/Evaluation/Decision children, ``Final result``, and ``Debug`` (see
+:func:`build_wave_navigation`). :func:`build_agent_navigation` remains as the
+agent-grouped view of the same timeline for agent-scoped navigation and
+regression coverage. Both are pure derivations of the projected
+:class:`~research_explorer.events.models.RunViewState`; neither introduces
 durable events or a second source of truth.
 """
 

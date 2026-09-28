@@ -22,6 +22,7 @@ from research_explorer.events.models import (
     NODE_COMPLETED,
     NODE_FAILED,
     NODE_PENDING,
+    NODE_SKIPPED,
     OUTCOME_DEGRADED,
     PHASE_DECISION,
     PHASE_EVALUATION,
@@ -149,7 +150,7 @@ def phase_progress_text(state: RunViewState) -> str:
             for agent_id in record.selected
             if state.agents.get(agent_id) is not None
             and state.agents[agent_id].research_status
-            in (NODE_COMPLETED, NODE_FAILED, "skipped")
+            in (NODE_COMPLETED, NODE_FAILED, NODE_SKIPPED)
         }
     return f"{len(terminal)}/{len(record.selected)} agents"
 
@@ -167,7 +168,6 @@ def phase_summary_text(state: RunViewState, wave: int, phase: str) -> str:
             f"{len(record.failed)} failed · {best}"
         )
     return f"leader {record.leader or DASH} · Δ{record.q_delta:+.3f}"
-
 
 
 _ERROR_OUTCOMES = frozenset({"fatal", "error", "failed"})
@@ -1022,7 +1022,7 @@ def render_research_tab(
     lines: list[str] = []
     if node is not None and node.kind == FINAL_NODE:
         return render_final_result(state)
-    if node is not None and node.kind in ("wave", PHASE_NODE):
+    if node is not None and node.kind in (WAVE_NODE, PHASE_NODE):
         wave = node.wave or state.current_wave
         lines.extend(render_wave_summary(state, wave))
         lines.append("")
@@ -1139,7 +1139,7 @@ def render_final_result(state: RunViewState) -> str:
     lines.append(
         f"- Stop reason: {state.stop_reason or state.terminal_reason or UNAVAILABLE}"
     )
-    lines.append(f"- Winner: {winner_label(state) or DASH}")
+    lines.append(f"- Winner: {winner_label(state)}")
     lines.append(f"- Best Q: {state.best_quality:.4f}")
     lines.append(
         f"- Waves: {state.total_waves or state.current_wave}  "
@@ -1176,7 +1176,6 @@ def render_final_result(state: RunViewState) -> str:
         f"- warnings: {len(state.warnings)}  failures: {len(state.failures)}"
     )
     return "\n".join(lines)
-
 
 
 def render_paper_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | None) -> str:

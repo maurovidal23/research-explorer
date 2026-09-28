@@ -143,7 +143,7 @@ class FooterBar(TextPane):
 
 
 class AgentTree(ListView):
-    """Selectable agent-first execution tree."""
+    """Selectable wave-first execution tree with agent/paper drill-down."""
 
 
 class ContentTabBar(Tabs):

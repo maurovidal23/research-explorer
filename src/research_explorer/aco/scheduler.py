@@ -15,9 +15,7 @@ import time
 from research_explorer.aco.colony import Colony
 from research_explorer.agents.explorer import ExplorerAgent
 from research_explorer.config import Config
-from research_explorer.evaluation.availability import (
-    REASON_MODEL_FAILED,
-)
+from research_explorer.evaluation.availability import REASON_MODEL_FAILED
 from research_explorer.evaluation.quality import QualityAssessor
 from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.events.models import (
