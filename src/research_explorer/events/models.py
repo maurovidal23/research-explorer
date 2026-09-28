@@ -67,6 +67,7 @@ class EventType:
     RUN_COMPLETED = "run_completed"
     RUN_CANCELLED = "run_cancelled"
     RUN_FAILED = "run_failed"
+    RUN_INTERRUPTED = "run_interrupted"
     LLM_STARTED = "llm_operation_started"
     LLM_COMPLETED = "llm_operation_completed"
     LLM_FAILED = "llm_operation_failed"
@@ -111,6 +112,7 @@ STATUS_EXHAUSTED = "exhausted"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
+STATUS_INTERRUPTED = "interrupted"
 
 OUTCOME_COMPLETED = "completed"
 OUTCOME_DEGRADED = "degraded"
@@ -256,6 +258,10 @@ class RunViewState(BaseModel):
     failures: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     events: list[RunEvent] = Field(default_factory=list)
+    events_seen_total: int = 0
+    events_dropped: int = 0
+    candidate_scores_seen_total: int = 0
+    candidate_scores_dropped: int = 0
     token_usage: int | None = None
     cost: float | None = None
     follow_live: bool = True

@@ -28,11 +28,13 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Input, ListItem, ListView, Markdown, Static, Tab, Tabs
 
+from research_explorer.events.limits import TUI_REFRESH_INTERVAL_SECONDS
 from research_explorer.events.models import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
     STATUS_RUNNING,
     EventType,
     RunEvent,
@@ -79,6 +81,15 @@ from research_explorer.tui.theme import (
 )
 
 COMPACT_BREAKPOINT = 84
+
+TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.RUN_COMPLETED,
+        EventType.RUN_FAILED,
+        EventType.RUN_CANCELLED,
+        EventType.RUN_INTERRUPTED,
+    }
+)
 
 RESEARCH_THEME_NAME = "research-explorer"
 
@@ -332,6 +343,8 @@ class ResearchTUIApp(App[None]):
         self._tree_nodes: list[NavNode] = []
         self._rows: list[tuple[int, NavNode]] = []
         self._tree_width = 120
+        self._render_interval = TUI_REFRESH_INTERVAL_SECONDS
+        self._refresh_timer: Any = None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -400,6 +413,15 @@ class ResearchTUIApp(App[None]):
         self._apply_narrow(self.size.width <= COMPACT_BREAKPOINT)
         self.refresh_view()
 
+    def on_unmount(self) -> None:
+        self._cancel_scheduled_refresh()
+        for worker in (self._consumer_worker, self._runner_worker):
+            if worker is not None and not worker.is_finished:
+                with contextlib.suppress(Exception):
+                    worker.cancel()
+        self._consumer_worker = None
+        self._runner_worker = None
+
     def _tick_elapsed(self) -> None:
         if self.read_only:
             return
@@ -438,9 +460,13 @@ class ResearchTUIApp(App[None]):
             event = await self._queue.get()
             try:
                 if event is None:
+                    self.refresh_view()
                     break
                 self.projection.apply(event)
-                self.refresh_view()
+                if event.canonical_type() in TERMINAL_EVENT_TYPES:
+                    self.refresh_view()
+                else:
+                    self._schedule_refresh()
             finally:
                 with contextlib.suppress(ValueError):
                     self._queue.task_done()
@@ -475,12 +501,41 @@ class ResearchTUIApp(App[None]):
     def _durable_terminal_received(self) -> bool:
         if self._terminal():
             return True
-        terminal = (EventType.RUN_FAILED, EventType.RUN_CANCELLED, EventType.RUN_COMPLETED)
-        return any(event.canonical_type() in terminal for event in self.state.events)
+        return any(
+            event.canonical_type() in TERMINAL_EVENT_TYPES
+            for event in self.state.events
+        )
 
     # ---- rendering --------------------------------------------------------
 
     def refresh_view(self) -> None:
+        """Render the newest fully applied projection immediately.
+
+        Any pending scheduled refresh is collapsed into this call so a burst
+        never renders an intermediate snapshot after an explicit refresh.
+        """
+        self._cancel_scheduled_refresh()
+        try:
+            self._refresh()
+        except Exception as exc:
+            self._request_render_shutdown(exc)
+
+    def _schedule_refresh(self) -> None:
+        if self._refresh_timer is not None:
+            return
+        self._refresh_timer = self.set_timer(
+            self._render_interval, self._flush_scheduled_refresh
+        )
+
+    def _cancel_scheduled_refresh(self) -> None:
+        timer = self._refresh_timer
+        self._refresh_timer = None
+        if timer is not None:
+            with contextlib.suppress(Exception):
+                timer.stop()
+
+    def _flush_scheduled_refresh(self) -> None:
+        self._refresh_timer = None
         try:
             self._refresh()
         except Exception as exc:
@@ -767,10 +822,20 @@ class ResearchTUIApp(App[None]):
 
     def action_cycle_event_outcome(self) -> None:
         self.session.event_outcome = next_event_outcome(self.session.event_outcome)
+        self.session.event_page = 0
         self.action_select_tab(TAB_EVENTS)
 
     def action_cycle_event_agent(self) -> None:
         self.session.event_agent = next_event_agent(self.session.event_agent)
+        self.session.event_page = 0
+        self.action_select_tab(TAB_EVENTS)
+
+    def action_events_older(self) -> None:
+        self.session.event_page += 1
+        self.action_select_tab(TAB_EVENTS)
+
+    def action_events_newer(self) -> None:
+        self.session.event_page = max(0, self.session.event_page - 1)
         self.action_select_tab(TAB_EVENTS)
 
     def _scope_agent(self) -> str:
@@ -801,7 +866,12 @@ class ResearchTUIApp(App[None]):
     # ---- quit / cancellation ---------------------------------------------
 
     def _terminal(self) -> bool:
-        return self.state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED)
+        return self.state.status in (
+            STATUS_COMPLETED,
+            STATUS_CANCELLED,
+            STATUS_FAILED,
+            STATUS_INTERRUPTED,
+        )
 
     def action_close_view(self) -> None:
         if self.screen is not self.screen_stack[0]:

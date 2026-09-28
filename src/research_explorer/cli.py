@@ -429,6 +429,13 @@ def replay_show(
         f"started={run['started_at']}  completed={run['completed_at']}  "
         f"best_Q={run['best_quality']}  events={run['event_count']}"
     )
+    if run["status"] in ("running", "interrupted"):
+        events = store.list_events(run_id)
+        last = events[-1] if events else None
+        if last is not None:
+            typer.echo(f"last_activity={last['ts']}  last_operation={last['type']}")
+        if run.get("interrupt_reason"):
+            typer.echo(f"interrupted: {run['interrupt_reason']}")
     if timeline:
         typer.echo("\n=== Timeline ===")
         for ev in store.list_events(run_id):
@@ -480,7 +487,7 @@ def replay_tui(
     from research_explorer.events.projection import RunProjection
     from research_explorer.replay.trace import RunTraceStore
     from research_explorer.tui import build_app
-    from research_explorer.tui.replay import hydrate_from_store
+    from research_explorer.tui.replay import apply_reconciled_status, hydrate_from_store
 
     store = RunTraceStore(db)
     run = store.get_run(run_id)
@@ -491,6 +498,7 @@ def replay_tui(
 
     projection = RunProjection.from_events(store.list_events(run_id))
     hydrate_from_store(projection, store, run_id)
+    apply_reconciled_status(projection, run)
     store.close()
 
     app = build_app(projection, read_only=True)

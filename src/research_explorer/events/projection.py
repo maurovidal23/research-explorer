@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from research_explorer.events.limits import LIVE_CANDIDATE_WINDOW, LIVE_EVENT_WINDOW
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_COMPLETED,
@@ -32,6 +33,7 @@ from research_explorer.events.models import (
     STATUS_COMPLETED,
     STATUS_EVALUATING,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
     STATUS_RUNNING,
     AgentSummary,
     EventType,
@@ -67,9 +69,16 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 class RunProjection:
     """Reduces ordered events into a :class:`RunViewState`."""
 
-    def __init__(self, state: RunViewState | None = None) -> None:
+    def __init__(
+        self,
+        state: RunViewState | None = None,
+        event_window: int = LIVE_EVENT_WINDOW,
+        candidate_window: int = LIVE_CANDIDATE_WINDOW,
+    ) -> None:
         self.state = state if state is not None else RunViewState()
-        self._seen_seq: set[int] = set()
+        self._max_seq: int = 0
+        self._event_window = max(1, event_window)
+        self._candidate_window = max(1, candidate_window)
         self._open_frontier: dict[tuple[str, int, int], str] = {}
         self._current_agent: str = ""
 
@@ -108,12 +117,12 @@ class RunProjection:
 
     def apply(self, event: RunEvent) -> None:
         if event.seq > 0:
-            if event.seq in self._seen_seq:
+            if event.seq <= self._max_seq:
                 return
-            self._seen_seq.add(event.seq)
+            self._max_seq = event.seq
         if event.payload:
             event = event.model_copy(update={"payload": redact_obj(event.payload)})
-        self.state.events.append(event)
+        self._append_event(event)
         # ``no_winner`` is a durable legacy event that must stay readable but
         # carries richer semantics than the generic completed handler.
         handler: Any
@@ -129,6 +138,24 @@ class RunProjection:
                     redact_secrets(f"projection_error type={event.type}")
                 )
         self._sync_follow()
+
+    def _append_event(self, event: RunEvent) -> None:
+        events = self.state.events
+        events.append(event)
+        self.state.events_seen_total += 1
+        overflow = len(events) - self._event_window
+        if overflow > 0:
+            del events[:overflow]
+            self.state.events_dropped += overflow
+
+    def _append_candidate_score(self, score: CandidateScore) -> None:
+        scores = self.state.candidate_scores
+        scores.append(score)
+        self.state.candidate_scores_seen_total += 1
+        overflow = len(scores) - self._candidate_window
+        if overflow > 0:
+            del scores[:overflow]
+            self.state.candidate_scores_dropped += overflow
 
     # ---- helpers ----------------------------------------------------------
 
@@ -562,7 +589,7 @@ class RunProjection:
     def _on_candidate_score(self, event: RunEvent) -> None:
         p = event.payload
         with contextlib.suppress(Exception):
-            self.state.candidate_scores.append(CandidateScore.model_validate(p))
+            self._append_candidate_score(CandidateScore.model_validate(p))
 
     def _on_candidate_selected(self, event: RunEvent) -> None:
         p = event.payload
@@ -1019,6 +1046,15 @@ class RunProjection:
         self.state.status = STATUS_CANCELLED
         self._finalize_agents()
 
+    def _on_run_interrupted(self, event: RunEvent) -> None:
+        """Present a stale/heartbeat-reconciled run without fabricating a winner."""
+        reason = redact_secrets(str(event.payload.get("reason", ""))).strip()
+        if reason:
+            self.state.terminal_reason = reason
+        self.state.status = STATUS_INTERRUPTED
+        self.state.outcome = str(event.payload.get("outcome") or self.state.outcome)
+        self._finalize_agents()
+
     def _on_status(self, event: RunEvent) -> None:
         status = str(event.payload.get("status", ""))
         if status in (
@@ -1087,6 +1123,7 @@ _HANDLERS: dict[str, Any] = {
     EventType.RUN_COMPLETED: RunProjection._on_run_completed,
     EventType.RUN_FAILED: RunProjection._on_run_failed,
     EventType.RUN_CANCELLED: RunProjection._on_run_cancelled,
+    EventType.RUN_INTERRUPTED: RunProjection._on_run_interrupted,
     EventType.ARTIFACT_SAVED: RunProjection._on_artifact,
     EventType.WARNING: RunProjection._on_warning,
     "status": RunProjection._on_status,

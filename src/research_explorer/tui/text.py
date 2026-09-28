@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from rich.text import Text
 
+from research_explorer.events.limits import EVENT_PAGE_SIZE
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_COMPLETED,
@@ -20,7 +21,9 @@ from research_explorer.events.models import (
     STATUS_COMPLETED,
     STATUS_EVALUATING,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
     AgentSummary,
+    EventType,
     RunEvent,
     RunViewState,
     TimelineEntry,
@@ -80,6 +83,7 @@ _STATUS_MARK = {
     STATUS_COMPLETED: "completed",
     STATUS_CANCELLED: "cancelled",
     STATUS_FAILED: "failed",
+    STATUS_INTERRUPTED: "interrupted",
 }
 
 _CASTE_LABEL = {
@@ -564,7 +568,19 @@ def render_events(state: RunViewState, agent_id: str = "", outcome: str = "") ->
     return "\n".join(lines)
 
 
+def last_durable_event(state: RunViewState) -> RunEvent | None:
+    """Newest durable event in the bounded window, skipping a synthetic interrupt."""
+    for event in reversed(state.events):
+        if event.canonical_type() == EventType.RUN_INTERRUPTED:
+            continue
+        return event
+    return None
+
+
 def render_metadata(state: RunViewState) -> str:
+    last = last_durable_event(state)
+    last_activity = last.ts if last is not None else ""
+    last_operation = last.canonical_type() if last is not None else ""
     lines = [
         "=== Run metadata and resolved configuration ===",
         f"run_id: {state.run_id or UNAVAILABLE}",
@@ -583,8 +599,17 @@ def render_metadata(state: RunViewState) -> str:
         f"fetches: {state.fetches_used}/{state.max_fetches}",
         f"waves: {state.total_waves or state.current_wave}",
         f"elapsed: {format_duration(state.elapsed_seconds)}",
+        f"last_activity: {last_activity or UNAVAILABLE}",
+        f"last_operation: {last_operation or UNAVAILABLE}",
+        f"tokens: {state.token_usage if state.token_usage is not None else UNAVAILABLE} "
+        "(API-reported historical; not inferred to keep accumulating)",
         f"question: {state.query or UNAVAILABLE}",
     ]
+    if state.status == STATUS_INTERRUPTED:
+        lines.append(
+            "interrupted: final in-memory work may have been lost; the durable "
+            "trace and graph data remain available."
+        )
     if state.failures:
         lines.append("failures:")
         lines.extend(f"  {redact_secrets(f)}" for f in state.failures)
@@ -860,9 +885,15 @@ def render_tab_bar(session: UISession) -> Text:
 
 def render_footer_text(state: RunViewState, session: UISession, settling: bool = False) -> Text:
     text = Text()
-    if settling and state.status not in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
+    terminal = (
+        STATUS_COMPLETED,
+        STATUS_CANCELLED,
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+    )
+    if settling and state.status not in terminal:
         text.append(" cancellation requested; settling… ", style=f"bold {theme.COLOR_WARN}")
-    if state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED):
+    if state.status in terminal:
         text.append(f" {status_label(state)} ", style=f"bold {theme.COLOR_ACCENT}")
         text.append("press "
                     "q to exit  ? for help  Ctrl+P for commands", style=theme.COLOR_MUTED)
@@ -998,12 +1029,31 @@ def render_evaluation_tab(state: RunViewState, agent_id: str) -> str:
     return "\n".join(lines)
 
 
-def render_events_tab(
-    state: RunViewState, agent_id: str = "", outcome: str = "", newest_first: bool = True
-) -> str:
+def filter_events(
+    state: RunViewState, agent_id: str = "", outcome: str = ""
+) -> list[RunEvent]:
+    """Filter the bounded live event window without building unbounded lists."""
     events = [e for e in state.events if not agent_id or agent_id in str(e.payload)]
     if outcome:
         events = [e for e in events if classify_event_outcome(e) == outcome]
+    return events
+
+
+def event_page_count(total: int, page_size: int = EVENT_PAGE_SIZE) -> int:
+    if total <= 0:
+        return 1
+    return (total + page_size - 1) // page_size
+
+
+def render_events_tab(
+    state: RunViewState,
+    agent_id: str = "",
+    outcome: str = "",
+    newest_first: bool = True,
+    page: int = 0,
+    page_size: int = EVENT_PAGE_SIZE,
+) -> str:
+    events = filter_events(state, agent_id, outcome)
     if newest_first:
         events = list(reversed(events))
     filters: list[str] = []
@@ -1012,11 +1062,39 @@ def render_events_tab(
     if outcome:
         filters.append(f"outcome={outcome}")
     scope = f" ({', '.join(filters)})" if filters else ""
+    total = len(events)
+    page_count = event_page_count(total, page_size)
+    current = max(0, min(page, page_count - 1))
+    start = current * page_size
+    window = events[start : start + page_size]
+    seen_total = state.events_seen_total or total
+    dropped = state.events_dropped
     lines = [f"## Events{scope}", ""]
-    if not events:
+    if total:
+        lines.append(
+            f"_Showing {start + 1}-{start + len(window)} of {total} "
+            f"(newest first; page {current + 1}/{page_count})_"
+        )
+        lines.append("")
+    else:
         lines.append("_No events recorded for this filter._")
+        if seen_total and dropped:
+            lines.append(
+                f"_{seen_total} durable events were seen, but none match the "
+                "current filter in the bounded live window._"
+            )
         return "\n".join(lines)
-    for event in events:
+    omitted = max(0, seen_total - total)
+    if dropped or omitted:
+        lines.extend(
+            [
+                f"_{seen_total} durable events seen; {dropped} evicted from the "
+                "bounded live window. Older history lives in the durable trace "
+                "(use `replay tui` once the run is finished)._",
+                "",
+            ]
+        )
+    for event in window:
         summary = " ".join(
             f"{k}={v}" for k, v in event.payload.items() if k != "content"
         )[:160]
@@ -1042,7 +1120,10 @@ def render_tab_body(state: RunViewState, session: UISession, entry: TimelineEntr
         return render_evaluation_tab(state, session.selected_agent_id)
     if session.active_tab == TAB_EVENTS:
         return render_events_tab(
-            state, events_scope_agent(state, session), session.event_outcome
+            state,
+            events_scope_agent(state, session),
+            session.event_outcome,
+            page=session.event_page,
         )
     return ""
 
@@ -1065,6 +1146,15 @@ def render_status_banner(state: RunViewState) -> Text:
     text.append(f"{glyph} ", style=color)
     if state.status == STATUS_FAILED:
         text.append(render_failure_summary(state), style=color)
+        return text
+    if state.status == STATUS_INTERRUPTED:
+        text.append(status_label(state), style=f"bold {color}")
+        reason = state.terminal_reason or "the run was interrupted"
+        text.append(f" {DASH} {reason}", style=theme.COLOR_MUTED)
+        text.append(
+            " (durable trace preserved; final in-memory work may be lost)",
+            style=theme.COLOR_MUTED,
+        )
         return text
     text.append(status_label(state), style=f"bold {color}")
     text.append(f" {DASH} {state.terminal_reason or 'run finished'}", style=theme.COLOR_MUTED)

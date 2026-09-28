@@ -10,10 +10,30 @@ from __future__ import annotations
 
 import re
 
+from research_explorer.events.models import STATUS_INTERRUPTED, RunEvent
 from research_explorer.events.projection import RunProjection
 from research_explorer.replay.trace import RunTraceStore
 
 _NARRATIVE_RE = re.compile(r"^narrative_(?P<agent>.+?)(?:_t\d+)?\.md$")
+
+
+def apply_reconciled_status(projection: RunProjection, run: dict) -> RunProjection:
+    """Project a reconciled ``interrupted`` row as a non-durable status event.
+
+    A killed process leaves no terminal event, so replay must surface the
+    heartbeat reconciliation without inventing a winner or touching the trace.
+    """
+    status = str(run.get("status") or "")
+    if status == STATUS_INTERRUPTED and projection.state.status != STATUS_INTERRUPTED:
+        reason = str(run.get("interrupt_reason") or "run was interrupted")
+        projection.apply(
+            RunEvent(
+                seq=0,
+                type="run_interrupted",
+                payload={"reason": reason, "outcome": STATUS_INTERRUPTED},
+            )
+        )
+    return projection
 
 
 def hydrate_from_store(

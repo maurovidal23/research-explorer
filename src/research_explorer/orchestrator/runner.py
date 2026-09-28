@@ -6,6 +6,8 @@ winning agent's narrative.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import json
 import time
@@ -33,7 +35,11 @@ from research_explorer.providers.base import ResilientProvider
 from research_explorer.providers.factory import build_all_providers
 from research_explorer.providers.routing import SeedRef, route_seed_provider
 from research_explorer.redaction import redact_secrets
-from research_explorer.replay.trace import RunTracer, RunTraceStore
+from research_explorer.replay.trace import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    RunTracer,
+    RunTraceStore,
+)
 
 log = get_logger("orchestrator")
 
@@ -97,6 +103,7 @@ class Orchestrator:
         # Evaluation replay trace store (lazily opened)
         self.trace = RunTraceStore(config.storage.trace_db_path)
         self.tracer: RunTracer | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     def _provider_for_seed(self, seed_paper_id: str) -> tuple[ResilientProvider, SeedRef]:
         """Route the seed to a enabled, capable provider (see providers.routing)."""
@@ -128,6 +135,8 @@ class Orchestrator:
         self.tracer = RunTracer(self.trace, run_id, sink=self.event_sink)
         self.llm.tracer = self.tracer
         self.scheduler.tracer = self.tracer
+        self.trace.start_heartbeat(run_id)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         log.info(
             "orchestrator_start",
@@ -155,6 +164,23 @@ class Orchestrator:
                 )
             self.trace.finish_run(run_id, "failed")
             raise
+        finally:
+            await self._stop_heartbeat()
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            with contextlib.suppress(Exception):
+                self.trace.heartbeat(self.run_id)
+
+    async def _stop_heartbeat(self) -> None:
+        task = getattr(self, "_heartbeat_task", None)
+        if task is None:
+            return
+        self._heartbeat_task = None
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def _run_impl(
         self,
@@ -345,6 +371,7 @@ class Orchestrator:
 
     async def aclose(self) -> None:
         """Clean up resources."""
+        await self._stop_heartbeat()
         await self.llm.aclose()
         for p in self.providers.values():
             await p.aclose()
