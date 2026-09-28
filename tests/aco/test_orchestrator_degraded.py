@@ -32,6 +32,7 @@ from research_explorer.graph.models import Paper
 from research_explorer.graph.store import GraphStore
 from research_explorer.orchestrator.runner import Orchestrator
 from research_explorer.providers.routing import SeedKind, SeedRef
+from research_explorer.replay.models import DetailedEvaluation
 from research_explorer.replay.trace import RunTracer, RunTraceStore
 from research_explorer.tui import text as render
 
@@ -198,6 +199,16 @@ async def test_completed_winner_run_keeps_completed_outcome(tmp_path) -> None:
     orch.colony.best_snapshot_agent = "a0"
     orch.colony.best_quality = 0.9
     orch.colony.best_narrative = "winning narrative"
+    orch.scheduler.evaluations = [
+        DetailedEvaluation(
+            agent_id="a0",
+            oleada=1,
+            turn=0,
+            q=0.9,
+            new_papers=["openalex:W1"],
+            status="complete",
+        )
+    ]
     seed_ref = SeedRef(
         kind=SeedKind.ARXIV,
         value="1905.07697",

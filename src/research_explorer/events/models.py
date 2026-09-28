@@ -40,6 +40,10 @@ class EventType:
     COLONY_INIT_COMPLETED = "colony_init_completed"
     WAVE_STARTED = "wave_started"
     WAVE_COMPLETED = "wave_completed"
+    WAVE_PHASE_STARTED = "wave_phase_started"
+    WAVE_PHASE_COMPLETED = "wave_phase_completed"
+    WAVE_PHASE_FAILED = "wave_phase_failed"
+    EVALUATION_SETTLED = "evaluation_settled"
     AGENT_TURN_QUEUED = "agent_turn_queued"
     AGENT_TURN_STARTED = "agent_turn_started"
     AGENT_TURN_COMPLETED = "agent_turn_completed"
@@ -121,6 +125,26 @@ TERMINAL_STATUSES = frozenset(
 OUTCOME_COMPLETED = "completed"
 OUTCOME_DEGRADED = "degraded"
 
+PHASE_SETUP = "setup"
+PHASE_RESEARCH = "research"
+PHASE_EVALUATION = "evaluation"
+PHASE_DECISION = "decision"
+PHASE_RESULT = "result"
+PHASE_DEBUG = "debug"
+
+WAVE_PHASE_ORDER: tuple[str, ...] = (PHASE_RESEARCH, PHASE_EVALUATION, PHASE_DECISION)
+
+EVAL_PENDING = "pending"
+EVAL_COMPLETE = "complete"
+EVAL_SKIPPED = "skipped"
+EVAL_FAILED = "failed"
+
+EVALUATION_TERMINAL_STATES = frozenset({EVAL_COMPLETE, EVAL_SKIPPED, EVAL_FAILED})
+
+REASON_EMPTY_WINNER_NARRATIVE = "empty_winner_narrative"
+REASON_NO_EVALUATED_EVIDENCE = "no_evaluated_evidence"
+REASON_WINNER_EVALUATION_MISSING = "winner_evaluation_missing"
+
 # Exactly one primary reason is attached to an empty initial frontier so the
 # terminal state is actionable instead of an opaque ``no_winner``.
 REASON_NO_NEIGHBORS_DISCOVERED = "no_neighbors_discovered"
@@ -148,6 +172,15 @@ REASON_TEXT: dict[str, str] = {
     ),
     REASON_NO_WINNER: (
         "the run finished without a winning narrative"
+    ),
+    REASON_EMPTY_WINNER_NARRATIVE: (
+        "the winning agent produced no usable narrative"
+    ),
+    REASON_NO_EVALUATED_EVIDENCE: (
+        "no evidence-bearing evaluation completed during exploration"
+    ),
+    REASON_WINNER_EVALUATION_MISSING: (
+        "the winning agent has no terminal evaluation"
     ),
 }
 
@@ -201,6 +234,64 @@ class AgentSummary(BaseModel):
     current_paper_source: str = ""
     budget: int = 0
     frontier: int = 0
+    research_status: str = NODE_PENDING
+    evaluation_status: str = EVAL_PENDING
+    evaluation_reason: str = ""
+    papers_attempted: int = 0
+    papers_integrated: int = 0
+    evidence_added: int = 0
+
+
+class PhaseState(BaseModel):
+    """Durable Research/Evaluation/Decision state for one wave phase."""
+
+    wave: int = 0
+    phase: str = PHASE_RESEARCH
+    status: str = NODE_PENDING
+    reason: str = ""
+    selected: list[str] = Field(default_factory=list)
+    completed: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list)
+    skipped: list[str] = Field(default_factory=list)
+    papers_attempted: int = 0
+    papers_integrated: int = 0
+    evidence_added: int = 0
+    best_q: float | None = None
+    leader: str = ""
+    q_delta: float = 0.0
+    budget_used: int = 0
+    continue_reason: str = ""
+    stop_reason: str = ""
+    converged: bool = False
+    pheromone_concentration: float = 0.0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def key(self) -> str:
+        return f"{self.wave}:{self.phase}"
+
+
+class EvaluationState(BaseModel):
+    """The single terminal evaluation outcome for a selected agent wave turn."""
+
+    agent_id: str
+    wave: int = 0
+    turn: int = 0
+    status: str = EVAL_PENDING
+    reason: str = ""
+    q: float | None = None
+    q_delta: float | None = None
+    components: dict[str, float | None] = Field(default_factory=dict)
+    unavailable: dict[str, str] = Field(default_factory=dict)
+    evidence_papers: int = 0
+
+    @property
+    def key(self) -> str:
+        return f"{self.wave}:{self.agent_id}"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in EVALUATION_TERMINAL_STATES
 
 
 class TimelineEntry(BaseModel):
@@ -270,9 +361,42 @@ class RunViewState(BaseModel):
     cost: float | None = None
     follow_live: bool = True
     selected_entry_id: str | None = None
+    phases: dict[str, PhaseState] = Field(default_factory=dict)
+    evaluation_states: dict[str, EvaluationState] = Field(default_factory=dict)
+    selected_agents: dict[int, list[str]] = Field(default_factory=dict)
+    current_phase: str = ""
+    stop_reason: str = ""
+    legacy_projection: bool = False
 
     def ordered_agents(self) -> list[AgentSummary]:
         return [self.agents[a] for a in self.agent_order if a in self.agents]
+
+    def phase(self, wave: int, phase: str) -> PhaseState | None:
+        return self.phases.get(f"{wave}:{phase}")
+
+    def wave_phases(self, wave: int) -> list[PhaseState]:
+        ordered: list[PhaseState] = []
+        for name in WAVE_PHASE_ORDER:
+            record = self.phase(wave, name)
+            if record is not None:
+                ordered.append(record)
+        return ordered
+
+    def evaluation_state(self, wave: int, agent_id: str) -> EvaluationState | None:
+        return self.evaluation_states.get(f"{wave}:{agent_id}")
+
+    def latest_evaluation(self, agent_id: str) -> EvaluationState | None:
+        records = [
+            record
+            for record in self.evaluation_states.values()
+            if record.agent_id == agent_id
+        ]
+        return max(records, key=lambda record: record.wave) if records else None
+
+    def ordered_waves(self) -> list[int]:
+        waves = {entry.wave for entry in self.timeline}
+        waves.update(phase.wave for phase in self.phases.values())
+        return sorted(wave for wave in waves if wave > 0)
 
     def timeline_children(self, parent_id: str | None) -> list[TimelineEntry]:
         return [e for e in self.timeline if e.parent_id == parent_id]

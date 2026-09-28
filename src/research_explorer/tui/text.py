@@ -16,7 +16,16 @@ from research_explorer.events.models import (
     AGENT_EVALUATING,
     AGENT_EXHAUSTED,
     AGENT_FAILED,
+    EVAL_FAILED,
+    EVAL_PENDING,
+    EVAL_SKIPPED,
+    NODE_COMPLETED,
+    NODE_FAILED,
+    NODE_PENDING,
     OUTCOME_DEGRADED,
+    PHASE_DECISION,
+    PHASE_EVALUATION,
+    PHASE_RESEARCH,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -29,7 +38,15 @@ from research_explorer.events.models import (
     RunViewState,
     TimelineEntry,
 )
-from research_explorer.events.navigation import AGENT_NODE, NavNode
+from research_explorer.events.navigation import (
+    AGENT_NODE,
+    DEBUG_NODE,
+    FINAL_NODE,
+    PHASE_NODE,
+    SETUP_NODE,
+    WAVE_NODE,
+    NavNode,
+)
 from research_explorer.redaction import redact_secrets
 from research_explorer.tui import theme
 from research_explorer.tui.actions import footer_hints
@@ -114,6 +131,43 @@ def status_label(state: RunViewState) -> str:
     if state.outcome == OUTCOME_DEGRADED:
         return f"{label} ({OUTCOME_DEGRADED})"
     return label
+
+
+def phase_progress_text(state: RunViewState) -> str:
+    """Compact ``done/total agents`` progress for the current wave phase."""
+    wave = state.current_wave
+    phase = state.current_phase
+    if not wave or not phase:
+        return DASH
+    record = state.phase(wave, phase)
+    if record is None or not record.selected:
+        return DASH if not record else f"0/{len(record.selected)} agents"
+    terminal = set(record.completed) | set(record.failed) | set(record.skipped)
+    if phase == PHASE_RESEARCH and not terminal:
+        terminal = {
+            agent_id
+            for agent_id in record.selected
+            if state.agents.get(agent_id) is not None
+            and state.agents[agent_id].research_status
+            in (NODE_COMPLETED, NODE_FAILED, "skipped")
+        }
+    return f"{len(terminal)}/{len(record.selected)} agents"
+
+
+def phase_summary_text(state: RunViewState, wave: int, phase: str) -> str:
+    record = state.phase(wave, phase)
+    if record is None:
+        return DASH
+    if phase == PHASE_RESEARCH:
+        return f"{len(record.completed)} done · {record.papers_integrated} papers"
+    if phase == PHASE_EVALUATION:
+        best = f"best Q {record.best_q:.3f}" if record.best_q is not None else "best Q --"
+        return (
+            f"{len(record.completed)} complete / {len(record.skipped)} skipped / "
+            f"{len(record.failed)} failed · {best}"
+        )
+    return f"leader {record.leader or DASH} · Δ{record.q_delta:+.3f}"
+
 
 
 _ERROR_OUTCOMES = frozenset({"fatal", "error", "failed"})
@@ -691,9 +745,16 @@ def render_dashboard_header(
     row1.append(f"  elapsed {format_duration(state.elapsed_seconds)}")
     row1.append(f"  fetch {state.fetches_used}/{state.max_fetches}")
     row1.append(f"  wave {state.current_wave}  turn {state.current_turn}")
+    row1.append(f"  phase {state.current_phase or DASH}")
+    row1.append(f"  {phase_progress_text(state)}")
     row1.append(f"  best {state.best_quality:.3f}", style=theme.COLOR_GOOD)
-    row1.append(f"  winner {winner_label(state)}", style=theme.COLOR_WARN)
+    row1.append(f"  leader {winner_label(state)}", style=theme.COLOR_WARN)
     row1.append(f"  tokens {tokens}", style=theme.COLOR_MUTED)
+    if state.warnings or state.failures:
+        row1.append(
+            f"  warn {len(state.warnings)} fail {len(state.failures)}",
+            style=theme.COLOR_BAD if state.failures else theme.COLOR_WARN,
+        )
 
     row2_segments: list[tuple[str, str | None]] = [
         (f"Q {state.query or DASH}", None),
@@ -765,8 +826,45 @@ def render_tree_label(
     )
     glyph, color = theme.status_style(node.status)
     status = f"  {glyph} {status_mark(node.status)}"
+    detail = ""
+    if node.kind == WAVE_NODE:
+        research = state.phase(node.wave, PHASE_RESEARCH)
+        evaluation = state.phase(node.wave, PHASE_EVALUATION)
+        decision = state.phase(node.wave, PHASE_DECISION)
+        parts = []
+        if research is not None:
+            parts.append(
+                f"{len(research.completed)}/{len(research.selected)} research"
+            )
+        if evaluation is not None:
+            best = (
+                f"Q {evaluation.best_q:.2f}"
+                if evaluation.best_q is not None
+                else "Q --"
+            )
+            parts.append(
+                f"eval {len(evaluation.completed)}/{len(evaluation.skipped)}/"
+                f"{len(evaluation.failed)} {best}"
+            )
+        if decision is not None and (decision.leader or decision.stop_reason):
+            reason = decision.stop_reason or decision.continue_reason or "continue"
+            parts.append(
+                f"leader {decision.leader or DASH} "
+                f"Δ{decision.q_delta:+.2f} {reason}"
+            )
+        detail = " · " + " · ".join(parts) if parts else ""
+    elif node.kind == PHASE_NODE:
+        detail = " · " + phase_summary_text(state, node.wave, node.node_id.split(":")[-1])
+    elif node.kind == FINAL_NODE:
+        detail = f" · {state.outcome or UNAVAILABLE}"
+        if state.stop_reason:
+            detail += f" · {state.stop_reason}"
+    elif node.kind == DEBUG_NODE:
+        detail = f" · {state.events_seen_total} events · {len(state.warnings)} warnings"
+    elif node.kind == SETUP_NODE:
+        detail = f" · seed {state.seed_paper_id or DASH}"
     body = _fit_segments(
-        [(node.label, None)],
+        [(node.label, None), (detail, theme.COLOR_MUTED)],
         max(1, width - len(prefix) - len(geometry) - 1 - len(status)),
     )
     text = Text(prefix + geometry + " ")
@@ -915,8 +1013,23 @@ def render_scope_caption(
     return "  ".join(parts)
 
 
-def render_research_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | None) -> str:
-    lines = [f"## Research line · {agent_label(state, agent_id)}", ""]
+def render_research_tab(
+    state: RunViewState,
+    agent_id: str,
+    entry: TimelineEntry | None,
+    node: NavNode | None = None,
+) -> str:
+    lines: list[str] = []
+    if node is not None and node.kind == FINAL_NODE:
+        return render_final_result(state)
+    if node is not None and node.kind in ("wave", PHASE_NODE):
+        wave = node.wave or state.current_wave
+        lines.extend(render_wave_summary(state, wave))
+        lines.append("")
+        lines.extend(render_phase_agent_table(state, wave, node.node_id))
+        lines.append("")
+    lines.append(f"## Research line · {agent_label(state, agent_id)}")
+    lines.append("")
     detail = entry.detail if entry is not None else {}
     delta = detail.get("delta_narrative") or detail.get("changed_understanding")
     if delta is None:
@@ -933,6 +1046,137 @@ def render_research_tab(state: RunViewState, agent_id: str, entry: TimelineEntry
     else:
         lines.append(narrative)
     return "\n".join(lines)
+
+
+def render_wave_summary(state: RunViewState, wave: int) -> list[str]:
+    """Compact, always-available wave rows used by the phase detail view."""
+    record = state.entry_by_id(f"wave:{wave}")
+    status = record.status if record is not None else NODE_PENDING
+    lines = [f"### Wave {wave} · {status_mark(status)}"]
+    research = state.phase(wave, PHASE_RESEARCH)
+    if research is not None:
+        lines.append(
+            f"- Research: {len(research.completed)}/{len(research.selected)} done · "
+            f"{research.papers_integrated} papers · {research.evidence_added} evidence"
+        )
+    evaluation = state.phase(wave, PHASE_EVALUATION)
+    if evaluation is not None:
+        best = f"{evaluation.best_q:.3f}" if evaluation.best_q is not None else DASH
+        lines.append(
+            f"- Evaluation: {len(evaluation.completed)} complete / "
+            f"{len(evaluation.skipped)} skipped / {len(evaluation.failed)} failed · best Q {best}"
+        )
+    decision = state.phase(wave, PHASE_DECISION)
+    if decision is not None:
+        reason = decision.stop_reason or decision.continue_reason or "continue"
+        lines.append(
+            f"- Decision: leader {decision.leader or DASH} · "
+            f"Δ{decision.q_delta:+.3f} · {reason}"
+        )
+    return lines
+
+
+def render_phase_agent_table(state: RunViewState, wave: int, node_id: str = "") -> list[str]:
+    """Compact per-agent table shown for a selected wave or phase."""
+    phase = PHASE_RESEARCH
+    if node_id.startswith("wave:") and node_id.count(":") == 2:
+        phase = node_id.split(":")[2]
+    selected = state.selected_agents.get(wave, [])
+    if not selected:
+        selected = state.agent_order
+    lines = ["Agent  Research     Evaluation   Q       Delta    Work"]
+    for agent_id in selected:
+        summary = state.agents.get(agent_id)
+        if summary is None:
+            continue
+        evaluation = state.evaluation_state(wave, agent_id)
+        if evaluation is not None:
+            eval_label = evaluation.status
+            q_text = f"{evaluation.q:.3f}" if evaluation.q is not None else DASH
+            delta_text = (
+                f"{evaluation.q_delta:+.3f}" if evaluation.q_delta is not None else DASH
+            )
+        else:
+            eval_label = EVAL_PENDING
+            q_text = DASH
+            delta_text = DASH
+        if eval_label == EVAL_SKIPPED and evaluation is not None and evaluation.reason:
+            eval_label = f"skipped:{evaluation.reason}"
+        work = summary.current_paper_title or "no recent paper"
+        lines.append(
+            f"{summary.label:<6} {status_mark(summary.research_status):<12} "
+            f"{eval_label:<12} {q_text:<7} {delta_text:<8} {ellipsize(work, 32)}"
+        )
+    if phase == PHASE_EVALUATION and len(lines) == 1:
+        lines.append("no evaluation recorded for this wave")
+    return lines
+
+
+def render_evaluation_state(state: RunViewState, agent_id: str, wave: int) -> list[str]:
+    evaluation = state.evaluation_state(wave, agent_id)
+    lines = [f"### Evaluation · {agent_label(state, agent_id)} (wave {wave})"]
+    if evaluation is None:
+        lines.append("no terminal evaluation recorded for this agent and wave")
+        return lines
+    lines.append(f"status: {evaluation.status}" + (f" ({evaluation.reason})" if evaluation.reason else ""))
+    for key in ("S", "P", "J", "R"):
+        value = evaluation.components.get(key)
+        if value is None:
+            reason = evaluation.unavailable.get(key, "unavailable")
+            lines.append(f"{key}: unavailable ({reason})")
+        else:
+            lines.append(f"{key}: {value:.4f}")
+    if evaluation.q is not None:
+        delta = f"{evaluation.q_delta:+.4f}" if evaluation.q_delta is not None else DASH
+        lines.append(f"Q: {evaluation.q:.4f}  Δ{delta}")
+    return lines
+
+
+def render_final_result(state: RunViewState) -> str:
+    lines = ["## Final result", ""]
+    lines.append(f"- Outcome: {state.outcome or UNAVAILABLE}")
+    lines.append(f"- Status: {status_label(state)}")
+    lines.append(
+        f"- Stop reason: {state.stop_reason or state.terminal_reason or UNAVAILABLE}"
+    )
+    lines.append(f"- Winner: {winner_label(state) or DASH}")
+    lines.append(f"- Best Q: {state.best_quality:.4f}")
+    lines.append(
+        f"- Waves: {state.total_waves or state.current_wave}  "
+        f"fetches: {state.fetches_used}/{state.max_fetches}  "
+        f"elapsed: {format_duration(state.elapsed_seconds)}  "
+        f"tokens: {state.token_usage if state.token_usage is not None else UNAVAILABLE}"
+    )
+    lines.append("")
+    lines.append("### Winning narrative")
+    narrative = state.narratives.get(state.winner_agent, "")
+    if narrative.strip():
+        lines.append(narrative)
+    else:
+        lines.append(
+            "_No winning narrative was produced;_ "
+            f"outcome is completed-degraded because {state.terminal_reason or 'the winner has no usable result'}."
+        )
+    lines.append("")
+    lines.append("### Winning evaluation")
+    latest = state.latest_evaluation(state.winner_agent) if state.winner_agent else None
+    if latest is not None:
+        lines.extend(render_evaluation_state(state, state.winner_agent, latest.wave))
+    else:
+        lines.append("no winner evaluation recorded")
+    failed = sum(
+        1 for record in state.evaluation_states.values() if record.status == EVAL_FAILED
+    )
+    skipped = sum(
+        1 for record in state.evaluation_states.values() if record.status == EVAL_SKIPPED
+    )
+    lines.append("")
+    lines.append(
+        f"### Quality gaps\n- failed evaluations: {failed}\n- skipped evaluations: {skipped}\n"
+        f"- warnings: {len(state.warnings)}  failures: {len(state.failures)}"
+    )
+    return "\n".join(lines)
+
 
 
 def render_paper_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | None) -> str:
@@ -1108,12 +1352,26 @@ def events_scope_agent(state: RunViewState, session: UISession) -> str:
     return session.selected_agent_id
 
 
-def render_tab_body(state: RunViewState, session: UISession, entry: TimelineEntry | None) -> str:
+def render_tab_body(
+    state: RunViewState,
+    session: UISession,
+    entry: TimelineEntry | None,
+    node: NavNode | None = None,
+) -> str:
     if session.active_tab == TAB_RESEARCH:
-        return render_research_tab(state, session.selected_agent_id, entry)
+        return render_research_tab(state, session.selected_agent_id, entry, node)
     if session.active_tab == TAB_PAPER:
         return render_paper_tab(state, session.selected_agent_id, entry)
     if session.active_tab == TAB_EVALUATION:
+        if (
+            node is not None
+            and node.kind == PHASE_NODE
+            and node.wave
+            and state.evaluation_state(node.wave, session.selected_agent_id) is not None
+        ):
+            return "\n".join(
+                render_evaluation_state(state, session.selected_agent_id, node.wave)
+            )
         return render_evaluation_tab(state, session.selected_agent_id)
     if session.active_tab == TAB_EVENTS:
         return render_events_tab(
@@ -1125,9 +1383,14 @@ def render_tab_body(state: RunViewState, session: UISession, entry: TimelineEntr
     return ""
 
 
-def render_reader(state: RunViewState, session: UISession, entry: TimelineEntry | None) -> tuple[str, str]:
+def render_reader(
+    state: RunViewState,
+    session: UISession,
+    entry: TimelineEntry | None,
+    node: NavNode | None = None,
+) -> tuple[str, str]:
     title = f"{tab_label(session.active_tab)} · {agent_label(state, session.selected_agent_id)}"
-    body = render_tab_body(state, session, entry)
+    body = render_tab_body(state, session, entry, node)
     if session.active_tab == TAB_EVENTS:
         return title, body
     caption = render_scope_caption(

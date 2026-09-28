@@ -21,7 +21,10 @@ from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.events.models import (
     OUTCOME_COMPLETED,
     OUTCOME_DEGRADED,
+    REASON_EMPTY_WINNER_NARRATIVE,
+    REASON_NO_EVALUATED_EVIDENCE,
     REASON_NO_WINNER,
+    REASON_WINNER_EVALUATION_MISSING,
     STATUS_RUNNING,
     reason_text,
 )
@@ -58,6 +61,7 @@ class Orchestrator:
         self.run_id: str = ""
         self.outcome: str = OUTCOME_COMPLETED
         self.terminal_reason: str = ""
+        self.stop_reason: str = ""
         configure_logging(config.log_level)
 
         # Storage
@@ -209,6 +213,8 @@ class Orchestrator:
         )
 
         # 1. Fetch the seed paper and cache it
+        setup_started = time.monotonic()
+        tracer.emit("wave_phase_started", oleada=0, phase="setup", selected=[])
         tracer.emit("seed_routing_started", seed=seed_paper_id)
         tracer.emit(
             "seed_routed",
@@ -233,8 +239,19 @@ class Orchestrator:
             seed=seed_nid,
             agents=[a.state.id for a in self.colony.agents],
         )
+        tracer.emit(
+            "wave_phase_completed",
+            oleada=0,
+            phase="setup",
+            selected=[],
+            completed=[],
+            failed=[],
+            skipped=[],
+            elapsed=round(time.monotonic() - setup_started, 1),
+        )
 
         # 3. Run oleadas until convergence
+        stop_reason = ""
         while not self.convergence.should_stop(
             self.colony.best_quality,
             self.scheduler.total_fetches,
@@ -245,7 +262,11 @@ class Orchestrator:
             # Check if all agents are exhausted
             if not self.colony.active_candidates():
                 log.info("all_agents_exhausted")
+                stop_reason = "all_agents_exhausted"
                 break
+        if not stop_reason:
+            stop_reason = getattr(self.convergence, "last_reason", "") or "converged"
+        self.stop_reason = stop_reason
 
         # 4. Final event/artifact before marking run complete
         winner = self.colony.best_agent
@@ -276,41 +297,85 @@ class Orchestrator:
                 reason_code=reason_code or REASON_NO_WINNER,
                 reason=reason,
                 elapsed=round(self._elapsed, 1),
+                stop_reason=stop_reason,
                 total_fetches=self.scheduler.total_fetches,
                 total_waves=self.scheduler.oleada_count,
             )
         else:
-            self.outcome = OUTCOME_COMPLETED
-            self.terminal_reason = ""
-            log.info(
-                "orchestrator_complete",
-                winner=self.colony.best_snapshot_agent,
-                best_Q=winner.state.quality,
-                peak_Q=self.colony.best_quality,
-                snapshot_oleada=self.colony.best_snapshot_oleada,
-                total_fetches=self.scheduler.total_fetches,
-                oleadas=self.scheduler.oleada_count,
-                elapsed=self._elapsed,
-            )
-            tracer.emit(
-                "orchestrator_complete",
-                run_id=run_id,
-                status="completed",
-                outcome=OUTCOME_COMPLETED,
-                winner=self.colony.best_snapshot_agent,
-                best_Q=round(winner.state.quality, 4),
-                peak_Q=round(self.colony.best_quality, 4),
-                snapshot_oleada=self.colony.best_snapshot_oleada,
-                total_fetches=self.scheduler.total_fetches,
-                total_waves=self.scheduler.oleada_count,
-                oleadas=self.scheduler.oleada_count,
-                elapsed=round(self._elapsed, 1),
-            )
-            tracer.record_artifact(
-                f"narrative_{self.colony.best_snapshot_agent}.md",
-                "narrative",
-                self.colony.best_narrative,
-            )
+            winner_id = self.colony.best_snapshot_agent or winner.state.id
+            narrative = (self.colony.best_narrative or "").strip()
+            degraded_reason = self._outcome_gap(winner_id, narrative)
+            if degraded_reason:
+                self.outcome = OUTCOME_DEGRADED
+                self.terminal_reason = reason_text(degraded_reason)
+                log.warning(
+                    "completed_degraded",
+                    reason_code=degraded_reason,
+                    winner=winner_id,
+                )
+                tracer.emit(
+                    "warning",
+                    run_id=run_id,
+                    classification="warning",
+                    outcome=OUTCOME_DEGRADED,
+                    reason_code=degraded_reason,
+                    reason=self.terminal_reason,
+                    winner=winner_id,
+                    elapsed=round(self._elapsed, 1),
+                )
+                tracer.emit(
+                    "orchestrator_complete",
+                    run_id=run_id,
+                    status="completed",
+                    outcome=OUTCOME_DEGRADED,
+                    reason_code=degraded_reason,
+                    reason=self.terminal_reason,
+                    winner=winner_id,
+                    best_Q=round(winner.state.quality, 4),
+                    peak_Q=round(self.colony.best_quality, 4),
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    stop_reason=stop_reason,
+                    total_fetches=self.scheduler.total_fetches,
+                    total_waves=self.scheduler.oleada_count,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=round(self._elapsed, 1),
+                )
+                if narrative:
+                    tracer.record_artifact(f"narrative_{winner_id}.md", "narrative", narrative)
+            else:
+                self.outcome = OUTCOME_COMPLETED
+                self.terminal_reason = ""
+                log.info(
+                    "orchestrator_complete",
+                    winner=winner_id,
+                    best_Q=winner.state.quality,
+                    peak_Q=self.colony.best_quality,
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    total_fetches=self.scheduler.total_fetches,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=self._elapsed,
+                    stop_reason=stop_reason,
+                )
+                tracer.emit(
+                    "orchestrator_complete",
+                    run_id=run_id,
+                    status="completed",
+                    outcome=OUTCOME_COMPLETED,
+                    winner=winner_id,
+                    best_Q=round(winner.state.quality, 4),
+                    peak_Q=round(self.colony.best_quality, 4),
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    stop_reason=stop_reason,
+                    total_fetches=self.scheduler.total_fetches,
+                    total_waves=self.scheduler.oleada_count,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=round(self._elapsed, 1),
+                )
+                tracer.record_artifact(
+                    f"narrative_{winner_id}.md",
+                    "narrative",
+                    narrative,
+                )
 
         self.trace.finish_run(
             run_id,
@@ -318,6 +383,24 @@ class Orchestrator:
             best_quality=round(self.colony.best_quality, 6),
         )
         return self.colony.best_narrative if winner is not None else ""
+
+    def _outcome_gap(self, winner_id: str, narrative: str) -> str:
+        """Return the stable degraded reason for an otherwise-completed run.
+
+        A normal success requires a non-empty narrative, at least one
+        evidence-bearing evaluated turn, and a terminal evaluation for the
+        winner. Anything else is surfaced as ``completed``/``degraded`` rather
+        than as a fabricated success.
+        """
+        if not narrative:
+            return REASON_EMPTY_WINNER_NARRATIVE
+        evaluations = getattr(self.scheduler, "evaluations", []) or []
+        completed = [r for r in evaluations if getattr(r, "status", "complete") == "complete"]
+        if not any(getattr(r, "new_papers", []) for r in completed):
+            return REASON_NO_EVALUATED_EVIDENCE
+        if not any(r.agent_id == winner_id for r in completed):
+            return REASON_WINNER_EVALUATION_MISSING
+        return ""
 
     def mark_cancelled(self) -> None:
         """Persist a distinct ``cancelled`` status for the active run.
@@ -349,6 +432,7 @@ class Orchestrator:
             elapsed=getattr(self, "_elapsed", 0.0),
             outcome=self.outcome,
             terminal_reason=self.terminal_reason,
+            stop_reason=self.stop_reason,
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:

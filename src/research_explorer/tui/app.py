@@ -41,8 +41,8 @@ from research_explorer.events.models import (
 from research_explorer.events.navigation import (
     NavNode,
     active_agent_id,
-    active_leaf_entry,
-    build_agent_navigation,
+    active_phase_node_id,
+    build_wave_navigation,
     find_node,
     flatten_navigation,
     parent_ids,
@@ -365,6 +365,10 @@ class ResearchTUIApp(App[None]):
         return None
 
     @property
+    def selected_node(self) -> NavNode | None:
+        return find_node(self._tree_nodes, self.session.selected_node_id)
+
+    @property
     def agent_roster_text(self) -> str:
         return str(render.render_agent_roster(self.state))
 
@@ -547,7 +551,7 @@ class ResearchTUIApp(App[None]):
             )
         )
 
-        roots = build_agent_navigation(state)
+        roots = build_wave_navigation(state)
         self._tree_nodes = roots
         self._ensure_selection(roots)
         self._render_tree(roots)
@@ -569,7 +573,9 @@ class ResearchTUIApp(App[None]):
         self._render_status_banner()
         self._sync_tabbar()
         self.query_one("#content", Markdown).update(
-            render.render_tab_body(state, self.session, self.selected_entry)
+            render.render_tab_body(
+                state, self.session, self.selected_entry, self.selected_node
+            )
         )
         self.query_one("#footer", FooterBar).set_text(
             render.render_footer_text(state, self.session, self._settling)
@@ -590,20 +596,25 @@ class ResearchTUIApp(App[None]):
             self.session.selected_agent_id = ""
             self.session.selected_node_id = None
             return
-        agent_ids = {node.agent_id for node in roots}
-        if self.session.selected_agent_id not in agent_ids:
-            self.session.selected_agent_id = active_agent_id(self.state) or roots[0].agent_id
+        agent_ids = set(self.state.agent_order)
+        if (
+            not self.session.selected_agent_id
+            or self.session.selected_agent_id not in agent_ids
+        ):
+            fallback = self.state.agent_order[0] if self.state.agent_order else ""
+            self.session.selected_agent_id = active_agent_id(self.state) or fallback
         if self.session.follow_live:
             self._follow(roots)
         elif find_node(roots, self.session.selected_node_id) is None:
-            self.session.selected_node_id = f"agent:{self.session.selected_agent_id}"
+            self.session.selected_node_id = active_phase_node_id(self.state)
 
     def _follow(self, roots: list[NavNode]) -> None:
         agent_id = active_agent_id(self.state)
         if agent_id:
             self.session.selected_agent_id = agent_id
-        node_id = active_leaf_entry(self.state, agent_id) or f"agent:{agent_id}"
+        node_id = active_phase_node_id(self.state)
         self.session.selected_node_id = node_id
+        self.session.expanded.add(node_id)
         parents = parent_ids(roots)
         cursor = node_id
         guard = 0
@@ -787,7 +798,9 @@ class ResearchTUIApp(App[None]):
         self.push_screen(TextViewer(title, body))
 
     def action_open_reader(self) -> None:
-        title, body = render.render_reader(self.state, self.session, self.selected_entry)
+        title, body = render.render_reader(
+            self.state, self.session, self.selected_entry, self.selected_node
+        )
         self._open_viewer(title, body)
 
     def action_view_evaluation(self) -> None:

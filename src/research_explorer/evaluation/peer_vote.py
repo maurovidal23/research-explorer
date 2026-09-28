@@ -13,6 +13,7 @@ from research_explorer.agents.explorer import ExplorerAgent
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import peer_vote
 from research_explorer.config import Config
+from research_explorer.evaluation import availability
 from research_explorer.graph.models import Paper
 from research_explorer.logging_setup import get_logger
 from research_explorer.replay.models import PeerVoteDetail, PeerVotesDetail
@@ -98,6 +99,8 @@ class PeerVoting:
                 aggregated_score=0.0,
                 aggregation_method=method,
                 num_votes=0,
+                available=False,
+                unavailable_reason=availability.REASON_NO_PEERS,
             )
 
         new_papers = new_papers or []
@@ -113,6 +116,8 @@ class PeerVoting:
                 aggregated_score=0.0,
                 aggregation_method=method,
                 num_votes=0,
+                available=False,
+                unavailable_reason=availability.REASON_MODEL_FAILED,
             )
 
         scores = [v.score for v in votes]

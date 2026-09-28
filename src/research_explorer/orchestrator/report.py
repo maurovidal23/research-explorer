@@ -43,6 +43,7 @@ def build_report(
     elapsed: float,
     outcome: str = OUTCOME_COMPLETED,
     terminal_reason: str = "",
+    stop_reason: str = "",
 ) -> str:
     parts: list[str] = []
 
@@ -69,17 +70,23 @@ def build_report(
     parts.append(f"- **Total fetches:** {scheduler.total_fetches}")
     parts.append(f"- **Elapsed:** {elapsed:.1f}s ({elapsed / 60:.1f} min)")
     parts.append(f"- **Active agents at end:** {len(colony.active_candidates())}")
+    if stop_reason:
+        parts.append(f"- **Stop reason:** {stop_reason}")
     if terminal_reason:
         parts.append(f"- **Terminal reason:** {terminal_reason}")
     parts.append("")
 
     # ---- Winning narrative ----------------------------------------------
     parts.append("## Winning Narrative\n")
-    if colony.best_narrative:
+    if colony.best_narrative and colony.best_narrative.strip():
         parts.append(colony.best_narrative)
     else:
         parts.append("No winning narrative was produced.")
-        if terminal_reason:
+        if outcome == "degraded":
+            parts.append(
+                f"Outcome: completed (degraded). Reason: {terminal_reason or 'unknown'}."
+            )
+        elif terminal_reason:
             parts.append(f"Reason: {terminal_reason}.")
     parts.append("")
 
