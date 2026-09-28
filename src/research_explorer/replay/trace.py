@@ -35,14 +35,6 @@ log = get_logger("replay.trace")
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 HEARTBEAT_STALE_SECONDS = 120.0
 
-_HEARTBEAT_MIGRATIONS: dict[str, str] = {
-    "process_id": "INTEGER",
-    "host_id": "TEXT",
-    "heartbeat_at": "TEXT",
-    "heartbeat_state": "TEXT",
-    "interrupt_reason": "TEXT",
-}
-
 
 def local_host_id() -> str:
     return socket.gethostname()
@@ -172,15 +164,24 @@ class RunTraceStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
-        self._migrate_heartbeat()
+        self._migrate()
         self._conn.commit()
 
-    def _migrate_heartbeat(self) -> None:
-        """Additively add heartbeat columns so old databases stay readable."""
-        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
-        for column, ddl in _HEARTBEAT_MIGRATIONS.items():
-            if column not in existing:
-                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")
+    def _migrate(self) -> None:
+        """Idempotent additive migrations; preserves pre-existing databases."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")
+        }
+        additions = {
+            "process_id": "INTEGER",
+            "host_id": "TEXT",
+            "heartbeat_at": "TEXT",
+            "heartbeat_state": "TEXT",
+            "interrupt_reason": "TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self._conn.close()

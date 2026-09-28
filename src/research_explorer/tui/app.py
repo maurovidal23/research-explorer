@@ -30,12 +30,9 @@ from textual.widgets import Input, ListItem, ListView, Markdown, Static, Tab, Ta
 
 from research_explorer.events.limits import TUI_REFRESH_INTERVAL_SECONDS
 from research_explorer.events.models import (
-    STATUS_CANCELLED,
-    STATUS_COMPLETED,
     STATUS_EVALUATING,
-    STATUS_FAILED,
-    STATUS_INTERRUPTED,
     STATUS_RUNNING,
+    TERMINAL_STATUSES,
     EventType,
     RunEvent,
     RunViewState,
@@ -866,12 +863,7 @@ class ResearchTUIApp(App[None]):
     # ---- quit / cancellation ---------------------------------------------
 
     def _terminal(self) -> bool:
-        return self.state.status in (
-            STATUS_COMPLETED,
-            STATUS_CANCELLED,
-            STATUS_FAILED,
-            STATUS_INTERRUPTED,
-        )
+        return self.state.status in TERMINAL_STATUSES
 
     def action_close_view(self) -> None:
         if self.screen is not self.screen_stack[0]:

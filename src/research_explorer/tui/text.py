@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from rich.text import Text
 
-from research_explorer.events.limits import EVENT_PAGE_SIZE
+from research_explorer.events.limits import CANDIDATE_TOP_ALTERNATIVES, EVENT_PAGE_SIZE
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_COMPLETED,
@@ -22,6 +22,7 @@ from research_explorer.events.models import (
     STATUS_EVALUATING,
     STATUS_FAILED,
     STATUS_INTERRUPTED,
+    TERMINAL_STATUSES,
     AgentSummary,
     EventType,
     RunEvent,
@@ -885,15 +886,9 @@ def render_tab_bar(session: UISession) -> Text:
 
 def render_footer_text(state: RunViewState, session: UISession, settling: bool = False) -> Text:
     text = Text()
-    terminal = (
-        STATUS_COMPLETED,
-        STATUS_CANCELLED,
-        STATUS_FAILED,
-        STATUS_INTERRUPTED,
-    )
-    if settling and state.status not in terminal:
+    if settling and state.status not in TERMINAL_STATUSES:
         text.append(" cancellation requested; settling… ", style=f"bold {theme.COLOR_WARN}")
-    if state.status in terminal:
+    if state.status in TERMINAL_STATUSES:
         text.append(f" {status_label(state)} ", style=f"bold {theme.COLOR_ACCENT}")
         text.append("press "
                     "q to exit  ? for help  Ctrl+P for commands", style=theme.COLOR_MUTED)
@@ -972,7 +967,9 @@ def render_paper_tab(state: RunViewState, agent_id: str, entry: TimelineEntry | 
     if not frontier:
         lines.append("no recorded frontier candidates")
     else:
-        for candidate in sorted(frontier, key=lambda c: c.eta, reverse=True)[:12]:
+        for candidate in sorted(frontier, key=lambda c: c.eta, reverse=True)[
+            :CANDIDATE_TOP_ALTERNATIVES
+        ]:
             marker = "chosen" if any(
                 s.paper_id == candidate.paper_id for s in state.selections
             ) else "candidate"

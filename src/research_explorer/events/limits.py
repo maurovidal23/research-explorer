@@ -1,9 +1,10 @@
 """Centralized memory bounds and cadences for the live run projection.
 
 SQLite remains the authoritative, complete history. These limits bound only the
-in-memory projection windows and the number of rows the Events tab renders per
-page, so a multi-hour run stays within a predictable memory envelope. Live and
-replay projection share these defaults so equivalent inputs compact
+in-memory projection windows, the number of rows the Events tab renders per
+page, the candidate alternatives shown per decision, and the live render
+cadence, so a multi-hour run stays within a predictable memory envelope. Live
+and replay projection share these defaults so equivalent inputs compact
 deterministically.
 """
 

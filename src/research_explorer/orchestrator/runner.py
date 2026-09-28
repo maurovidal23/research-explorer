@@ -174,7 +174,7 @@ class Orchestrator:
                 self.trace.heartbeat(self.run_id)
 
     async def _stop_heartbeat(self) -> None:
-        task = getattr(self, "_heartbeat_task", None)
+        task = self._heartbeat_task
         if task is None:
             return
         self._heartbeat_task = None
