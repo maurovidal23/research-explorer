@@ -6,6 +6,7 @@ from research_explorer.events.limits import LIVE_CANDIDATE_WINDOW, LIVE_EVENT_WI
 from research_explorer.events.models import RunEvent
 from research_explorer.events.projection import RunProjection
 from research_explorer.tui import TUIController, build_app
+from research_explorer.tui import text as render
 
 MAX_REFRESHES = 100
 
@@ -155,3 +156,95 @@ async def test_pilot_stress_keeps_queue_rows_and_markdown_bounded(monkeypatch) -
         body = str(app.query_one("#content").source)
         assert len(body) < 200_000
         assert body.count("- `[") <= 200
+
+
+async def test_events_page_navigation_clamps_and_filter_resets() -> None:
+    app = build_app(RunProjection.from_events(_base_events()))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        for seq in range(100, 650):
+            app.projection.apply(_score(seq))
+        app.refresh_view()
+        await pilot.pause()
+
+        scoped = render.filter_events(
+            app.state, app._events_scope_agent(), app.session.event_outcome
+        )
+        last_page = render.event_page_count(len(scoped)) - 1
+        assert last_page >= 2
+        assert app.session.event_page == 0
+
+        app.action_events_older()
+        await pilot.pause()
+        assert app.session.event_page == 1
+        app.action_events_older()
+        app.action_events_older()
+        await pilot.pause()
+        assert app.session.event_page == last_page
+        app.action_events_older()
+        await pilot.pause()
+        assert app.session.event_page == last_page
+
+        app.action_events_newer()
+        await pilot.pause()
+        assert app.session.event_page == last_page - 1
+
+        app.action_cycle_event_outcome()
+        await pilot.pause()
+        assert app.session.event_page == 0
+        app.session.event_page = last_page
+        app.action_cycle_event_agent()
+        await pilot.pause()
+        assert app.session.event_page == 0
+
+
+async def test_events_outcome_filter_is_deterministic() -> None:
+    app = build_app(RunProjection.from_events(_base_events()))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        for seq in range(700, 900):
+            app.projection.apply(_score(seq))
+        app.projection.apply(
+            RunEvent(seq=901, type="run_failed", payload={"agent_id": "a0", "error": "boom"})
+        )
+        app.refresh_view()
+        await pilot.pause()
+        errors = render.filter_events(app.state, "", "error")
+        assert [e.seq for e in errors] == [901]
+        first = render.render_events_tab(app.state, outcome="error")
+        second = render.render_events_tab(app.state, outcome="error")
+        assert first == second
+        assert "outcome=error" in first
+
+
+async def test_interrupted_event_is_terminal_and_flushes_immediately() -> None:
+    controller = TUIController()
+    app = build_app(RunProjection.from_events(_base_events()), queue=controller.queue)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        controller.event_sink.publish(
+            RunEvent(seq=50, type="run_interrupted", payload={"reason": "heartbeat stale"})
+        )
+        await _drain(
+            pilot,
+            app,
+            controller,
+            lambda: app.state.status == "interrupted" and app._refresh_timer is None,
+        )
+        assert app.state.status == "interrupted"
+        assert app._refresh_timer is None
+        assert app._durable_terminal_received() is True
+        assert app._terminal() is True
+
+
+async def test_shutdown_cancels_scheduled_refresh_and_releases_workers() -> None:
+    app = build_app(RunProjection.from_events(_base_events()))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        app._schedule_refresh()
+        assert app._refresh_timer is not None
+        app.on_unmount()
+        assert app._refresh_timer is None
+        assert app._consumer_worker is None
+        assert app._runner_worker is None
+

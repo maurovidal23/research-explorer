@@ -10,6 +10,7 @@ import pytest
 
 from research_explorer.events.models import STATUS_INTERRUPTED, RunEvent
 from research_explorer.events.projection import RunProjection
+from research_explorer.replay.models import DetailedEvaluation
 from research_explorer.replay.trace import RunTraceStore, local_host_id
 from research_explorer.tui import text as render
 from research_explorer.tui.replay import apply_reconciled_status
@@ -156,6 +157,85 @@ def test_durable_trace_preserved_after_reconciliation(store: RunTraceStore) -> N
     assert len(events) == 20
     assert [e["seq"] for e in events] == list(range(1, 21))
     assert "candidate_score" in {e["type"] for e in events}
+
+
+def test_reconcile_ignores_terminal_and_non_active_rows(store: RunTraceStore) -> None:
+    completed = store.create_run("seed", "q")
+    store.start_heartbeat(completed, process_id=999_999, host_id=local_host_id())
+    store.finish_run(completed, "completed", best_quality=0.7)
+
+    failed = store.create_run("seed", "q")
+    store.start_heartbeat(failed, process_id=999_999, host_id=local_host_id())
+    store.finish_run(failed, "failed")
+
+    assert store.reconcile_stale_runs(pid_alive=lambda pid: False) == []
+    assert store.get_run(completed, reconcile=False)["status"] == "completed"
+    assert store.get_run(failed, reconcile=False)["status"] == "failed"
+
+
+def test_heartbeat_only_refreshes_active_runs(store: RunTraceStore) -> None:
+    run_id = store.create_run("seed", "q")
+    store.start_heartbeat(run_id, process_id=os.getpid(), host_id=local_host_id())
+    first = store.heartbeat_state(run_id)["heartbeat_at"]
+
+    store.heartbeat(run_id)
+    refreshed = store.heartbeat_state(run_id)["heartbeat_at"]
+    assert refreshed is not None and refreshed >= first
+
+    store.finish_run(run_id, "completed")
+    store.heartbeat(run_id)
+    assert store.heartbeat_state(run_id)["heartbeat_at"] is None
+
+    other = store.create_run("seed", "q")
+    store.heartbeat(other)
+    assert store.heartbeat_state(other)["heartbeat_at"] is None
+
+
+def test_reconcile_preserves_evaluations_artifacts_and_events(store: RunTraceStore) -> None:
+    run_id = store.create_run("seed", "q")
+    store.append_event(run_id, "orchestrator_start", {"run_id": run_id})
+    store.save_evaluation(
+        run_id,
+        DetailedEvaluation(agent_id="a0", oleada=1, turn=0, q=0.5),
+    )
+    artifact_id = store.save_artifact(run_id, "narrative_a0.md", "narrative", "text")
+    store.start_heartbeat(run_id, process_id=999_999, host_id=local_host_id())
+
+    assert store.reconcile_stale_runs(pid_alive=lambda pid: False) == [run_id]
+    run = store.get_run(run_id, reconcile=False)
+    assert run["status"] == STATUS_INTERRUPTED
+    assert run["event_count"] == 1
+    assert run["evaluation_count"] == 1
+    assert len(store.list_events(run_id)) == 1
+    assert [e.agent_id for e in store.list_evaluations(run_id)] == ["a0"]
+    assert store.get_artifact(artifact_id) is not None
+    assert [a["name"] for a in store.list_artifacts(run_id)] == ["narrative_a0.md"]
+
+
+def test_list_and_get_run_reconcile_by_default(store: RunTraceStore) -> None:
+    run_id = store.create_run("seed", "q")
+    store.start_heartbeat(run_id, process_id=999_999, host_id=local_host_id())
+
+    run = store.get_run(run_id)
+    assert run is not None and run["status"] == STATUS_INTERRUPTED
+    assert run["interrupt_reason"]
+
+    listed = store.list_runs()
+    assert [r["run_id"] for r in listed] == [run_id]
+    assert listed[0]["status"] == STATUS_INTERRUPTED
+
+
+def test_apply_reconciled_status_ignores_non_interrupted_run(store: RunTraceStore) -> None:
+    run_id = store.create_run("seed", "q")
+    store.append_event(run_id, "orchestrator_start", {"run_id": run_id})
+    store.append_event(run_id, "run_completed", {"run_id": run_id, "status": "completed"})
+    store.finish_run(run_id, "completed")
+    run = store.get_run(run_id, reconcile=False)
+    assert run is not None and run["status"] == "completed"
+
+    projection = RunProjection.from_events(store.list_events(run_id))
+    apply_reconciled_status(projection, run)
+    assert projection.state.status == "completed"
 
 
 def test_run_event_supports_interrupted_type() -> None:

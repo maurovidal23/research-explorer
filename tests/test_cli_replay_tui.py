@@ -7,7 +7,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from research_explorer.cli import app
-from research_explorer.replay.trace import RunTracer, RunTraceStore
+from research_explorer.replay.trace import RunTracer, RunTraceStore, local_host_id
 
 runner = CliRunner()
 
@@ -143,3 +143,49 @@ def test_replay_tui_projects_failed_and_cancelled_status(tmp_path, monkeypatch) 
         result = runner.invoke(app, ["replay", "tui", run_id, "--db", str(db)])
         assert result.exit_code == 0, result.output
         assert captured["projection"].state.status == status
+
+
+def _seed_stale_run(db: Path) -> str:
+    store = RunTraceStore(db)
+    run_id = store.create_run("seed", "q")
+    tracer = RunTracer(store, run_id)
+    tracer.emit("orchestrator_start", run_id=run_id, colony_size=1, K=1)
+    tracer.emit("candidate_score", paper_id="p1", agent_id="a0", eta=0.5)
+    store.start_heartbeat(run_id, process_id=999_999, host_id=local_host_id())
+    store.reconcile_stale_runs(pid_alive=lambda pid: False)
+    store.close()
+    return run_id
+
+
+def test_replay_tui_projects_reconciled_interrupted_status(tmp_path, monkeypatch) -> None:
+    captured: dict = {}
+
+    class _FakeApp:
+        def __init__(self, projection, read_only=False):
+            captured["projection"] = projection
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("research_explorer.tui.build_app", _FakeApp)
+    db = tmp_path / "interrupted.db"
+    run_id = _seed_stale_run(db)
+
+    result = runner.invoke(app, ["replay", "tui", run_id, "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    state = captured["projection"].state
+    assert state.status == "interrupted"
+    assert state.winner_agent == ""
+    assert state.terminal_reason
+
+
+def test_replay_show_reports_last_activity_and_interrupt_reason(tmp_path) -> None:
+    db = tmp_path / "interrupted.db"
+    run_id = _seed_stale_run(db)
+
+    result = runner.invoke(app, ["replay", "show", run_id, "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert "last_activity=" in result.output
+    assert "last_operation=" in result.output
+    assert "interrupted:" in result.output
+
