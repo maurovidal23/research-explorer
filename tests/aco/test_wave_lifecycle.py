@@ -9,6 +9,12 @@ import pytest
 from research_explorer.aco.scheduler import Scheduler
 from research_explorer.agents.state import AgentState
 from research_explorer.config import Config
+from research_explorer.events.models import (
+    PHASE_DECISION,
+    PHASE_EVALUATION,
+    PHASE_RESEARCH,
+)
+from research_explorer.events.projection import RunProjection
 from research_explorer.replay.models import (
     DetailedEvaluation,
     PeerVoteDetail,
@@ -18,6 +24,7 @@ from research_explorer.replay.models import (
     VirginJudgeDetail,
 )
 from research_explorer.replay.trace import RunTracer, RunTraceStore
+from research_explorer.tui import text as render
 
 
 class FakePheromone:
@@ -295,4 +302,74 @@ async def test_decision_mutations_happen_after_evaluation_barrier(tmp_path) -> N
     assert "ranking" in decision["payload"] and "budget_used" in decision["payload"]
     assert "converged" in decision["payload"]
     assert "pheromone_concentration" in decision["payload"]
+    store.close()
+
+
+async def test_scheduler_durable_events_reconstruct_wave_view(tmp_path) -> None:
+    """The scheduler's durable telemetry must replay into the wave-first view.
+
+    This pins the wire contract between the phase/evaluation events the scheduler
+    emits and the projection the TUI/replay consume. The lifecycle tests assert
+    the emitted payloads and the projection tests assert hand-crafted events, so
+    without this test a field rename on either side would stay green.
+    """
+    store = RunTraceStore(tmp_path / "replay.db")
+    run_id = store.create_run("seed", "research line")
+    tracer = RunTracer(store, run_id)
+    agents = [_agent("a0"), _agent("a1")]
+    for agent in agents:
+        async def take_turn(k, agent=agent):
+            return [("seed", f"paper-{agent.state.id}", "ref")]
+
+        agent.take_turn = take_turn
+
+    async def assess(agent, active_agents, seed_query, new_papers=None, oleada=0):
+        record = _record(agent, oleada, 0.4)
+        record.self_assessment.available = False
+        record.self_assessment.unavailable_reason = "empty_narrative"
+        record.peers.available = False
+        record.peers.unavailable_reason = "no_peers"
+        record.virgin_judge.available = False
+        record.virgin_judge.unavailable_reason = "empty_narrative"
+        record.unavailable = {
+            "S": "empty_narrative",
+            "P": "no_peers",
+            "J": "empty_narrative",
+        }
+        return record
+
+    scheduler, store, run_id = _scheduler(tmp_path, agents, tracer, assess)
+    await scheduler.run_oleada()
+
+    state = RunProjection.from_events(store.list_events(run_id)).state
+
+    research = state.phase(1, PHASE_RESEARCH)
+    assert research is not None
+    assert research.completed == ["a0", "a1"]
+    assert research.papers_attempted == 2
+    assert research.evidence_added == 2
+
+    evaluation = state.phase(1, PHASE_EVALUATION)
+    assert evaluation is not None and evaluation.best_q == 0.4
+    decision = state.phase(1, PHASE_DECISION)
+    assert decision is not None and decision.leader == "a0"
+    assert decision.continue_reason == "budget_remaining"
+
+    record = state.evaluation_state(1, "a0")
+    assert record is not None and record.status == "complete"
+    assert record.components["R"] == 0.4
+    assert record.components["S"] is None
+    assert record.unavailable["S"] == "empty_narrative"
+    assert record.q == 0.4
+
+    # The TUI must distinguish unavailable components from a numeric zero and
+    # show the evaluation status per agent in the phase table.
+    detail = "\n".join(render.render_evaluation_state(state, "a0", 1))
+    assert "S: unavailable (empty_narrative)" in detail
+    assert "R: 0.4000" in detail
+    table = "\n".join(render.render_phase_agent_table(state, 1))
+    assert "A01" in table and "complete" in table and "0.400" in table
+    summary = "\n".join(render.render_wave_summary(state, 1))
+    assert "best Q 0.400" in summary
+    assert "budget_remaining" in summary
     store.close()

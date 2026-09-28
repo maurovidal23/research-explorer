@@ -88,6 +88,23 @@ async def test_live_summary_shows_phase_progress_leader_and_budget() -> None:
         assert "budget_remaining" in wave_row
 
 
+async def test_wave_detail_shows_agent_evaluation_status_and_q_delta() -> None:
+    app = build_app(RunProjection.from_events(_events(terminal=False)))
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("left")
+        await pilot.pause()
+        wave = next(node for node in app._tree_nodes if node.node_id == "wave:1")
+        app._on_tree_select(wave)
+        await pilot.pause()
+        content = str(app.query_one("#content").source)
+        assert "### Agents" in content
+        assert "A01" in content and "complete" in content and "0.400" in content
+        assert "A02" in content and "skipped (no_new_evidence)" in content
+        assert "best Q 0.400" in content
+        assert "budget_remaining" in content
+
+
 async def test_terminal_defaults_to_final_result_and_keeps_wave_drilldown() -> None:
     app = build_app(RunProjection.from_events(_events(terminal=True)))
     async with app.run_test(size=(140, 40)) as pilot:

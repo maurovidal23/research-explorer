@@ -172,6 +172,10 @@ def test_empty_narrative_regression_is_unmistakable_in_tui() -> None:
     assert state.outcome == OUTCOME_DEGRADED
     assert state.reason_code == REASON_EMPTY_WINNER_NARRATIVE
 
+    mapping = state.entry_by_id("reference:arxiv:seed")
+    assert mapping is not None and mapping.kind == "reference_mapping"
+    assert "observed=3" in mapping.label
+
     final_body = render.render_final_result(state)
     assert "No winning narrative" in final_body
     assert "no usable narrative" in final_body

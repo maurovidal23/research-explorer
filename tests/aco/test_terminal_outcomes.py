@@ -157,10 +157,20 @@ async def test_completed_but_degraded_outcomes(tmp_path, narrative, evaluations,
     assert state.reason_code == expected
     assert expected in render.render_metadata(state)
     assert "degraded" in render.render_header(state)
+    final_body = render.render_final_result(state)
+    assert "- Outcome: degraded" in final_body
+    if narrative:
+        assert narrative in final_body
+    else:
+        assert "No winning narrative" in final_body
+        assert reason_text(expected) in final_body
 
     report = orch.generate_report(SEED, "graph attention")
     assert "**Outcome:** degraded" in report
     assert f"**Terminal reason:** {reason_text(expected)}" in report
+    if not narrative:
+        assert "No winning narrative was produced." in report
+        assert "completed (degraded)" in report
     graph.close()
     store.close()
 
@@ -179,5 +189,19 @@ async def test_valid_narrative_and_terminal_evaluation_stay_completed(tmp_path) 
     )
     assert complete["payload"]["outcome"] == OUTCOME_COMPLETED
     assert complete["payload"]["stop_reason"] == "budget_exhausted"
+
+    state = RunProjection.from_events(
+        [
+            RunEvent(seq=e["seq"], type=e["type"], payload=e["payload"], ts=e["ts"])
+            for e in store.list_events(run_id)
+        ]
+    ).state
+    assert state.outcome == OUTCOME_COMPLETED
+    assert state.reason_code == ""
+    report = orch.generate_report(SEED, "graph attention")
+    assert "**Outcome:** completed" in report
+    assert "**Terminal reason:**" not in report
+    assert "degraded" not in report
+    assert "a valid narrative" in report
     graph.close()
     store.close()
