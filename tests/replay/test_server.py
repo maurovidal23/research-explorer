@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -88,6 +89,31 @@ async def test_get_run(client):
     res = await c.get(f"/api/runs/{run_id}")
     assert res.status_code == 200
     assert res.json()["status"] == "completed"
+
+
+async def test_run_endpoints_omit_local_heartbeat_identity(tmp_path):
+    heartbeat_fields = {
+        "process_id",
+        "host_id",
+        "heartbeat_at",
+        "heartbeat_state",
+        "interrupt_reason",
+    }
+    db = tmp_path / "replay.db"
+    store = RunTraceStore(db)
+    run_id = store.create_run("seed", "q")
+    store.start_heartbeat(run_id, process_id=os.getpid(), host_id="some-host")
+    store.close()
+
+    app = build_app(db)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        detail = (await c.get(f"/api/runs/{run_id}")).json()
+        listing = (await c.get("/api/runs")).json()[0]
+
+    for payload in (detail, listing):
+        assert payload["status"] == "running"
+        assert heartbeat_fields.isdisjoint(payload.keys())
 
 
 async def test_events_ordered(client):
