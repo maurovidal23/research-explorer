@@ -354,9 +354,11 @@ class ArxivProvider(ResilientProvider):
         return [c for c in categories if c]
 
     def _parse_summary(self, entry: ET.Element) -> PaperSummary:
+        arxiv_id = self._extract_id(entry)
         return PaperSummary(
-            id=self._extract_id(entry),
+            id=arxiv_id,
             doi=self._find_text(entry, "arxiv:doi"),
+            arxiv_id=arxiv_id,
             title=self._clean_text(self._find_text(entry, "atom:title")),
             year=self._extract_year(entry),
             authors=self._extract_authors(entry),
@@ -374,6 +376,7 @@ class ArxivProvider(ResilientProvider):
         return Paper(
             id=arxiv_id,
             doi=doi or None,
+            arxiv_id=arxiv_id,
             title=self._clean_text(self._find_text(entry, "atom:title")),
             year=self._extract_year(entry),
             authors=self._extract_authors(entry),
