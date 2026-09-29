@@ -176,6 +176,8 @@ class ExamItem(BaseModel):
     source_distance: str = SOURCE_DISTANCE_SEED
     has_insufficient_evidence_option: bool = False
     defensible_option_ids: list[str] = Field(default_factory=list)
+    critic_status: str = STATUS_GENERATED
+    critic_reasons: list[str] = Field(default_factory=list)
     generation_status: str = STATUS_GENERATED
     validation_status: str = STATUS_GENERATED
     rejection_reasons: list[str] = Field(default_factory=list)
@@ -358,6 +360,8 @@ class BenchmarkResult(BaseModel):
     survivor_accuracy: float | None = None
     naive_accuracy: float | None = None
     uplift: float | None = None
+    uplift_ci_low: float | None = None
+    uplift_ci_high: float | None = None
     survivor_unavailable: str | None = None
     naive_unavailable: str | None = None
     survivor_score: ExamScore | None = None
@@ -369,3 +373,5 @@ class BenchmarkResult(BaseModel):
     config_fingerprint: str = ""
     state_hash: str = ""
     model_ids: dict[str, str] = Field(default_factory=dict)
+    token_usage: dict[str, int] = Field(default_factory=dict)
+    latency_seconds: float = 0.0

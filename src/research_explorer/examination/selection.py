@@ -125,3 +125,11 @@ def compute_selection_accuracy(
         return None, 0.0
     accuracy = correct / total
     return accuracy, accuracy
+
+
+def terminal_formula(weights: SelectionWeights) -> str:
+    """Render the effective terminal-score formula from configured weights."""
+    return (
+        f"Q_terminal = {weights.selection:.2f}*E_selection + "
+        f"{weights.process:.2f}*Q_process + {weights.grounding:.2f}*G"
+    )

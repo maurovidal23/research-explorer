@@ -320,6 +320,11 @@ class RunProjection:
     def _on_seed_routing(self, event: RunEvent) -> None:
         self.state.status = STATUS_RUNNING
 
+    def _on_research_scope(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.effective_scope = str(p.get("scope") or self.state.effective_scope)
+        self.state.scope_origin = str(p.get("origin") or self.state.scope_origin)
+
     def _on_colony_init(self, event: RunEvent) -> None:
         p = event.payload
         self.state.colony_size = _as_int(p.get("size"), self.state.colony_size)
@@ -1333,6 +1338,11 @@ class RunProjection:
         record.status = NODE_ACTIVE
         self.state.current_phase = PHASE_SELECTION
 
+    def _on_candidate_test_started(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_SELECTION)
+        record.status = NODE_ACTIVE
+        self.state.current_phase = PHASE_SELECTION
+
     def _on_candidate_test_completed(self, event: RunEvent) -> None:
         record = self._exam_phase(PHASE_SELECTION)
         agent = str(event.payload.get("agent_id") or "")
@@ -1372,6 +1382,9 @@ class RunProjection:
         self.state.benchmark_outcome = str(p.get("outcome") or "")
         self.state.benchmark_reason_code = str(p.get("reason_code") or "")
         self.state.benchmark_reason = str(p.get("reason") or "")
+        synthesis = p.get("survivor_synthesis")
+        if isinstance(synthesis, str) and synthesis:
+            self.state.survivor_synthesis = synthesis
         if "survivor_accuracy" in p:
             self.state.survivor_accuracy = _as_optional_float(p.get("survivor_accuracy"))
         if "naive_accuracy" in p:
@@ -1400,6 +1413,7 @@ class RunProjection:
 
 _HANDLERS: dict[str, Any] = {
     EventType.RUN_STARTED: RunProjection._on_run_started,
+    EventType.RESEARCH_SCOPE_RESOLVED: RunProjection._on_research_scope,
     EventType.SEED_ROUTING_STARTED: RunProjection._on_seed_routing,
     EventType.SEED_ROUTING_COMPLETED: RunProjection._on_seed_routing,
     EventType.SEED_ROUTING_FAILED: RunProjection._on_run_failed,
@@ -1453,6 +1467,7 @@ _HANDLERS: dict[str, Any] = {
     EventType.EXAM_GENERATED: RunProjection._on_exam_generated,
     EventType.EXAM_VALIDATED: RunProjection._on_exam_validated,
     EventType.EXAM_PARTITIONED: RunProjection._on_exam_partitioned,
+    EventType.CANDIDATE_TEST_STARTED: RunProjection._on_candidate_test_started,
     EventType.CANDIDATE_TEST_COMPLETED: RunProjection._on_candidate_test_completed,
     EventType.SURVIVOR_SELECTED: RunProjection._on_survivor_selected,
     EventType.BASELINE_COMPLETED: RunProjection._on_baseline_completed,

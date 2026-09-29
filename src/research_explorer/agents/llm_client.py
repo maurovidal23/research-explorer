@@ -70,6 +70,7 @@ class LLMClient:
         self.sem = asyncio.Semaphore(max_concurrent)
         self.limiter = AsyncLimiter(max(rpm / 60, 0.1), 1)
         self.tracer: RunTracer | None = None
+        self.last_usage: dict[str, Any] | None = None
 
     def _emit_operation(self, type: str, **payload: Any) -> None:
         tracer = self.tracer
@@ -121,6 +122,7 @@ class LLMClient:
             elapsed=round(time.monotonic() - started, 4),
             **usage,
         )
+        self.last_usage = usage
         return content
 
     @retry(
@@ -189,6 +191,7 @@ class LLMClient:
         max_tokens: int | None = 2000,
         purpose: str = "chat_json",
         attempts: int = 2,
+        extra_body: dict | None = None,
     ) -> dict:
         """Chat with structured JSON output (json_schema strict)."""
         if schema:
@@ -207,6 +210,7 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 purpose=purpose,
+                extra_body=extra_body,
             )
             try:
                 return json.loads(content)

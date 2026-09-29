@@ -37,6 +37,15 @@ def _accuracy(value: float | None) -> str:
     return "unavailable" if value is None else f"{value:.4f}"
 
 
+def _uplift_interval(result: BenchmarkResult) -> str:
+    if result.uplift_ci_low is None or result.uplift_ci_high is None:
+        return "unavailable"
+    return (
+        f"[{result.uplift_ci_low * 100:.2f}, {result.uplift_ci_high * 100:.2f}] pp "
+        "(descriptive, single run)"
+    )
+
+
 def _humanize(name: str) -> str:
     return name.replace("_", " ") or "unlabeled"
 
@@ -165,6 +174,7 @@ def benchmark_report_markdown(
                 f"- Descriptive uplift (percentage points): "
                 f"{'unavailable' if result.uplift is None else f'{result.uplift * 100:.2f}'}"
             ),
+            f"- Paired 95% interval (item-level): {_uplift_interval(result)}",
             f"- Survivor arm unavailable: {result.survivor_unavailable or 'no'}",
             f"- Naive arm unavailable: {result.naive_unavailable or 'no'}",
             "",
@@ -185,6 +195,8 @@ def benchmark_report_markdown(
             "",
             f"- Fingerprint: {result.config_fingerprint or 'unset'}",
             f"- Models: {json.dumps(result.model_ids, sort_keys=True)}",
+            f"- Token usage: {json.dumps(result.token_usage, sort_keys=True) or '{}'}",
+            f"- Answer latency (s): {result.latency_seconds:.4f}",
         ]
     )
     if result.survivor_score is not None:

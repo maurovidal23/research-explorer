@@ -35,6 +35,7 @@ from research_explorer.graph.feromone import PheromoneManager
 from research_explorer.graph.models import normalize_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import configure_logging, get_logger
+from research_explorer.memory.scope import resolve_scope
 from research_explorer.providers.base import ResilientProvider
 from research_explorer.providers.factory import build_all_providers
 from research_explorer.providers.routing import SeedRef, route_seed_provider
@@ -47,6 +48,7 @@ from research_explorer.replay.trace import (
 
 if TYPE_CHECKING:
     from research_explorer.examination.models import BenchmarkResult
+    from research_explorer.survivor.models import SurvivorBundle
 
 log = get_logger("orchestrator")
 
@@ -86,6 +88,7 @@ class Orchestrator:
         self.effective_scope: str = ""
         self.scope_origin: str = "derived"
         self.benchmark_result: BenchmarkResult | None = None
+        self.survivor_bundle: SurvivorBundle | None = None
         configure_logging(config.log_level)
 
         # Storage
@@ -255,8 +258,6 @@ class Orchestrator:
 
         # SURV-1: the positional text is an optional research scope, not the
         # literal final-answer question. When blank, derive a bounded profile.
-        from research_explorer.memory.scope import resolve_scope
-
         self.effective_scope, self.scope_origin = resolve_scope(seed_query, seed_paper)
         tracer.emit(
             "research_scope_resolved",
@@ -462,6 +463,7 @@ class Orchestrator:
         from research_explorer.examination.benchmark import (
             OUTCOME_BENCHMARKED,
             OUTCOME_DEGRADED,
+            OUTCOME_EXAM_INSUFFICIENT,
             OUTCOME_FAILED,
             OUTCOME_SURVIVOR_UNBENCHMARKED,
         )
@@ -501,12 +503,17 @@ class Orchestrator:
             seed_nid, self.effective_scope, union, distances=distances
         ).freeze()
         tracer.emit("evidence_pack_frozen", **evidence_pack_frozen_payload(pack))
+        tracer.record_artifact(
+            "evidence_pack.json", "evidence_pack", pack.model_dump_json(indent=2)
+        )
 
         if exam.examiner_provider == "fake":
             generator = FakeExaminer()
             answer_client = FakeAnswerClient()
+            answer_model = exam.answer_model or "fake-answer-v1"
         else:
-            generator, answer_client = self._build_live_exam_clients()
+            answer_model = self._require_answer_model(exam)
+            generator, answer_client = self._build_live_exam_clients(answer_model)
 
         candidates = []
         acquired: dict = {}
@@ -527,10 +534,12 @@ class Orchestrator:
             weights=weights,
             min_coverage=exam.min_examination_coverage,
             context_max_chars=self.cfg.baseline.context_max_chars,
+            answer_batch_size=exam.answer_batch_size,
+            max_validation_attempts=exam.max_validation_attempts,
             config_fingerprint=config_fingerprint(
                 {
                     "examiner": exam.examiner_model,
-                    "answer": exam.answer_model or exam.examiner_model,
+                    "answer": answer_model,
                     "seed": exam.partition_seed,
                     "selection": exam.selection_count,
                     "holdout": exam.holdout_count,
@@ -538,13 +547,14 @@ class Orchestrator:
             ),
             model_ids={
                 "examiner_model": exam.examiner_model,
-                "answer_model": exam.answer_model or exam.examiner_model,
+                "answer_model": answer_model,
             },
             prompt_versions={"examiner": "v1", "answer": "v1"},
         )
-        runner = BenchmarkRunner(pack, generator, answer_client, config)
+        runner = BenchmarkRunner(pack, generator, answer_client, config, tracer=tracer)
         result = await runner.run(candidates, acquired)
         self.benchmark_result = result
+        self.survivor_bundle = runner.survivor_bundle
 
         if runner.bank is not None:
             for event_type, payload in exam_payloads(
@@ -554,7 +564,8 @@ class Orchestrator:
                 runner.bank.rejection_reasons,
             ):
                 tracer.emit(event_type, **payload)
-        for event_type, payload in survivor_payloads(result):
+        synthesis = runner.survivor_bundle.synthesis if runner.survivor_bundle else ""
+        for event_type, payload in survivor_payloads(result, synthesis=synthesis):
             tracer.emit(event_type, **payload)
 
         if runner.bank is not None:
@@ -578,6 +589,7 @@ class Orchestrator:
             OUTCOME_BENCHMARKED: OUTCOME_BENCHMARKED,
             OUTCOME_SURVIVOR_UNBENCHMARKED: OUTCOME_SURVIVOR_UNBENCHMARKED,
             OUTCOME_DEGRADED: OUTCOME_DEGRADED,
+            OUTCOME_EXAM_INSUFFICIENT: OUTCOME_EXAM_INSUFFICIENT,
             OUTCOME_FAILED: OUTCOME_FAILED,
         }
         self.outcome = outcome_map.get(result.outcome, OUTCOME_DEGRADED)
@@ -593,7 +605,21 @@ class Orchestrator:
             uplift=result.uplift,
         )
 
-    def _build_live_exam_clients(self):
+    def _require_answer_model(self, exam) -> str:
+        """Return the configured answer model or fail closed (EXAM-8).
+
+        The answer model must be explicit for a live run. Silently reusing the
+        examiner model would violate the matched-baseline contract because the
+        examiner is not assumed to serve the answer role.
+        """
+        if exam.answer_model.strip():
+            return exam.answer_model
+        raise RuntimeError(
+            "examination.answer_model must be set for a live examination; "
+            "refusing to reuse the examiner model for the answer arms (EXAM-8)"
+        )
+
+    def _build_live_exam_clients(self, answer_model: str):
         """Build the examiner/answer clients (live path, not used by tests)."""
         from research_explorer.agents.llm_client import LLMClient
         from research_explorer.examination import LLMAnswerClient, LLMExaminer
@@ -605,10 +631,16 @@ class Orchestrator:
             max_concurrent=self.cfg.llm.max_concurrent,
             rpm=self.cfg.llm.rpm,
         )
-        answer_model = exam.answer_model or exam.examiner_model
         self._examiner_llm = examiner_llm
         return (
-            LLMExaminer(examiner_llm, exam.examiner_model, exam.examiner_max_tokens),
+            LLMExaminer(
+                examiner_llm,
+                exam.examiner_model,
+                exam.examiner_max_tokens,
+                temperature=exam.examiner_temperature,
+                reasoning_effort=exam.examiner_reasoning_effort or None,
+                evidence_max_chars=exam.evidence_max_chars,
+            ),
             LLMAnswerClient(
                 examiner_llm,
                 answer_model,
@@ -655,6 +687,8 @@ class Orchestrator:
         """Build a full markdown exploration report after run() has completed."""
         from research_explorer.orchestrator.report import build_report
 
+        bundle = getattr(self, "survivor_bundle", None)
+        survivor_synthesis = bundle.synthesis if bundle is not None else ""
         return build_report(
             config=self.cfg,
             colony=self.colony,
@@ -670,6 +704,7 @@ class Orchestrator:
             benchmark_result=getattr(self, "benchmark_result", None),
             effective_scope=getattr(self, "effective_scope", ""),
             scope_origin=getattr(self, "scope_origin", "derived"),
+            survivor_synthesis=survivor_synthesis,
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:

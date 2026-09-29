@@ -33,6 +33,7 @@ class EventType:
     """
 
     RUN_STARTED = "run_started"
+    RESEARCH_SCOPE_RESOLVED = "research_scope_resolved"
     SEED_ROUTING_STARTED = "seed_routing_started"
     SEED_ROUTING_COMPLETED = "seed_routing_completed"
     SEED_ROUTING_FAILED = "seed_routing_failed"
@@ -141,6 +142,7 @@ OUTCOME_DEGRADED = "degraded"
 OUTCOME_BENCHMARKED = "completed_benchmarked"
 OUTCOME_SURVIVOR_UNBENCHMARKED = "completed_survivor_unbenchmarked"
 OUTCOME_DEGRADED_NO_SURVIVOR = "completed_degraded"
+OUTCOME_EXAM_INSUFFICIENT = "completed_exam_insufficient"
 OUTCOME_FAILED = "failed"
 
 PHASE_SETUP = "setup"
@@ -371,6 +373,8 @@ class RunViewState(BaseModel):
     run_id: str = ""
     seed_paper_id: str = ""
     query: str = ""
+    effective_scope: str = ""
+    scope_origin: str = "derived"
     pipeline: str = "aco"
     status: str = STATUS_INITIALIZING
     outcome: str = OUTCOME_COMPLETED
@@ -439,6 +443,7 @@ class RunViewState(BaseModel):
     survivor_process_score: float | None = None
     survivor_grounding_score: float | None = None
     survivor_ranking: list[str] = Field(default_factory=list)
+    survivor_synthesis: str = ""
 
     def ordered_agents(self) -> list[AgentSummary]:
         return [self.agents[a] for a in self.agent_order if a in self.agents]

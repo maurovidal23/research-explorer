@@ -154,3 +154,57 @@ def test_state_memory_view_round_trips() -> None:
     assert memory.agent_id == "a"
     assert memory.scope_origin == "user"
     assert memory.dossiers[dossier.paper_id].has_evidence_credit
+
+
+class _StubAnalysisLLM:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def chat_json(self, messages, **kwargs) -> dict:
+        self.calls.append(str(kwargs.get("purpose")))
+        return {
+            "research_problem": "How does X work?",
+            "contribution": "Introduces method M.",
+            "key_concepts": ["concept-a"],
+            "method": "Method M",
+            "findings": ["Finding one", "Finding two"],
+            "limitations": ["Small sample"],
+            "relations": [
+                {"target_paper_id": "arxiv:other", "kind": "extension", "rationale": "builds on"}
+            ],
+            "knowledge_gaps": ["No replication yet"],
+        }
+
+
+async def test_live_integration_populates_structured_memory() -> None:
+    from types import SimpleNamespace
+
+    from research_explorer.agents.explorer import ExplorerAgent
+
+    agent = ExplorerAgent.__new__(ExplorerAgent)
+    agent.state = AgentState(id="a", pos="arxiv:x", research_scope="scope")
+    agent.cfg = SimpleNamespace(
+        memory=SimpleNamespace(enabled=True, chunk_chars=1000, max_chunks=1),
+        llm=SimpleNamespace(
+            explorer_model="m",
+            temperature=0.0,
+            evaluation_max_tokens=1000,
+            structured_output_attempts=1,
+        ),
+    )
+    agent.llm = _StubAnalysisLLM()
+    paper = Paper(
+        id="x", title="Paper X", provider="arxiv", fulltext="Unique body. " * 40
+    )
+
+    await agent._extract_memory(paper)
+
+    assert agent.state.paper_analyses["arxiv:x"]["findings"]
+    dossier = agent.state.dossiers["arxiv:x"]
+    assert dossier.research_problem and dossier.method and dossier.results
+    assert agent.state.claims
+    assert all(claim.has_resolving_support for claim in agent.state.claims.values())
+    assert agent.state.relations
+    assert agent.state.knowledge_gaps
+    assert agent.state.concepts
+    assert agent.llm.calls == ["paper_analysis"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from research_explorer.examination.models import (
     AnswerKey,
     AnswerSet,
@@ -74,3 +76,27 @@ def paired_outcomes(
             "naive": bool(naive.item_outcomes.get(question_id, False)),
         }
     return paired
+
+
+def paired_confidence_interval(
+    paired: dict[str, dict[str, bool]], z: float = 1.96
+) -> tuple[float, float] | None:
+    """Deterministic paired interval over per-item uplift differences.
+
+    Each paired item contributes ``survivor - naive`` in ``{-1, 0, 1}``. The
+    interval is a normal-approximation 95% interval across the holdout items of
+    one run; it is descriptive and does not replace an across-run interval.
+    """
+    diffs = [
+        int(bool(outcome.get("survivor"))) - int(bool(outcome.get("naive")))
+        for outcome in paired.values()
+    ]
+    count = len(diffs)
+    if count == 0:
+        return None
+    mean = sum(diffs) / count
+    if count == 1:
+        return (mean, mean)
+    variance = sum((value - mean) ** 2 for value in diffs) / (count - 1)
+    stderr = math.sqrt(variance / count)
+    return (mean - z * stderr, mean + z * stderr)

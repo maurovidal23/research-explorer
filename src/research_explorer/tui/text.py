@@ -1325,6 +1325,14 @@ def render_final_result(state: RunViewState) -> str:
     else:
         lines.append("no winner evaluation recorded")
     lines.extend(_render_benchmark_result(state))
+    if state.survivor_synthesis.strip():
+        lines.append("")
+        lines.append("### Frozen survivor synthesis")
+        lines.append(
+            "_Derived view over the frozen structured memory; not the authoritative memory._"
+        )
+        lines.append("")
+        lines.append(state.survivor_synthesis)
     failed = sum(
         1 for record in state.evaluation_states.values() if record.status == EVAL_FAILED
     )

@@ -8,10 +8,13 @@ unavailable arm is represented as unavailable with a reason, never as zero.
 from __future__ import annotations
 
 import hashlib
+import time
+from typing import Any
 
 from research_explorer.events.models import (
     OUTCOME_BENCHMARKED,
     OUTCOME_DEGRADED_NO_SURVIVOR,
+    OUTCOME_EXAM_INSUFFICIENT,
     OUTCOME_FAILED,
     OUTCOME_SURVIVOR_UNBENCHMARKED,
     REASON_BASELINE_FAILED,
@@ -19,6 +22,7 @@ from research_explorer.events.models import (
     REASON_INSUFFICIENT_QUESTIONS,
     REASON_INVALID_CANDIDATE_RESPONSE,
     REASON_NO_ELIGIBLE_SURVIVOR,
+    EventType,
 )
 from research_explorer.examination.clients import AnswerClient, build_answer_set
 from research_explorer.examination.generator import (
@@ -39,12 +43,22 @@ from research_explorer.examination.models import (
     SurvivorSelection,
 )
 from research_explorer.examination.partition import PartitionError, partition_bank
-from research_explorer.examination.scoring import paired_outcomes, score_answers
-from research_explorer.examination.selection import grounding_score, select_survivor
+from research_explorer.examination.scoring import (
+    paired_confidence_interval,
+    paired_outcomes,
+    score_answers,
+)
+from research_explorer.examination.selection import (
+    compute_selection_accuracy,
+    grounding_score,
+    select_survivor,
+    terminal_formula,
+)
 from research_explorer.examination.validation import validate_bank
 from research_explorer.logging_setup import get_logger
 from research_explorer.memory.ledger import enforce_claim_ledger, validate_claim
 from research_explorer.memory.models import ContentKind, ResearchMemory, canonical_json
+from research_explorer.memory.synthesis import synthesize_memory
 from research_explorer.survivor.answer import assemble_context
 from research_explorer.survivor.bundle import build_bundle
 from research_explorer.survivor.models import SelectionMetadata, SurvivorBundle
@@ -69,6 +83,8 @@ class BenchmarkConfig:
         model_ids: dict[str, str] | None = None,
         prompt_versions: dict[str, str] | None = None,
         context_max_chars: int = 40_000,
+        answer_batch_size: int = 5,
+        max_validation_attempts: int = 2,
     ) -> None:
         self.selection_count = selection_count
         self.holdout_count = holdout_count
@@ -81,6 +97,8 @@ class BenchmarkConfig:
         self.model_ids = model_ids or {}
         self.prompt_versions = prompt_versions or {}
         self.context_max_chars = context_max_chars
+        self.answer_batch_size = max(1, answer_batch_size)
+        self.max_validation_attempts = max(1, max_validation_attempts)
 
     @property
     def total(self) -> int:
@@ -142,14 +160,31 @@ class BenchmarkRunner:
         generator: ExamGenerator,
         answer_client: AnswerClient,
         config: BenchmarkConfig | None = None,
+        tracer: Any | None = None,
     ) -> None:
         self.pack = pack
         self.generator = generator
         self.answer_client = answer_client
         self.cfg = config or BenchmarkConfig()
+        self.tracer = tracer
         self.bank: ExamBank | None = None
         self.answer_key: AnswerKey | None = None
         self.survivor_bundle: SurvivorBundle | None = None
+        self.token_usage: dict[str, int] = {}
+        self.latency_seconds: float = 0.0
+
+    def _emit(self, event_type: str, **payload: Any) -> None:
+        if self.tracer is not None:
+            self.tracer.emit(event_type, **payload)
+
+    def _accumulate_usage(self) -> None:
+        usage = getattr(self.answer_client, "last_usage", None)
+        if not isinstance(usage, dict):
+            return
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                self.token_usage[key] = self.token_usage.get(key, 0) + value
 
     async def _run_partition(
         self,
@@ -157,17 +192,48 @@ class BenchmarkRunner:
         question_ids: list[str],
         contexts: dict[str, str],
         responder_model: str,
+        partition: str = "selection",
     ) -> dict[str, AnswerSet]:
         questions = _student_questions(bank, question_ids)
         opts = _valid_options(questions)
+        batch_size = self.cfg.answer_batch_size
         results: dict[str, AnswerSet] = {}
         for agent_id in sorted(contexts):
-            raw = await self.answer_client.answer(
-                agent_id, questions, contexts[agent_id]
-            )
-            results[agent_id] = build_answer_set(
+            raw: dict[str, str | None] = {}
+            latencies: dict[str, float] = {}
+            for start in range(0, len(questions), batch_size):
+                batch = questions[start : start + batch_size]
+                self._emit(
+                    EventType.CANDIDATE_TEST_STARTED,
+                    agent_id=agent_id,
+                    partition=partition,
+                    question_count=len(batch),
+                )
+                started = time.monotonic()
+                try:
+                    partial = await self.answer_client.answer(
+                        agent_id, batch, contexts[agent_id]
+                    )
+                finally:
+                    elapsed = time.monotonic() - started
+                    for question in batch:
+                        latencies[question.question_id] = elapsed
+                self.latency_seconds += elapsed
+                raw.update(partial)
+                self._accumulate_usage()
+                self._emit(
+                    EventType.CANDIDATE_TEST_COMPLETED,
+                    agent_id=agent_id,
+                    partition=partition,
+                    question_count=len(batch),
+                    elapsed=round(elapsed, 6),
+                )
+            answer_set = build_answer_set(
                 agent_id, responder_model, raw, questions, opts
             )
+            for question_id, record in answer_set.answers.items():
+                record.latency_seconds = latencies.get(question_id)
+            results[agent_id] = answer_set
         return results
 
     async def run(
@@ -181,6 +247,7 @@ class BenchmarkRunner:
             holdout_count=self.cfg.holdout_count,
             seed=self.cfg.partition_seed,
             options_per_item=self.cfg.options_per_item,
+            max_validation_attempts=self.cfg.max_validation_attempts,
         )
         result = BenchmarkResult(config_fingerprint=self.cfg.config_fingerprint)
         result.model_ids = dict(self.cfg.model_ids)
@@ -196,7 +263,7 @@ class BenchmarkRunner:
             return result
         accepted, _rejected, _reasons = validate_bank(raw_items, self.pack)
         if len(accepted) < self.cfg.total:
-            result.outcome = OUTCOME_FAILED
+            result.outcome = OUTCOME_EXAM_INSUFFICIENT
             result.reason_code = REASON_INSUFFICIENT_QUESTIONS
             result.reason = (
                 f"accepted={len(accepted)} required={self.cfg.total}"
@@ -214,7 +281,7 @@ class BenchmarkRunner:
                 accepted, self.cfg.selection_count, self.cfg.holdout_count, self.cfg.partition_seed
             )
         except PartitionError as exc:
-            result.outcome = OUTCOME_FAILED
+            result.outcome = OUTCOME_EXAM_INSUFFICIENT
             result.reason_code = REASON_INSUFFICIENT_QUESTIONS
             result.reason = exc.reason
             return result
@@ -253,7 +320,7 @@ class BenchmarkRunner:
         responder_model = self.cfg.model_ids.get("answer_model", "fake-answer-v1")
         try:
             selection_sets = await self._run_partition(
-                bank, selection_ids, selection_contexts, responder_model
+                bank, selection_ids, selection_contexts, responder_model, "selection"
             )
         except Exception as exc:
             result.outcome = OUTCOME_SURVIVOR_UNBENCHMARKED
@@ -267,7 +334,9 @@ class BenchmarkRunner:
             if answer_set is None:
                 continue
             score = score_answers(answer_set, bank, selection_ids, key, self.pack)
-            candidate.selection_accuracy = score.accuracy
+            candidate.selection_accuracy, _ = compute_selection_accuracy(
+                score.correct, len(selection_questions)
+            )
             valid_answers = sum(
                 1
                 for rec in answer_set.answers.values()
@@ -297,6 +366,7 @@ class BenchmarkRunner:
             process_score=selection.process_score,
             grounding_score=selection.grounding_score,
             weights=self.cfg.weights,
+            formula=terminal_formula(self.cfg.weights),
             candidate_ranking=selection.ranking,
             process_peak_agent=selection.process_peak_agent,
         )
@@ -324,6 +394,7 @@ class BenchmarkRunner:
                 holdout_ids,
                 {"survivor": survivor_ctx, "naive": naive_ctx},
                 responder_model,
+                "holdout",
             )
         except Exception as exc:
             result.outcome = OUTCOME_SURVIVOR_UNBENCHMARKED
@@ -344,6 +415,11 @@ class BenchmarkRunner:
         if survivor_score.accuracy is not None and naive_score.accuracy is not None:
             result.uplift = round(survivor_score.accuracy - naive_score.accuracy, 6)
         result.paired_outcomes = paired_outcomes(survivor_score, naive_score)
+        interval = paired_confidence_interval(result.paired_outcomes)
+        if interval is not None:
+            result.uplift_ci_low, result.uplift_ci_high = interval
+        result.token_usage = dict(self.token_usage)
+        result.latency_seconds = round(self.latency_seconds, 6)
         result.outcome = OUTCOME_BENCHMARKED
         result.reason_code = ""
         result.reason = ""
@@ -351,8 +427,6 @@ class BenchmarkRunner:
 
 
 def survivor_memory_synthesis(memory: ResearchMemory, max_words: int) -> str:
-    from research_explorer.memory.synthesis import synthesize_memory
-
     return synthesize_memory(memory, max_words)
 
 

@@ -627,6 +627,8 @@ def benchmark(
             ),
             min_coverage=exam.min_examination_coverage,
             context_max_chars=cfg.baseline.context_max_chars,
+            answer_batch_size=exam.answer_batch_size,
+            max_validation_attempts=exam.max_validation_attempts,
             model_ids={
                 "examiner_model": exam.examiner_model,
                 "answer_model": exam.answer_model or "fake-answer-v1",
@@ -638,6 +640,9 @@ def benchmark(
 
     out_dir = Path(output)
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "evidence_pack.json").write_text(
+        pack.model_dump_json(indent=2), encoding="utf-8"
+    )
     (out_dir / "benchmark_result.json").write_text(
         benchmark_result_json(result), encoding="utf-8"
     )

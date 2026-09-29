@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from research_explorer.config import Config
 from research_explorer.examination.models import (
     BenchmarkResult,
@@ -15,6 +17,7 @@ from research_explorer.examination.models import (
     SurvivorSelection,
 )
 from research_explorer.orchestrator.report import build_report
+from research_explorer.orchestrator.runner import Orchestrator
 
 
 def _result() -> BenchmarkResult:
@@ -90,3 +93,22 @@ def test_report_omits_benchmark_section_without_a_result() -> None:
     report = _empty_report()
     assert "## Survivor Benchmark" not in report
     assert "## Winning Narrative" in report
+
+
+def test_report_renders_frozen_survivor_synthesis() -> None:
+    report = _empty_report(
+        benchmark_result=_result(),
+        survivor_synthesis="Established findings\n- synthesized view",
+    )
+    assert "## Frozen Survivor Synthesis" in report
+    assert "synthesized view" in report
+
+
+def test_live_answer_model_fails_closed_when_unset() -> None:
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    with pytest.raises(RuntimeError):
+        orchestrator._require_answer_model(SimpleNamespace(answer_model=""))
+    assert (
+        orchestrator._require_answer_model(SimpleNamespace(answer_model="answer-x"))
+        == "answer-x"
+    )

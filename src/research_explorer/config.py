@@ -316,6 +316,15 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("examination examiner_model must not be empty")
     if exam.allow_examiner_fallback and not exam.fallback_examiner_model.strip():
         raise ValueError("examiner fallback requires fallback_examiner_model")
+    if (
+        exam.enabled
+        and exam.examiner_provider != "fake"
+        and not exam.answer_model.strip()
+    ):
+        raise ValueError(
+            "examination.answer_model must be set for a live examination; "
+            "the examiner model is not assumed to answer both arms (EXAM-8)"
+        )
     if cfg.memory.synthesis_words <= 0:
         raise ValueError("memory synthesis_words must be positive")
     if cfg.memory.chunk_chars <= 0 or cfg.memory.max_chunks <= 0:

@@ -96,6 +96,15 @@ def test_keys_absent_while_selection_is_active() -> None:
     assert "holdout items: 4" in rendered
 
 
+def test_final_result_renders_frozen_synthesis() -> None:
+    events = _exam_events()
+    events[-1].payload["survivor_synthesis"] = "Established findings\n- synthesized view"
+    state = RunProjection.from_events(events).state
+    rendered = render.render_final_result(state)
+    assert "Frozen survivor synthesis" in rendered
+    assert "synthesized view" in rendered
+
+
 def test_live_and_replay_exam_navigation_match(tmp_path) -> None:
     store = RunTraceStore(tmp_path / "replay.db")
     run_id = store.create_run("arxiv:seed", "scope")

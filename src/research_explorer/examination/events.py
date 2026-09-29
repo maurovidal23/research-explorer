@@ -29,7 +29,7 @@ def exam_payloads(
     rejected: int,
     rejection_reasons: list[str],
 ) -> list[tuple[str, dict[str, Any]]]:
-    return [
+    payloads: list[tuple[str, dict[str, Any]]] = [
         (
             EventType.EXAM_GENERATED,
             {"item_count": len(bank.items), "exam_version": bank.exam_version},
@@ -51,9 +51,14 @@ def exam_payloads(
             },
         ),
     ]
+    for _event_type, payload in payloads:
+        assert_no_private_key(payload)
+    return payloads
 
 
-def survivor_payloads(result: BenchmarkResult) -> list[tuple[str, dict[str, Any]]]:
+def survivor_payloads(
+    result: BenchmarkResult, synthesis: str = ""
+) -> list[tuple[str, dict[str, Any]]]:
     payloads: list[tuple[str, dict[str, Any]]] = []
     selection = result.selection
     if selection is not None:
@@ -95,9 +100,12 @@ def survivor_payloads(result: BenchmarkResult) -> list[tuple[str, dict[str, Any]
                 "outcome": result.outcome,
                 "reason_code": result.reason_code,
                 "reason": result.reason,
+                "survivor_synthesis": synthesis,
             },
         )
     )
+    for _event_type, payload in payloads:
+        assert_no_private_key(payload)
     return payloads
 
 

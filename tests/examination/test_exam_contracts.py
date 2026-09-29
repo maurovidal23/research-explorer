@@ -63,6 +63,30 @@ class _RecordingClient(FakeAnswerClient):
         return await super().answer(responder, questions, context)
 
 
+class _RecordingTracer:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, event_type: str, **payload) -> None:
+        self.events.append((event_type, payload))
+
+
+def test_benchmark_runner_emits_candidate_test_events() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    tracer = _RecordingTracer()
+    runner = BenchmarkRunner(
+        pack, FakeExaminer(), FakeAnswerClient(), _config(), tracer=tracer
+    )
+    result = asyncio.run(runner.run(candidates, acquired))
+    assert result.outcome == OUTCOME_BENCHMARKED
+    types = [event_type for event_type, _ in tracer.events]
+    assert "candidate_test_started" in types
+    assert "candidate_test_completed" in types
+    started = [payload for event_type, payload in tracer.events if event_type == "candidate_test_started"]
+    partitions = {payload["partition"] for payload in started}
+    assert {"selection", "holdout"} <= partitions
+
+
 def test_test_takers_never_receive_private_fields() -> None:
     client = _RecordingClient()
     _runner, result = _run(client)
@@ -149,7 +173,7 @@ def test_insufficient_validated_items_has_stable_reason_and_no_holdout_shrink() 
     pack, candidates, acquired = build_synthetic_corpus()
     runner = BenchmarkRunner(pack, _TinyExaminer(), FakeAnswerClient(), _config())
     result = asyncio.run(runner.run(candidates, acquired))
-    assert result.outcome == "failed"
+    assert result.outcome == "completed_exam_insufficient"
     assert result.reason_code == "insufficient_validated_questions"
     assert runner.bank is None
     assert result.survivor_accuracy is None

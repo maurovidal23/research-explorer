@@ -8,6 +8,7 @@ network access (CFG-1 test profile).
 
 from __future__ import annotations
 
+import json
 import random
 from typing import Protocol, runtime_checkable
 
@@ -19,6 +20,7 @@ from research_explorer.examination.models import (
     DIFFICULTY_HARD,
     DIFFICULTY_MEDIUM,
     EXAM_SCHEMA_VERSION,
+    STATUS_REJECTED,
     AnswerKey,
     EvidencePack,
     ExamBank,
@@ -69,12 +71,14 @@ class GenerationSpec:
         exam_version: str = EXAM_SCHEMA_VERSION,
         seed: int = 0,
         options_per_item: int = 4,
+        max_validation_attempts: int = 2,
     ) -> None:
         self.selection_count = selection_count
         self.holdout_count = holdout_count
         self.exam_version = exam_version
         self.seed = seed
         self.options_per_item = options_per_item
+        self.max_validation_attempts = max(1, max_validation_attempts)
 
     @property
     def total(self) -> int:
@@ -171,28 +175,124 @@ class FakeExaminer:
 class LLMExaminer:
     """LLM-backed examiner (non-deterministic path; not used by automated tests)."""
 
-    def __init__(self, llm, model_id: str, max_tokens: int = 4000) -> None:
+    def __init__(
+        self,
+        llm,
+        model_id: str,
+        max_tokens: int = 4000,
+        *,
+        temperature: float = 0.2,
+        reasoning_effort: str | None = None,
+        evidence_max_chars: int = 40_000,
+    ) -> None:
         self.llm = llm
         self.model_id = model_id
         self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.reasoning_effort = reasoning_effort
+        self.evidence_max_chars = evidence_max_chars
 
     async def generate(self, pack: EvidencePack, spec: GenerationSpec) -> list[ExamItem]:
-        schema = _exam_json_schema()
-        prompt = self._prompt(pack, spec)
-        payload = await self.llm.chat_json(
+        collected: list[ExamItem] = []
+        seen: set[str] = set()
+        for attempt in range(spec.max_validation_attempts):
+            payload = await self._generate_payload(pack, spec)
+            items = _parse_items(payload, self.model_id, id_prefix=f"a{attempt}")
+            items = await self._critique(items, pack)
+            for item in items:
+                if item.question_id in seen:
+                    continue
+                seen.add(item.question_id)
+                collected.append(item)
+            if len(collected) >= spec.total:
+                break
+        if not collected:
+            raise EvidenceInsufficientError("examiner returned no items")
+        return collected
+
+    async def _generate_payload(self, pack: EvidencePack, spec: GenerationSpec) -> dict:
+        extra_body = (
+            {"reasoning_effort": self.reasoning_effort}
+            if self.reasoning_effort
+            else None
+        )
+        return await self.llm.chat_json(
             [
                 {"role": "system", "content": _EXAMINER_SYSTEM},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": self._prompt(pack, spec)},
             ],
             model=self.model_id,
-            schema=schema,
-            temperature=0.2,
+            schema=_exam_json_schema(),
+            temperature=self.temperature,
             max_tokens=self.max_tokens,
             purpose="exam_generation",
+            extra_body=extra_body,
         )
-        items = _parse_items(payload, self.model_id)
+
+    async def _critique(self, items: list[ExamItem], pack: EvidencePack) -> list[ExamItem]:
+        """Independent critic pass, isolated from the generator's rationale.
+
+        The critic sees only public question fields plus the keyed option id and
+        evidence references (never the private rationale). It contributes
+        ``defensible_option_ids`` so the deterministic validator can reject
+        ambiguous items, and can reject items it cannot ground.
+        """
         if not items:
-            raise EvidenceInsufficientError("examiner returned no items")
+            return items
+        public = []
+        for item in items:
+            payload = item.public_payload()
+            payload["correct_option_id"] = item.correct_option_id
+            payload["evidence_refs"] = list(item.evidence_refs)
+            public.append(payload)
+        extra_body = (
+            {"reasoning_effort": self.reasoning_effort}
+            if self.reasoning_effort
+            else None
+        )
+        try:
+            verdicts = await self.llm.chat_json(
+                [
+                    {"role": "system", "content": _CRITIC_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Evidence pack:\n{pack.bounded_context(self.evidence_max_chars)}\n\n"
+                            f"Items to validate:\n{json.dumps(public)}"
+                        ),
+                    },
+                ],
+                model=self.model_id,
+                schema=_critic_json_schema(),
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                purpose="exam_validation",
+                extra_body=extra_body,
+            )
+        except Exception as exc:  # pragma: no cover - live path defensive
+            log.warning("examiner_critique_failed", error=str(exc))
+            return items
+        verdict_by_id = {
+            str(v.get("question_id")): v
+            for v in verdicts.get("items", [])
+            if isinstance(v, dict)
+        }
+        for item in items:
+            verdict = verdict_by_id.get(item.question_id)
+            if verdict is None:
+                continue
+            defensible = [
+                str(option_id) for option_id in verdict.get("defensible_option_ids", [])
+            ]
+            if defensible:
+                item.defensible_option_ids = sorted(
+                    set(item.defensible_option_ids) | set(defensible)
+                )
+            if verdict.get("accepted") is False:
+                item.critic_status = STATUS_REJECTED
+                reason = str(verdict.get("rejection_reason") or "critic_rejected")
+                if reason not in item.critic_reasons:
+                    item.critic_reasons.append(reason)
         return items
 
     def _prompt(self, pack: EvidencePack, spec: GenerationSpec) -> str:
@@ -201,7 +301,8 @@ class LLMExaminer:
             f"evidence pack below. Category targets: {CATEGORY_DISTRIBUTION}. "
             f"Exactly one defensible correct option per item; distractors must be "
             f"false or incomplete. Return JSON {{\"items\":[...]}}.\n\n"
-            f"Evidence pack hash: {pack.pack_hash}\n\n{pack.bounded_context()}"
+            f"Evidence pack hash: {pack.pack_hash}\n\n"
+            f"{pack.bounded_context(self.evidence_max_chars)}"
         )
 
 
@@ -209,6 +310,16 @@ _EXAMINER_SYSTEM = (
     "You are an independent scientific examiner. Use only the supplied evidence "
     "pack. Never reference candidate agents, narratives, or quality scores. Every "
     "keyed answer must be entailed by the pack. Return strict JSON only."
+)
+
+_CRITIC_SYSTEM = (
+    "You are an independent examination critic. You receive candidate "
+    "multiple-choice items with their keyed option and evidence references, plus "
+    "the frozen evidence pack. For each item, decide whether exactly one option "
+    "is defensible from the evidence alone. Return strict JSON "
+    '{"items": [{"question_id": str, "defensible_option_ids": [str], '
+    '"accepted": bool, "rejection_reason": str}]}. Never read or use any '
+    "candidate narrative, memory, identity, path, or process score."
 )
 
 
@@ -221,6 +332,7 @@ def _exam_json_schema() -> dict:
                 "items": {
                     "type": "object",
                     "properties": {
+                        "question_id": {"type": "string"},
                         "question": {"type": "string"},
                         "category": {"type": "string"},
                         "difficulty": {"type": "string"},
@@ -236,6 +348,10 @@ def _exam_json_schema() -> dict:
                             },
                         },
                         "correct_option_id": {"type": "string"},
+                        "defensible_option_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                         "evidence_refs": {"type": "array", "items": {"type": "string"}},
                         "rationale": {"type": "string"},
                         "source_distance": {"type": "string"},
@@ -248,7 +364,32 @@ def _exam_json_schema() -> dict:
     }
 
 
-def _parse_items(payload: dict, model_id: str) -> list[ExamItem]:
+def _critic_json_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question_id": {"type": "string"},
+                        "defensible_option_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "accepted": {"type": "boolean"},
+                        "rejection_reason": {"type": "string"},
+                    },
+                    "required": ["question_id", "defensible_option_ids", "accepted"],
+                },
+            }
+        },
+        "required": ["items"],
+    }
+
+
+def _parse_items(payload: dict, model_id: str, id_prefix: str = "") -> list[ExamItem]:
     items: list[ExamItem] = []
     for index, raw in enumerate(payload.get("items", [])):
         try:
@@ -256,14 +397,21 @@ def _parse_items(payload: dict, model_id: str) -> list[ExamItem]:
                 ExamOption(id=str(o["id"]), text=str(o["text"]))
                 for o in raw.get("options", [])
             ]
+            prefix = f"{id_prefix}-" if id_prefix else ""
             items.append(
                 ExamItem(
-                    question_id=raw.get("question_id") or f"q-{index + 1:04d}",
+                    question_id=str(
+                        raw.get("question_id") or f"{prefix}q-{index + 1:04d}"
+                    ),
                     category=str(raw.get("category", CATEGORY_CONCEPTS)),
                     difficulty=str(raw.get("difficulty", DIFFICULTY_MEDIUM)),
                     question=str(raw["question"]),
                     options=options,
                     correct_option_id=raw.get("correct_option_id"),
+                    defensible_option_ids=[
+                        str(option_id)
+                        for option_id in raw.get("defensible_option_ids", [])
+                    ],
                     evidence_refs=[str(r) for r in raw.get("evidence_refs", [])],
                     rationale=str(raw.get("rationale", "")),
                     source_distance=str(raw.get("source_distance", "seed")),

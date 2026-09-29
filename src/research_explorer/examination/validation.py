@@ -29,6 +29,7 @@ REASON_ANSWER_LEAKAGE = "answer_leakage"
 REASON_DUPLICATE = "duplicate_question"
 REASON_INVALID_CATEGORY = "invalid_category"
 REASON_INVALID_DIFFICULTY = "invalid_difficulty"
+REASON_CRITIC_REJECTED = "critic_rejected"
 
 _LEAK_PHRASES = (
     "all of the above",
@@ -92,6 +93,9 @@ def validate_item(
 
     if existing and _is_duplicate(item, existing):
         reasons.append(REASON_DUPLICATE)
+
+    if item.critic_status == STATUS_REJECTED:
+        reasons.append(REASON_CRITIC_REJECTED)
 
     return reasons
 

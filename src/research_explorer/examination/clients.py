@@ -82,6 +82,7 @@ class LLMAnswerClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.last_usage: dict | None = None
 
     async def answer(
         self,
@@ -126,6 +127,7 @@ class LLMAnswerClient:
         except Exception as exc:
             log.warning("answer_client_failed", responder=responder, error=str(exc))
             raise
+        self.last_usage = getattr(self.llm, "last_usage", None)
         answers = result.get("answers", {})
         return {str(k): (str(v) if v is not None else None) for k, v in answers.items()}
 

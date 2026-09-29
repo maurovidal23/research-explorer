@@ -50,12 +50,19 @@ def _benchmark_section(
     lines.append(f"- **Survivor accuracy:** {_benchmark_accuracy(result.survivor_accuracy)}")
     lines.append(f"- **Naive accuracy:** {_benchmark_accuracy(result.naive_accuracy)}")
     lines.append(f"- **Research uplift:** {_benchmark_uplift(result.uplift)}")
+    if result.uplift_ci_low is not None and result.uplift_ci_high is not None:
+        lines.append(
+            "- **Paired 95% interval (item-level, descriptive):** "
+            f"[{result.uplift_ci_low * 100:.2f}, {result.uplift_ci_high * 100:.2f}] pp"
+        )
     if result.survivor_unavailable:
         lines.append(f"- **Survivor arm unavailable:** {result.survivor_unavailable}")
     if result.naive_unavailable:
         lines.append(f"- **Naive arm unavailable:** {result.naive_unavailable}")
     lines.append(f"- **Config fingerprint:** {result.config_fingerprint or 'unset'}")
     lines.append(f"- **Models:** {json.dumps(result.model_ids, sort_keys=True)}")
+    lines.append(f"- **Token usage:** {json.dumps(result.token_usage, sort_keys=True) or '{}'}")
+    lines.append(f"- **Answer latency (s):** {result.latency_seconds:.4f}")
     lines.append(f"- **Frozen state hash:** {result.state_hash or 'unset'}")
     lines.append("")
     return lines
@@ -91,6 +98,7 @@ def build_report(
     benchmark_result: BenchmarkResult | None = None,
     effective_scope: str = "",
     scope_origin: str = "derived",
+    survivor_synthesis: str = "",
 ) -> str:
     parts: list[str] = []
 
@@ -140,6 +148,17 @@ def build_report(
         elif terminal_reason:
             parts.append(f"Reason: {terminal_reason}.")
     parts.append("")
+
+    # ---- Frozen survivor synthesis (SURV-4) -----------------------------
+    if survivor_synthesis.strip():
+        parts.append("## Frozen Survivor Synthesis\n")
+        parts.append(
+            "Derived view over the frozen structured memory; not the authoritative "
+            "memory itself."
+        )
+        parts.append("")
+        parts.append(survivor_synthesis)
+        parts.append("")
 
     # ---- Quality evolution ----------------------------------------------
     parts.append("## Quality Evolution\n")
