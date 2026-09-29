@@ -38,6 +38,7 @@ from research_explorer.examination.models import (
     CandidateMemory,
     EvidencePack,
     ExamBank,
+    ExamItem,
     SelectionWeights,
     StudentQuestion,
     SurvivorSelection,
@@ -161,12 +162,15 @@ class BenchmarkRunner:
         answer_client: AnswerClient,
         config: BenchmarkConfig | None = None,
         tracer: Any | None = None,
+        fallback_generator: ExamGenerator | None = None,
     ) -> None:
         self.pack = pack
         self.generator = generator
         self.answer_client = answer_client
         self.cfg = config or BenchmarkConfig()
         self.tracer = tracer
+        self.fallback_generator = fallback_generator
+        self.fallback_model = getattr(fallback_generator, "model_id", "")
         self.bank: ExamBank | None = None
         self.answer_key: AnswerKey | None = None
         self.survivor_bundle: SurvivorBundle | None = None
@@ -185,6 +189,37 @@ class BenchmarkRunner:
             value = usage.get(key)
             if isinstance(value, int):
                 self.token_usage[key] = self.token_usage.get(key, 0) + value
+
+    async def _generate_with_fallback(
+        self,
+        spec: GenerationSpec,
+        primary_error: EvidenceInsufficientError,
+        result: BenchmarkResult,
+    ) -> list[ExamItem] | None:
+        """Use the explicitly configured fallback examiner, never a silent one.
+
+        Returns the generated items, or ``None`` after recording an explicit
+        examiner-unavailable outcome. A fallback is only consulted when one was
+        explicitly configured (EXAM-2).
+        """
+        fallback = self.fallback_generator
+        if fallback is None:
+            result.outcome = OUTCOME_FAILED
+            result.reason_code = REASON_EXAMINER_UNAVAILABLE
+            result.reason = str(primary_error)
+            return None
+        try:
+            items = await fallback.generate(self.pack, spec)
+        except EvidenceInsufficientError as fallback_error:
+            result.outcome = OUTCOME_FAILED
+            result.reason_code = REASON_EXAMINER_UNAVAILABLE
+            result.reason = (
+                f"{primary_error}; configured fallback "
+                f"{self.fallback_model or 'unknown'} failed: {fallback_error}"
+            )
+            return None
+        result.examiner_fallback_used = True
+        return items
 
     async def _run_partition(
         self,
@@ -252,15 +287,18 @@ class BenchmarkRunner:
         result = BenchmarkResult(config_fingerprint=self.cfg.config_fingerprint)
         result.model_ids = dict(self.cfg.model_ids)
         result.outcome = OUTCOME_DEGRADED
+        result.examiner_fallback_model = self.fallback_model
+        if self.fallback_model:
+            result.model_ids.setdefault("examiner_fallback_model", self.fallback_model)
 
         # 1. Generate and independently validate the bank.
+        raw_items: list[ExamItem] | None
         try:
             raw_items = await self.generator.generate(self.pack, spec)
         except EvidenceInsufficientError as exc:
-            result.outcome = OUTCOME_FAILED
-            result.reason_code = REASON_EXAMINER_UNAVAILABLE
-            result.reason = str(exc)
-            return result
+            raw_items = await self._generate_with_fallback(spec, exc, result)
+            if raw_items is None:
+                return result
         accepted, _rejected, _reasons = validate_bank(raw_items, self.pack)
         if len(accepted) < self.cfg.total:
             result.outcome = OUTCOME_EXAM_INSUFFICIENT
@@ -323,7 +361,7 @@ class BenchmarkRunner:
                 bank, selection_ids, selection_contexts, responder_model, "selection"
             )
         except Exception as exc:
-            result.outcome = OUTCOME_SURVIVOR_UNBENCHMARKED
+            result.outcome = OUTCOME_DEGRADED
             result.reason_code = REASON_INVALID_CANDIDATE_RESPONSE
             result.reason = str(exc)
             return result

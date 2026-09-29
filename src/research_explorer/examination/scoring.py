@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from research_explorer.examination.models import (
     AnswerKey,
@@ -98,5 +99,24 @@ def paired_confidence_interval(
     if count == 1:
         return (mean, mean)
     variance = sum((value - mean) ** 2 for value in diffs) / (count - 1)
+    stderr = math.sqrt(variance / count)
+    return (mean - z * stderr, mean + z * stderr)
+
+
+def across_run_confidence_interval(
+    uplifts: Sequence[float], z: float = 1.96
+) -> tuple[float, float] | None:
+    """Paired 95% interval across repeated independent runs (EXAM-8).
+
+    Each element is one run's ``survivor_accuracy - naive_accuracy``. The
+    interval is a normal approximation across runs and requires at least two
+    runs; a single run is descriptive only and returns ``None``.
+    """
+    values = [float(value) for value in uplifts]
+    count = len(values)
+    if count < 2:
+        return None
+    mean = sum(values) / count
+    variance = sum((value - mean) ** 2 for value in values) / (count - 1)
     stderr = math.sqrt(variance / count)
     return (mean - z * stderr, mean + z * stderr)

@@ -36,7 +36,11 @@ from research_explorer.examination.report import (
     private_key_artifact,
     public_exam_artifact,
 )
-from research_explorer.examination.scoring import score_answers
+from research_explorer.examination.scoring import (
+    across_run_confidence_interval,
+    paired_confidence_interval,
+    score_answers,
+)
 from research_explorer.examination.selection import (
     candidate_eligibility,
     select_survivor,
@@ -354,3 +358,102 @@ def test_report_reconstructs_scores_partitions_models_and_reasons() -> None:
     assert result.outcome in report
     json_blob = benchmark_result_json(result)
     assert result.survivor_id in json_blob
+
+
+def test_answer_batch_size_drives_batch_count() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    client = _RecordingAnswerClient()
+    config = BenchmarkConfig(
+        5,
+        4,
+        7,
+        answer_batch_size=2,
+        model_ids={"answer_model": client.model_id},
+        prompt_versions={"examiner": "v1", "answer": "v1"},
+    )
+    _runner, result = _run_sync(pack, candidates, acquired, client, config)
+    assert result.outcome == OUTCOME_BENCHMARKED
+    selection_calls = [c for c in client.calls if c[0] == "survivor-candidate"]
+    assert len(selection_calls) == 3
+    assert sum(len(c[1]) for c in selection_calls) == 5
+
+
+class _UsageAnswerClient(FakeAnswerClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_usage = {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "total_tokens": 5,
+        }
+
+    async def answer(self, responder, questions, context):
+        import asyncio
+
+        await asyncio.sleep(0.01)
+        return await super().answer(responder, questions, context)
+
+
+def test_benchmark_result_records_latency_and_token_usage() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    client = _UsageAnswerClient()
+    _runner, result = _run_sync(pack, candidates, acquired, client)
+    assert result.outcome == OUTCOME_BENCHMARKED
+    assert result.latency_seconds > 0
+    assert result.token_usage.get("total_tokens", 0) > 0
+    report = benchmark_report_markdown(result, pack)
+    assert "Cost (USD):" in report
+    assert "Examiner fallback:" in report
+
+
+def test_paired_and_across_run_intervals_are_deterministic() -> None:
+    paired = {
+        "q1": {"survivor": True, "naive": False},
+        "q2": {"survivor": True, "naive": True},
+        "q3": {"survivor": False, "naive": True},
+        "q4": {"survivor": True, "naive": False},
+    }
+    low, high = paired_confidence_interval(paired)
+    assert low < 0.25 < high
+    assert paired_confidence_interval({}) is None
+    assert paired_confidence_interval(
+        {"q1": {"survivor": True, "naive": False}}
+    ) == (1.0, 1.0)
+
+    across = across_run_confidence_interval([0.0, 0.1, 0.2])
+    assert across is not None
+    assert across[0] < 0.1 < across[1]
+    assert across_run_confidence_interval([0.2]) is None
+    assert across_run_confidence_interval([]) is None
+
+
+class _SelectionOfflineClient(FakeAnswerClient):
+    async def answer(self, responder, questions, context):
+        raise RuntimeError("selection arm offline")
+
+
+def test_pre_survivor_selection_failure_is_completed_degraded() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    _runner, result = _run_sync(pack, candidates, acquired, _SelectionOfflineClient())
+    assert result.outcome == "completed_degraded"
+    assert result.reason_code == "invalid_candidate_response"
+    assert result.survivor_id == ""
+
+
+def test_configured_fallback_examiner_is_used_explicitly() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    fallback = FakeExaminer(ambiguous_at=None, model_id="fallback-examiner")
+    runner = BenchmarkRunner(
+        pack,
+        FakeExaminer(unavailable_reason="primary offline"),
+        FakeAnswerClient(),
+        BenchmarkConfig(6, 4, 7, model_ids={"answer_model": "fake-answer-v1"}),
+        fallback_generator=fallback,
+    )
+    import asyncio
+
+    result = asyncio.run(runner.run(candidates, acquired))
+    assert result.outcome == OUTCOME_BENCHMARKED
+    assert result.examiner_fallback_used is True
+    assert result.examiner_fallback_model == "fallback-examiner"
+    assert "fallback-examiner" in benchmark_report_markdown(result, pack)

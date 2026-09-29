@@ -1248,6 +1248,7 @@ def render_exam_phase(state: RunViewState, phase: str) -> list[str]:
         lines.append(f"- survivor accuracy: {_ratio_text(state.survivor_accuracy)}")
         lines.append(f"- naive accuracy: {_ratio_text(state.naive_accuracy)}")
         lines.append(f"- research uplift: {_uplift_text(state.uplift)}")
+        lines.extend(_render_public_outcomes(state))
     if record.reason and phase != PHASE_BENCHMARK:
         lines.append(f"- note: {record.reason}")
     return lines
@@ -1272,6 +1273,41 @@ def _render_terminal_breakdown(state: RunViewState) -> list[str]:
     return lines
 
 
+def _render_bucket_rows(buckets: dict[str, dict[str, int]]) -> list[str]:
+    rows: list[str] = []
+    for name in sorted(buckets):
+        bucket = buckets[name]
+        correct = int(bucket.get("correct", 0))
+        total = int(bucket.get("total", 0))
+        share = f" ({correct / total * 100:.1f}%)" if total else ""
+        rows.append(f"- {name.replace('_', ' ')}: {correct}/{total}{share}")
+    return rows
+
+
+def _render_public_outcomes(state: RunViewState) -> list[str]:
+    """Public post-benchmark outcomes; never rendered while a test is active."""
+    if not state.benchmark_outcome:
+        return []
+    lines: list[str] = []
+    if state.benchmark_by_category:
+        lines.append("")
+        lines.append("### Public category outcomes (survivor)")
+        lines.extend(_render_bucket_rows(state.benchmark_by_category))
+    if state.benchmark_by_difficulty:
+        lines.append("")
+        lines.append("### Public difficulty outcomes (survivor)")
+        lines.extend(_render_bucket_rows(state.benchmark_by_difficulty))
+    if state.benchmark_item_outcomes:
+        correct = sum(1 for value in state.benchmark_item_outcomes.values() if value)
+        total = len(state.benchmark_item_outcomes)
+        lines.append("")
+        lines.append(f"### Public holdout item outcomes ({correct}/{total} correct)")
+        for question_id in sorted(state.benchmark_item_outcomes):
+            mark = "correct" if state.benchmark_item_outcomes[question_id] else "incorrect"
+            lines.append(f"- {question_id}: {mark}")
+    return lines
+
+
 def _render_benchmark_result(state: RunViewState) -> list[str]:
     if not (state.benchmark_outcome or state.survivor_id):
         return []
@@ -1287,6 +1323,7 @@ def _render_benchmark_result(state: RunViewState) -> list[str]:
     lines.append(f"- Survivor accuracy: {_ratio_text(state.survivor_accuracy)}")
     lines.append(f"- Naive accuracy: {_ratio_text(state.naive_accuracy)}")
     lines.append(f"- Research uplift: {_uplift_text(state.uplift)}")
+    lines.extend(_render_public_outcomes(state))
     return lines
 
 

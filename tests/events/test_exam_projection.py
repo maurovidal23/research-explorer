@@ -42,14 +42,26 @@ def _emit_exam_events(tracer: RunTracer) -> None:
     tracer.emit("candidate_test_completed", agent_id="a0", partition="selection")
 
     from research_explorer.examination.benchmark import BenchmarkResult
-    from research_explorer.examination.models import SurvivorSelection
+    from research_explorer.examination.models import (
+        CategoryScore,
+        ExamScore,
+        SurvivorSelection,
+    )
 
+    survivor_score = ExamScore(
+        correct=1,
+        total=1,
+        item_outcomes={"q-2": True},
+        by_category={"concepts_definitions": CategoryScore(correct=1, total=1)},
+        by_difficulty={"easy": CategoryScore(correct=1, total=1)},
+    )
     result = BenchmarkResult(
         survivor_id="a0",
         outcome="completed_benchmarked",
         survivor_accuracy=0.75,
         naive_accuracy=0.25,
         uplift=0.5,
+        survivor_score=survivor_score,
         selection=SurvivorSelection(
             survivor_id="a0", eligible=True, terminal_score=0.8, selection_accuracy=0.7
         ),
@@ -91,6 +103,19 @@ def test_exam_projection_live_matches_replay(tmp_path) -> None:
     assert replayed.state.current_phase == "benchmark"
     assert replayed.state.exam_phases["exam_build"].status == "completed"
     assert replayed.state.exam_phases["survivor"].leader == "a0"
+    assert replayed.state.benchmark_item_outcomes == {"q-2": True}
+    assert replayed.state.benchmark_by_category == {
+        "concepts_definitions": {"correct": 1, "total": 1}
+    }
+    assert replayed.state.benchmark_by_difficulty == {"easy": {"correct": 1, "total": 1}}
+    from research_explorer.tui import text as render
+
+    rendered = render.render_final_result(replayed.state)
+    assert "Public category outcomes" in rendered
+    assert "concepts definitions: 1/1" in rendered
+    assert "q-2: correct" in rendered
+    for forbidden in ("correct_option_id", "rationale", "answer_key", "evidence_refs"):
+        assert forbidden not in rendered
     store.close()
 
 

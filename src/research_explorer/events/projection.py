@@ -86,6 +86,20 @@ def _as_optional_float(value: Any) -> float | None:
         return None
 
 
+def _bucket_map(value: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        return {}
+    buckets: dict[str, dict[str, int]] = {}
+    for name, bucket in value.items():
+        if not isinstance(bucket, dict):
+            continue
+        buckets[str(name)] = {
+            "correct": _as_int(bucket.get("correct")),
+            "total": _as_int(bucket.get("total")),
+        }
+    return buckets
+
+
 class RunProjection:
     """Reduces ordered events into a :class:`RunViewState`."""
 
@@ -1391,6 +1405,25 @@ class RunProjection:
             self.state.naive_accuracy = _as_optional_float(p.get("naive_accuracy"))
         if "uplift" in p:
             self.state.uplift = _as_optional_float(p.get("uplift"))
+        outcomes = p.get("item_outcomes")
+        if isinstance(outcomes, dict):
+            self.state.benchmark_item_outcomes = {
+                str(key): bool(value) for key, value in outcomes.items()
+            }
+        naive_outcomes = p.get("naive_item_outcomes")
+        if isinstance(naive_outcomes, dict):
+            self.state.benchmark_naive_item_outcomes = {
+                str(key): bool(value) for key, value in naive_outcomes.items()
+            }
+        for key, field in (
+            ("by_category", "benchmark_by_category"),
+            ("by_difficulty", "benchmark_by_difficulty"),
+            ("naive_by_category", "benchmark_naive_by_category"),
+            ("naive_by_difficulty", "benchmark_naive_by_difficulty"),
+        ):
+            buckets = p.get(key)
+            if isinstance(buckets, dict):
+                setattr(self.state, field, _bucket_map(buckets))
         record = self._exam_phase(PHASE_BENCHMARK)
         record.status = NODE_COMPLETED
         self.state.current_phase = PHASE_BENCHMARK

@@ -112,3 +112,25 @@ def test_live_answer_model_fails_closed_when_unset() -> None:
         orchestrator._require_answer_model(SimpleNamespace(answer_model="answer-x"))
         == "answer-x"
     )
+
+
+def test_source_distances_classify_seed_references_citants_and_deeper() -> None:
+    from research_explorer.orchestrator.runner import _source_distances
+
+    agent = SimpleNamespace(
+        state=SimpleNamespace(
+            local_refs={"arxiv:seed": ["arxiv:ref"]},
+            local_cits={"arxiv:seed": ["arxiv:cit"]},
+        )
+    )
+    distances = _source_distances(
+        "arxiv:seed",
+        [agent],
+        {"arxiv:seed": 1, "arxiv:ref": 1, "arxiv:cit": 1, "arxiv:deep": 1},
+    )
+    assert distances == {
+        "arxiv:seed": "seed",
+        "arxiv:ref": "direct_reference",
+        "arxiv:cit": "citant",
+        "arxiv:deep": "deeper",
+    }

@@ -11,6 +11,7 @@ from research_explorer.examination.models import (
     EvidencePack,
     ExamBank,
 )
+from research_explorer.examination.scoring import across_run_confidence_interval
 
 
 def public_exam_artifact(bank: ExamBank) -> str:
@@ -48,6 +49,34 @@ def _uplift_interval(result: BenchmarkResult) -> str:
 
 def _humanize(name: str) -> str:
     return name.replace("_", " ") or "unlabeled"
+
+
+def _cost_text(result: BenchmarkResult) -> str:
+    return "unavailable (no pricing configured)" if result.cost is None else f"{result.cost:.6f}"
+
+
+def _fallback_text(result: BenchmarkResult) -> str:
+    if result.examiner_fallback_used:
+        return f"used ({result.examiner_fallback_model or 'unknown'})"
+    if result.examiner_fallback_model:
+        return f"configured, not used ({result.examiner_fallback_model})"
+    return "not configured"
+
+
+def _across_run_interval(result: BenchmarkResult) -> list[str]:
+    interval = across_run_confidence_interval(result.replicate_uplifts)
+    if interval is None:
+        return []
+    low, high = interval
+    lines = [
+        f"- Across-run paired 95% interval: [{low * 100:.2f}, {high * 100:.2f}] pp "
+        f"({len(result.replicate_uplifts)} runs)"
+    ]
+    if result.replicate_fingerprints:
+        lines.append(
+            f"- Run fingerprints: {', '.join(result.replicate_fingerprints)}"
+        )
+    return lines
 
 
 def _bucket_line(name: str, bucket: Any) -> str:
@@ -175,6 +204,7 @@ def benchmark_report_markdown(
                 f"{'unavailable' if result.uplift is None else f'{result.uplift * 100:.2f}'}"
             ),
             f"- Paired 95% interval (item-level): {_uplift_interval(result)}",
+            *_across_run_interval(result),
             f"- Survivor arm unavailable: {result.survivor_unavailable or 'no'}",
             f"- Naive arm unavailable: {result.naive_unavailable or 'no'}",
             "",
@@ -197,6 +227,8 @@ def benchmark_report_markdown(
             f"- Models: {json.dumps(result.model_ids, sort_keys=True)}",
             f"- Token usage: {json.dumps(result.token_usage, sort_keys=True) or '{}'}",
             f"- Answer latency (s): {result.latency_seconds:.4f}",
+            f"- Cost (USD): {_cost_text(result)}",
+            f"- Examiner fallback: {_fallback_text(result)}",
         ]
     )
     if result.survivor_score is not None:

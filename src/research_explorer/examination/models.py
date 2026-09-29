@@ -375,3 +375,8 @@ class BenchmarkResult(BaseModel):
     model_ids: dict[str, str] = Field(default_factory=dict)
     token_usage: dict[str, int] = Field(default_factory=dict)
     latency_seconds: float = 0.0
+    cost: float | None = None
+    examiner_fallback_model: str = ""
+    examiner_fallback_used: bool = False
+    replicate_uplifts: list[float] = Field(default_factory=list)
+    replicate_fingerprints: list[str] = Field(default_factory=list)

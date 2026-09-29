@@ -63,6 +63,15 @@ def _benchmark_section(
     lines.append(f"- **Models:** {json.dumps(result.model_ids, sort_keys=True)}")
     lines.append(f"- **Token usage:** {json.dumps(result.token_usage, sort_keys=True) or '{}'}")
     lines.append(f"- **Answer latency (s):** {result.latency_seconds:.4f}")
+    cost = "unavailable (no pricing configured)" if result.cost is None else f"{result.cost:.6f}"
+    lines.append(f"- **Cost (USD):** {cost}")
+    if result.examiner_fallback_used:
+        fallback = f"used ({result.examiner_fallback_model or 'unknown'})"
+    elif result.examiner_fallback_model:
+        fallback = f"configured, not used ({result.examiner_fallback_model})"
+    else:
+        fallback = "not configured"
+    lines.append(f"- **Examiner fallback:** {fallback}")
     lines.append(f"- **Frozen state hash:** {result.state_hash or 'unset'}")
     lines.append("")
     return lines

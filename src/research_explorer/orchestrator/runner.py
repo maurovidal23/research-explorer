@@ -53,6 +53,37 @@ if TYPE_CHECKING:
 log = get_logger("orchestrator")
 
 
+def _source_distances(
+    seed_nid: str, agents: list, paper_ids: dict
+) -> dict[str, str]:
+    """Classify evidence sources by citation distance from the seed (EXAM-3/8).
+
+    Uses the union of the agents' private reference/citation edges around the
+    seed: seed, its direct references, its citants, and everything else reached
+    at a deeper path. This keeps the reported source-distance breakdown honest
+    instead of collapsing every non-seed paper to ``direct_reference``.
+    """
+    seed_refs: set[str] = set()
+    seed_cits: set[str] = set()
+    for agent in agents:
+        state = getattr(agent, "state", None)
+        if state is None:
+            continue
+        seed_refs.update(state.local_refs.get(seed_nid, []))
+        seed_cits.update(state.local_cits.get(seed_nid, []))
+    distances: dict[str, str] = {}
+    for paper_id in paper_ids:
+        if paper_id == seed_nid:
+            distances[paper_id] = "seed"
+        elif paper_id in seed_refs:
+            distances[paper_id] = "direct_reference"
+        elif paper_id in seed_cits:
+            distances[paper_id] = "citant"
+        else:
+            distances[paper_id] = "deeper"
+    return distances
+
+
 def resolve_examiner_key(api_key_env: str) -> str:
     """Resolve the examiner credential without reusing another provider's key.
 
@@ -495,10 +526,7 @@ class Orchestrator:
             )
             return
 
-        distances = {
-            paper_id: ("seed" if paper_id == seed_nid else "direct_reference")
-            for paper_id in union
-        }
+        distances = _source_distances(seed_nid, self.colony.agents, union)
         pack = build_evidence_pack(
             seed_nid, self.effective_scope, union, distances=distances
         ).freeze()
@@ -510,10 +538,13 @@ class Orchestrator:
         if exam.examiner_provider == "fake":
             generator = FakeExaminer()
             answer_client = FakeAnswerClient()
+            fallback_generator = None
             answer_model = exam.answer_model or "fake-answer-v1"
         else:
             answer_model = self._require_answer_model(exam)
-            generator, answer_client = self._build_live_exam_clients(answer_model)
+            generator, answer_client, fallback_generator = self._build_live_exam_clients(
+                answer_model
+            )
 
         candidates = []
         acquired: dict = {}
@@ -551,7 +582,14 @@ class Orchestrator:
             },
             prompt_versions={"examiner": "v1", "answer": "v1"},
         )
-        runner = BenchmarkRunner(pack, generator, answer_client, config, tracer=tracer)
+        runner = BenchmarkRunner(
+            pack,
+            generator,
+            answer_client,
+            config,
+            tracer=tracer,
+            fallback_generator=fallback_generator,
+        )
         result = await runner.run(candidates, acquired)
         self.benchmark_result = result
         self.survivor_bundle = runner.survivor_bundle
@@ -620,7 +658,12 @@ class Orchestrator:
         )
 
     def _build_live_exam_clients(self, answer_model: str):
-        """Build the examiner/answer clients (live path, not used by tests)."""
+        """Build the examiner/answer clients (live path, not used by tests).
+
+        A fallback examiner is built only when ``allow_examiner_fallback`` is
+        set and a fallback model is configured; it is never used silently
+        (EXAM-2).
+        """
         from research_explorer.agents.llm_client import LLMClient
         from research_explorer.examination import LLMAnswerClient, LLMExaminer
 
@@ -632,23 +675,32 @@ class Orchestrator:
             rpm=self.cfg.llm.rpm,
         )
         self._examiner_llm = examiner_llm
-        return (
-            LLMExaminer(
+        generator = LLMExaminer(
+            examiner_llm,
+            exam.examiner_model,
+            exam.examiner_max_tokens,
+            temperature=exam.examiner_temperature,
+            reasoning_effort=exam.examiner_reasoning_effort or None,
+            evidence_max_chars=exam.evidence_max_chars,
+        )
+        fallback_generator = None
+        if exam.allow_examiner_fallback and exam.fallback_examiner_model.strip():
+            fallback_generator = LLMExaminer(
                 examiner_llm,
-                exam.examiner_model,
+                exam.fallback_examiner_model,
                 exam.examiner_max_tokens,
                 temperature=exam.examiner_temperature,
                 reasoning_effort=exam.examiner_reasoning_effort or None,
                 evidence_max_chars=exam.evidence_max_chars,
-            ),
-            LLMAnswerClient(
-                examiner_llm,
-                answer_model,
-                temperature=exam.answer_temperature,
-                max_tokens=exam.answer_max_tokens,
-                reasoning_effort=exam.answer_reasoning_effort or None,
-            ),
+            )
+        answer_client = LLMAnswerClient(
+            examiner_llm,
+            answer_model,
+            temperature=exam.answer_temperature,
+            max_tokens=exam.answer_max_tokens,
+            reasoning_effort=exam.answer_reasoning_effort or None,
         )
+        return generator, answer_client, fallback_generator
 
     def _outcome_gap(self, winner_id: str, narrative: str) -> str:
         """Return the stable degraded reason for an otherwise-completed run.

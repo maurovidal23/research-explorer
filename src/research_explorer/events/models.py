@@ -444,6 +444,12 @@ class RunViewState(BaseModel):
     survivor_grounding_score: float | None = None
     survivor_ranking: list[str] = Field(default_factory=list)
     survivor_synthesis: str = ""
+    benchmark_item_outcomes: dict[str, bool] = Field(default_factory=dict)
+    benchmark_naive_item_outcomes: dict[str, bool] = Field(default_factory=dict)
+    benchmark_by_category: dict[str, dict[str, int]] = Field(default_factory=dict)
+    benchmark_by_difficulty: dict[str, dict[str, int]] = Field(default_factory=dict)
+    benchmark_naive_by_category: dict[str, dict[str, int]] = Field(default_factory=dict)
+    benchmark_naive_by_difficulty: dict[str, dict[str, int]] = Field(default_factory=dict)
 
     def ordered_agents(self) -> list[AgentSummary]:
         return [self.agents[a] for a in self.agent_order if a in self.agents]

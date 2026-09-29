@@ -56,6 +56,36 @@ def exam_payloads(
     return payloads
 
 
+def _bucket_payload(buckets: dict[str, Any]) -> dict[str, dict[str, int]]:
+    return {
+        str(name): {"correct": int(bucket.correct), "total": int(bucket.total)}
+        for name, bucket in buckets.items()
+    }
+
+
+def _public_outcome_payload(result: BenchmarkResult) -> dict[str, Any]:
+    """Public post-benchmark outcomes: per-item correctness and bucket totals.
+
+    These are booleans and aggregate counts only; no option key, rationale, or
+    evidence annotation is ever included.
+    """
+    survivor = result.survivor_score
+    naive = result.naive_score
+    if survivor is None and naive is None:
+        return {}
+    payload: dict[str, Any] = {
+        "item_outcomes": dict(survivor.item_outcomes) if survivor else {},
+        "naive_item_outcomes": dict(naive.item_outcomes) if naive else {},
+    }
+    if survivor is not None:
+        payload["by_category"] = _bucket_payload(survivor.by_category)
+        payload["by_difficulty"] = _bucket_payload(survivor.by_difficulty)
+    if naive is not None:
+        payload["naive_by_category"] = _bucket_payload(naive.by_category)
+        payload["naive_by_difficulty"] = _bucket_payload(naive.by_difficulty)
+    return payload
+
+
 def survivor_payloads(
     result: BenchmarkResult, synthesis: str = ""
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -101,6 +131,7 @@ def survivor_payloads(
                 "reason_code": result.reason_code,
                 "reason": result.reason,
                 "survivor_synthesis": synthesis,
+                **_public_outcome_payload(result),
             },
         )
     )
