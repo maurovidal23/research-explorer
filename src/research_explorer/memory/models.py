@@ -13,17 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 MEMORY_SCHEMA_VERSION = "research-memory/1"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def content_hash(text: str) -> str:

@@ -12,13 +12,9 @@ import random
 from typing import Protocol, runtime_checkable
 
 from research_explorer.examination.models import (
-    CATEGORY_ASSUMPTIONS,
+    CATEGORIES,
     CATEGORY_CONCEPTS,
-    CATEGORY_CROSS_PAPER,
     CATEGORY_DISTRIBUTION,
-    CATEGORY_METHOD,
-    CATEGORY_RESULTS,
-    CATEGORY_TRANSFER,
     DIFFICULTY_EASY,
     DIFFICULTY_HARD,
     DIFFICULTY_MEDIUM,
@@ -32,15 +28,6 @@ from research_explorer.examination.models import (
 from research_explorer.logging_setup import get_logger
 
 log = get_logger("examiner")
-
-_CATEGORY_ORDER = (
-    CATEGORY_CONCEPTS,
-    CATEGORY_METHOD,
-    CATEGORY_RESULTS,
-    CATEGORY_ASSUMPTIONS,
-    CATEGORY_CROSS_PAPER,
-    CATEGORY_TRANSFER,
-)
 
 _QUESTION_WORDS = (
     "alignment",
@@ -108,13 +95,13 @@ def _category_counts(total: int) -> list[str]:
         counts[category] = n
         assigned += n
     remainder = total - assigned
-    for category in _CATEGORY_ORDER:
+    for category in CATEGORIES:
         if remainder <= 0:
             break
         counts[category] += 1
         remainder -= 1
     ordered: list[str] = []
-    for category in _CATEGORY_ORDER:
+    for category in CATEGORIES:
         ordered.extend([category] * counts[category])
     return ordered
 

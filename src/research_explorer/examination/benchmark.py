@@ -9,6 +9,17 @@ from __future__ import annotations
 
 import hashlib
 
+from research_explorer.events.models import (
+    OUTCOME_BENCHMARKED,
+    OUTCOME_DEGRADED_NO_SURVIVOR,
+    OUTCOME_FAILED,
+    OUTCOME_SURVIVOR_UNBENCHMARKED,
+    REASON_BASELINE_FAILED,
+    REASON_EXAMINER_UNAVAILABLE,
+    REASON_INSUFFICIENT_QUESTIONS,
+    REASON_INVALID_CANDIDATE_RESPONSE,
+    REASON_NO_ELIGIBLE_SURVIVOR,
+)
 from research_explorer.examination.clients import AnswerClient, build_answer_set
 from research_explorer.examination.generator import (
     EvidenceInsufficientError,
@@ -40,18 +51,7 @@ from research_explorer.survivor.models import SelectionMetadata, SurvivorBundle
 
 log = get_logger("benchmark")
 
-OUTCOME_BENCHMARKED = "completed_benchmarked"
-OUTCOME_SURVIVOR_UNBENCHMARKED = "completed_survivor_unbenchmarked"
-OUTCOME_DEGRADED = "completed_degraded"
-OUTCOME_FAILED = "failed"
-
-REASON_EXAMINER_UNAVAILABLE = "examiner_unavailable"
-REASON_INSUFFICIENT_QUESTIONS = "insufficient_validated_questions"
-REASON_INVALID_CANDIDATE_RESPONSE = "invalid_candidate_response"
-REASON_BASELINE_FAILED = "baseline_failed"
-REASON_SURVIVOR_UNAVAILABLE = "survivor_unavailable"
-REASON_NO_ELIGIBLE_SURVIVOR = "no_eligible_survivor"
-
+OUTCOME_DEGRADED = OUTCOME_DEGRADED_NO_SURVIVOR
 NAIVE_DISTANCE = "seed"
 
 

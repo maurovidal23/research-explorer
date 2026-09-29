@@ -247,10 +247,12 @@ class Orchestrator:
         # 2. Initialize the colony (each agent reads the seed). The tracer is
         # attached before seed discovery so its telemetry is durable/replayable.
         tracer.emit("colony_init_started", seed=seed_nid)
-        await self.colony.initialize(seed_nid, self.effective_scope, tracer=tracer)
-        for agent in getattr(self.colony, "agents", []):
-            agent.state.research_scope = self.effective_scope
-            agent.state.scope_origin = self.scope_origin
+        await self.colony.initialize(
+            seed_nid,
+            self.effective_scope,
+            tracer=tracer,
+            scope_origin=self.scope_origin,
+        )
         tracer.emit(
             "colony_initialized",
             size=len(self.colony.agents),
@@ -410,7 +412,7 @@ class Orchestrator:
         try:
             await self._benchmark_impl(seed_nid, tracer)
         except Exception as exc:
-            from research_explorer.examination.benchmark import (
+            from research_explorer.events.models import (
                 OUTCOME_SURVIVOR_UNBENCHMARKED,
                 REASON_SURVIVOR_UNAVAILABLE,
             )

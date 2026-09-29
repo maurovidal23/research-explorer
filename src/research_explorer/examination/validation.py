@@ -10,9 +10,7 @@ from __future__ import annotations
 import re
 
 from research_explorer.examination.models import (
-    CATEGORY_DISTRIBUTION as _KNOWN_CATEGORIES,
-)
-from research_explorer.examination.models import (
+    CATEGORIES,
     DIFFICULTIES,
     EXAM_SCHEMA_VERSION,
     STATUS_REJECTED,
@@ -84,7 +82,7 @@ def validate_item(
         if any(ref not in known for ref in item.evidence_refs):
             reasons.append(REASON_UNRESOLVED_EVIDENCE)
 
-    if item.category not in _KNOWN_CATEGORIES:
+    if item.category not in CATEGORIES:
         reasons.append(REASON_INVALID_CATEGORY)
     if item.difficulty not in DIFFICULTIES:
         reasons.append(REASON_INVALID_DIFFICULTY)

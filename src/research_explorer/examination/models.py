@@ -34,6 +34,8 @@ CATEGORY_DISTRIBUTION: dict[str, float] = {
     CATEGORY_TRANSFER: 0.10,
 }
 
+CATEGORIES: tuple[str, ...] = tuple(CATEGORY_DISTRIBUTION)
+
 DIFFICULTY_EASY = "easy"
 DIFFICULTY_MEDIUM = "medium"
 DIFFICULTY_HARD = "hard"

@@ -7,12 +7,13 @@ plausible, disputed, and unknown statements.
 
 from __future__ import annotations
 
+import re
 from typing import Protocol, runtime_checkable
 
 from research_explorer.memory.models import ClaimStatus, LedgerClaim
 from research_explorer.survivor.models import LaterAnswer, SurvivorBundle
 
-_WORD_RE = __import__("re").compile(r"[a-z0-9]+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 @runtime_checkable

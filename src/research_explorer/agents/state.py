@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from research_explorer.memory.extract import merge_claims
 from research_explorer.memory.models import (
     Concept,
     ContentKind,
@@ -23,6 +24,7 @@ from research_explorer.memory.models import (
     LedgerClaim,
     PaperDossier,
     PaperRelation,
+    ResearchMemory,
 )
 from research_explorer.memory.synthesis import synthesize_memory
 
@@ -182,8 +184,6 @@ class AgentState(BaseModel):
             if existing is None:
                 self.claims[claim.id] = claim
             else:
-                from research_explorer.memory.extract import merge_claims
-
                 self.claims[claim.id] = merge_claims(existing, claim)
 
     def record_relation(self, relation: PaperRelation) -> None:
@@ -196,8 +196,6 @@ class AgentState(BaseModel):
 
     def regenerate_synthesis(self, max_words: int | None = None) -> str:
         """Regenerate the derived synthesis view without mutating memory."""
-        from research_explorer.memory.models import ResearchMemory
-
         if max_words is not None:
             self.synthesis_words = max_words
         memory = ResearchMemory(

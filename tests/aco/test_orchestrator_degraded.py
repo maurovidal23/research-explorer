@@ -64,7 +64,9 @@ class _StubColony:
     def init_reason_text(self) -> str:
         return reason_text(self.init_reason) if self.init_reason else ""
 
-    async def initialize(self, seed_id: str, seed_query: str, tracer=None) -> None:
+    async def initialize(
+        self, seed_id: str, seed_query: str, tracer=None, scope_origin: str = "derived"
+    ) -> None:
         self.tracer_attached = tracer is not None
 
     def active_candidates(self) -> list:

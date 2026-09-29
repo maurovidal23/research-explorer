@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from research_explorer.graph.models import Paper, PaperSummary
+from research_explorer.graph.models import Paper, PaperSummary, normalize_id
 from research_explorer.memory.models import (
     ClaimStatus,
     Concept,
@@ -107,8 +107,6 @@ def _primary_evidence(paper: Paper, acquisition_event: int | None) -> list[Dossi
 
 
 def _normalized(paper: Paper) -> str:
-    from research_explorer.graph.models import normalize_id
-
     return normalize_id(paper.provider, paper.id)
 
 

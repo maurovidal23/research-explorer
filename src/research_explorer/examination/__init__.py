@@ -29,6 +29,7 @@ from research_explorer.examination.generator import (
     build_answer_key,
 )
 from research_explorer.examination.models import (
+    CATEGORIES,
     CATEGORY_DISTRIBUTION,
     EXAM_SCHEMA_VERSION,
     STATUS_REJECTED,
@@ -71,6 +72,7 @@ from research_explorer.examination.synthetic import (
 from research_explorer.examination.validation import validate_bank, validate_item
 
 __all__ = [
+    "CATEGORIES",
     "CATEGORY_DISTRIBUTION",
     "EXAM_SCHEMA_VERSION",
     "OUTCOME_BENCHMARKED",
