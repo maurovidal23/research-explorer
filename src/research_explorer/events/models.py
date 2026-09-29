@@ -89,6 +89,18 @@ class EventType:
     REFERENCE_MAPPING_FAILED = "reference_mapping_failed"
     ARTIFACT_SAVED = "artifact_saved"
     WARNING = "warning"
+    # Examination / survivor lifecycle (OBS-1)
+    EVIDENCE_PACK_FROZEN = "evidence_pack_frozen"
+    EXAM_GENERATED = "exam_generated"
+    EXAM_VALIDATED = "exam_validated"
+    EXAM_PARTITIONED = "exam_partitioned"
+    EXAM_INSUFFICIENT = "exam_insufficient"
+    CANDIDATE_TEST_STARTED = "candidate_test_started"
+    CANDIDATE_TEST_COMPLETED = "candidate_test_completed"
+    SURVIVOR_SELECTED = "survivor_selected"
+    SURVIVOR_FROZEN = "survivor_frozen"
+    BASELINE_COMPLETED = "baseline_completed"
+    BENCHMARK_COMPLETED = "benchmark_completed"
 
 
 LEGACY_TYPES: dict[str, str] = {
@@ -125,14 +137,31 @@ TERMINAL_STATUSES = frozenset(
 OUTCOME_COMPLETED = "completed"
 OUTCOME_DEGRADED = "degraded"
 
+# Terminal benchmark outcomes (EXAM-9)
+OUTCOME_BENCHMARKED = "completed_benchmarked"
+OUTCOME_SURVIVOR_UNBENCHMARKED = "completed_survivor_unbenchmarked"
+OUTCOME_DEGRADED_NO_SURVIVOR = "completed_degraded"
+OUTCOME_FAILED = "failed"
+
 PHASE_SETUP = "setup"
 PHASE_RESEARCH = "research"
 PHASE_EVALUATION = "evaluation"
 PHASE_DECISION = "decision"
 PHASE_RESULT = "result"
 PHASE_DEBUG = "debug"
+# Terminal examination phases after research convergence (TUI-1)
+PHASE_EXAM_BUILD = "exam_build"
+PHASE_SELECTION = "selection"
+PHASE_SURVIVOR = "survivor"
+PHASE_BENCHMARK = "benchmark"
 
 WAVE_PHASE_ORDER: tuple[str, ...] = (PHASE_RESEARCH, PHASE_EVALUATION, PHASE_DECISION)
+EXAM_PHASE_ORDER: tuple[str, ...] = (
+    PHASE_EXAM_BUILD,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
+    PHASE_BENCHMARK,
+)
 
 EVAL_PENDING = "pending"
 EVAL_COMPLETE = "complete"
@@ -153,6 +182,14 @@ REASON_REFERENCE_EXTRACTION_FAILED = "reference_extraction_failed"
 REASON_REFERENCE_MAPPING_INCOMPLETE = "reference_mapping_incomplete"
 REASON_SEED_DISCOVERY_FAILED = "seed_discovery_failed"
 REASON_NO_WINNER = "no_winner"
+
+# Stable benchmark reason codes (EXAM-9)
+REASON_EXAMINER_UNAVAILABLE = "examiner_unavailable"
+REASON_INSUFFICIENT_QUESTIONS = "insufficient_validated_questions"
+REASON_INVALID_CANDIDATE_RESPONSE = "invalid_candidate_response"
+REASON_BASELINE_FAILED = "baseline_failed"
+REASON_SURVIVOR_UNAVAILABLE = "survivor_unavailable"
+REASON_NO_ELIGIBLE_SURVIVOR = "no_eligible_survivor"
 
 REASON_TEXT: dict[str, str] = {
     REASON_NO_NEIGHBORS_DISCOVERED: (
@@ -181,6 +218,24 @@ REASON_TEXT: dict[str, str] = {
     ),
     REASON_WINNER_EVALUATION_MISSING: (
         "the winning agent has no terminal evaluation"
+    ),
+    REASON_EXAMINER_UNAVAILABLE: (
+        "the configured examiner was unavailable; no exam was generated"
+    ),
+    REASON_INSUFFICIENT_QUESTIONS: (
+        "the validation budget could not produce the minimum validated bank"
+    ),
+    REASON_INVALID_CANDIDATE_RESPONSE: (
+        "a candidate produced an invalid selection response"
+    ),
+    REASON_BASELINE_FAILED: (
+        "the matched naive baseline could not complete"
+    ),
+    REASON_SURVIVOR_UNAVAILABLE: (
+        "no usable survivor bundle was produced"
+    ),
+    REASON_NO_ELIGIBLE_SURVIVOR: (
+        "no candidate satisfied the survivor eligibility gates"
     ),
 }
 
@@ -367,6 +422,18 @@ class RunViewState(BaseModel):
     current_phase: str = ""
     stop_reason: str = ""
     legacy_projection: bool = False
+    # Terminal examination visibility (TUI-1)
+    exam_phases: dict[str, PhaseState] = Field(default_factory=dict)
+    survivor_id: str = ""
+    survivor_accuracy: float | None = None
+    naive_accuracy: float | None = None
+    uplift: float | None = None
+    benchmark_outcome: str = ""
+    benchmark_reason_code: str = ""
+    benchmark_reason: str = ""
+    exam_selection_count: int = 0
+    exam_holdout_count: int = 0
+    exam_rejected_count: int = 0
 
     def ordered_agents(self) -> list[AgentSummary]:
         return [self.agents[a] for a in self.agent_order if a in self.agents]

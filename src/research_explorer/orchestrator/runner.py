@@ -62,6 +62,9 @@ class Orchestrator:
         self.outcome: str = OUTCOME_COMPLETED
         self.terminal_reason: str = ""
         self.stop_reason: str = ""
+        self.effective_scope: str = ""
+        self.scope_origin: str = "derived"
+        self.benchmark_result: object | None = None
         configure_logging(config.log_level)
 
         # Storage
@@ -229,10 +232,25 @@ class Orchestrator:
         self.graph.cache_paper(seed_paper)
         seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
 
+        # SURV-1: the positional text is an optional research scope, not the
+        # literal final-answer question. When blank, derive a bounded profile.
+        from research_explorer.memory.scope import resolve_scope
+
+        self.effective_scope, self.scope_origin = resolve_scope(seed_query, seed_paper)
+        tracer.emit(
+            "research_scope_resolved",
+            seed=seed_nid,
+            scope=self.effective_scope,
+            origin=self.scope_origin,
+        )
+
         # 2. Initialize the colony (each agent reads the seed). The tracer is
         # attached before seed discovery so its telemetry is durable/replayable.
         tracer.emit("colony_init_started", seed=seed_nid)
-        await self.colony.initialize(seed_nid, seed_query, tracer=tracer)
+        await self.colony.initialize(seed_nid, self.effective_scope, tracer=tracer)
+        for agent in getattr(self.colony, "agents", []):
+            agent.state.research_scope = self.effective_scope
+            agent.state.scope_origin = self.scope_origin
         tracer.emit(
             "colony_initialized",
             size=len(self.colony.agents),
@@ -377,12 +395,205 @@ class Orchestrator:
                     narrative,
                 )
 
+        if self.cfg.examination.enabled and winner is not None:
+            await self._run_terminal_benchmark(seed_nid, tracer)
+
         self.trace.finish_run(
             run_id,
             "completed",
             best_quality=round(self.colony.best_quality, 6),
         )
         return self.colony.best_narrative if winner is not None else ""
+
+    async def _run_terminal_benchmark(self, seed_nid: str, tracer: RunTracer) -> None:
+        """Run the hidden examination and matched naive baseline (EXAM-1..9)."""
+        try:
+            await self._benchmark_impl(seed_nid, tracer)
+        except Exception as exc:
+            from research_explorer.examination.benchmark import (
+                OUTCOME_SURVIVOR_UNBENCHMARKED,
+                REASON_SURVIVOR_UNAVAILABLE,
+            )
+
+            self.outcome = OUTCOME_SURVIVOR_UNBENCHMARKED
+            self.terminal_reason = redact_secrets(str(exc))
+            tracer.emit(
+                "warning",
+                classification="warning",
+                outcome=self.outcome,
+                reason_code=REASON_SURVIVOR_UNAVAILABLE,
+                reason=self.terminal_reason,
+            )
+        log.info("terminal_benchmark_done", outcome=self.outcome)
+
+    async def _benchmark_impl(self, seed_nid: str, tracer: RunTracer) -> None:
+        from research_explorer.examination import (
+            BenchmarkConfig,
+            BenchmarkRunner,
+            FakeAnswerClient,
+            FakeExaminer,
+            SelectionWeights,
+            build_evidence_pack,
+            config_fingerprint,
+        )
+        from research_explorer.examination.benchmark import (
+            OUTCOME_BENCHMARKED,
+            OUTCOME_DEGRADED,
+            OUTCOME_FAILED,
+            OUTCOME_SURVIVOR_UNBENCHMARKED,
+        )
+        from research_explorer.examination.events import (
+            evidence_pack_frozen_payload,
+            exam_payloads,
+            survivor_payloads,
+        )
+        from research_explorer.examination.report import (
+            benchmark_report_markdown,
+            benchmark_result_json,
+            private_key_artifact,
+            public_exam_artifact,
+        )
+        from research_explorer.memory.extract import memory_from_state
+
+        exam = self.cfg.examination
+        union: dict = {}
+        for agent in self.colony.agents:
+            for paper_id, dossier in agent.state.dossiers.items():
+                union.setdefault(paper_id, dossier)
+        if not union:
+            self.outcome = OUTCOME_DEGRADED
+            tracer.emit(
+                "warning",
+                classification="warning",
+                outcome=self.outcome,
+                reason_code="no_evidence_bearing_dossier",
+            )
+            return
+
+        distances = {
+            paper_id: ("seed" if paper_id == seed_nid else "direct_reference")
+            for paper_id in union
+        }
+        pack = build_evidence_pack(
+            seed_nid, self.effective_scope, union, distances=distances
+        ).freeze()
+        tracer.emit("evidence_pack_frozen", **evidence_pack_frozen_payload(pack))
+
+        if exam.examiner_provider == "fake":
+            generator = FakeExaminer()
+            answer_client = FakeAnswerClient()
+        else:
+            generator, answer_client = self._build_live_exam_clients()
+
+        candidates = []
+        acquired: dict = {}
+        for agent in self.colony.agents:
+            state = agent.state
+            candidates.append((state.id, state.quality, memory_from_state(state)))
+            acquired[state.id] = state.acquired_index()
+
+        weights = SelectionWeights(
+            selection=self.cfg.terminal_selection.w_selection,
+            process=self.cfg.terminal_selection.w_process,
+            grounding=self.cfg.terminal_selection.w_grounding,
+        )
+        config = BenchmarkConfig(
+            selection_count=exam.selection_count,
+            holdout_count=exam.holdout_count,
+            partition_seed=exam.partition_seed,
+            weights=weights,
+            min_coverage=exam.min_examination_coverage,
+            context_max_chars=self.cfg.baseline.context_max_chars,
+            config_fingerprint=config_fingerprint(
+                {
+                    "examiner": exam.examiner_model,
+                    "answer": exam.answer_model or exam.examiner_model,
+                    "seed": exam.partition_seed,
+                    "selection": exam.selection_count,
+                    "holdout": exam.holdout_count,
+                }
+            ),
+            model_ids={
+                "examiner_model": exam.examiner_model,
+                "answer_model": exam.answer_model or exam.examiner_model,
+            },
+            prompt_versions={"examiner": "v1", "answer": "v1"},
+        )
+        runner = BenchmarkRunner(pack, generator, answer_client, config)
+        result = await runner.run(candidates, acquired)
+        self.benchmark_result = result
+
+        if runner.bank is not None:
+            for event_type, payload in exam_payloads(
+                runner.bank,
+                runner.bank.accepted_count,
+                runner.bank.rejected_count,
+                runner.bank.rejection_reasons,
+            ):
+                tracer.emit(event_type, **payload)
+        for event_type, payload in survivor_payloads(result):
+            tracer.emit(event_type, **payload)
+
+        if runner.bank is not None:
+            tracer.record_artifact(
+                "exam_public.json", "exam", public_exam_artifact(runner.bank)
+            )
+        if runner.answer_key is not None:
+            tracer.record_private_artifact(
+                "exam_key.private.json", "answer_key", private_key_artifact(runner.answer_key)
+            )
+        tracer.record_artifact(
+            "benchmark_result.json", "benchmark", benchmark_result_json(result)
+        )
+        tracer.record_artifact(
+            "benchmark_report.md",
+            "report",
+            benchmark_report_markdown(result, pack, scope=self.effective_scope, bank=runner.bank),
+        )
+
+        outcome_map = {
+            OUTCOME_BENCHMARKED: OUTCOME_BENCHMARKED,
+            OUTCOME_SURVIVOR_UNBENCHMARKED: OUTCOME_SURVIVOR_UNBENCHMARKED,
+            OUTCOME_DEGRADED: OUTCOME_DEGRADED,
+            OUTCOME_FAILED: OUTCOME_FAILED,
+        }
+        self.outcome = outcome_map.get(result.outcome, OUTCOME_DEGRADED)
+        self.terminal_reason = result.reason or result.reason_code
+        tracer.emit(
+            "benchmark_completed",
+            outcome=self.outcome,
+            reason_code=result.reason_code,
+            reason=self.terminal_reason,
+            survivor=result.survivor_id,
+            survivor_accuracy=result.survivor_accuracy,
+            naive_accuracy=result.naive_accuracy,
+            uplift=result.uplift,
+        )
+
+    def _build_live_exam_clients(self):
+        """Build the examiner/answer clients (live path, not used by tests)."""
+        from research_explorer.agents.llm_client import LLMClient
+        from research_explorer.examination import LLMAnswerClient, LLMExaminer
+
+        exam = self.cfg.examination
+        examiner_llm = LLMClient(
+            base_url=exam.examiner_base_url,
+            api_key=get_api_key(exam.examiner_api_key_env),
+            max_concurrent=self.cfg.llm.max_concurrent,
+            rpm=self.cfg.llm.rpm,
+        )
+        answer_model = exam.answer_model or exam.examiner_model
+        self._examiner_llm = examiner_llm
+        return (
+            LLMExaminer(examiner_llm, exam.examiner_model, exam.examiner_max_tokens),
+            LLMAnswerClient(
+                examiner_llm,
+                answer_model,
+                temperature=exam.answer_temperature,
+                max_tokens=exam.answer_max_tokens,
+                reasoning_effort=exam.answer_reasoning_effort or None,
+            ),
+        )
 
     def _outcome_gap(self, winner_id: str, narrative: str) -> str:
         """Return the stable degraded reason for an otherwise-completed run.
@@ -457,6 +668,9 @@ class Orchestrator:
         """Clean up resources."""
         await self._stop_heartbeat()
         await self.llm.aclose()
+        examiner_llm = getattr(self, "_examiner_llm", None)
+        if examiner_llm is not None:
+            await examiner_llm.aclose()
         for p in self.providers.values():
             await p.aclose()
         self.graph.close()

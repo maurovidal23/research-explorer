@@ -12,6 +12,7 @@ NaN limits: 60 rpm, 5 concurrent, 1.5M tpm per model.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,14 @@ if TYPE_CHECKING:
     from research_explorer.replay.trace import RunTracer
 
 log = get_logger("llm")
+
+
+class EmptyCompletionError(ValueError):
+    pass
+
+
+class TruncatedCompletionError(ValueError):
+    pass
 
 
 class LLMClient:
@@ -75,7 +84,7 @@ class LLMClient:
         model: str = "qwen3.6",
         response_format: dict | None = None,
         temperature: float = 0.6,
-        max_tokens: int = 2000,
+        max_tokens: int | None = 2000,
         extra_body: dict | None = None,
         purpose: str = "chat",
     ) -> str:
@@ -127,22 +136,37 @@ class LLMClient:
         model: str,
         response_format: dict | None,
         temperature: float,
-        max_tokens: int,
+        max_tokens: int | None,
         extra_body: dict | None,
-    ) -> tuple[str, dict[str, int]]:
+    ) -> tuple[str, dict[str, Any]]:
         async with self.sem, self.limiter:
             kwargs: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
-                "max_tokens": max_tokens,
             }
+            if max_tokens is not None and max_tokens > 0:
+                kwargs["max_tokens"] = max_tokens
             if response_format:
                 kwargs["response_format"] = response_format
             if extra_body:
                 kwargs["extra_body"] = extra_body
             resp = await self.client.chat.completions.create(**kwargs)
-            usage: dict[str, int] = {}
+            choice = resp.choices[0]
+            content = choice.message.content or ""
+            finish_reason = str(getattr(choice, "finish_reason", "") or "")
+            if finish_reason == "length":
+                raise TruncatedCompletionError(
+                    f"completion truncated at configured token limit; response_chars={len(content)}"
+                )
+            if not content.strip():
+                raise EmptyCompletionError(
+                    f"completion returned no visible content; finish_reason={finish_reason or 'unknown'}"
+                )
+            usage: dict[str, Any] = {
+                "finish_reason": finish_reason or "unknown",
+                "response_chars": len(content),
+            }
             reported = getattr(resp, "usage", None)
             if reported is not None:
                 for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -153,7 +177,7 @@ class LLMClient:
                 total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                 if total:
                     usage["total_tokens"] = total
-            return resp.choices[0].message.content or "", usage
+            return content, usage
 
     async def chat_json(
         self,
@@ -162,8 +186,9 @@ class LLMClient:
         model: str = "qwen3.6",
         schema: dict | None = None,
         temperature: float = 0.6,
-        max_tokens: int = 2000,
+        max_tokens: int | None = 2000,
         purpose: str = "chat_json",
+        attempts: int = 2,
     ) -> dict:
         """Chat with structured JSON output (json_schema strict)."""
         if schema:
@@ -173,17 +198,31 @@ class LLMClient:
             }
         else:
             response_format = {"type": "json_object"}
-        content = await self.chat(
-            messages,
-            model=model,
-            response_format=response_format,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            purpose=purpose,
-        )
-        import json
-
-        return json.loads(content)
+        last_error: json.JSONDecodeError | None = None
+        for attempt in range(max(1, attempts)):
+            content = await self.chat(
+                messages,
+                model=model,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                purpose=purpose,
+            )
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                self._emit_operation(
+                    "llm_structured_output_invalid",
+                    purpose=purpose,
+                    model=model,
+                    attempt=attempt + 1,
+                    response_chars=len(content),
+                    error=redact_secrets(str(exc)),
+                )
+        if last_error is None:
+            raise RuntimeError("structured output failed without an error")
+        raise last_error
 
     @retry(
         reraise=True,

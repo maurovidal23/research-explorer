@@ -52,8 +52,9 @@ class SelfAssessment:
                 model=self.cfg.llm.explorer_model,
                 schema=SCORE_SCHEMA,
                 temperature=0.3,
-                max_tokens=1000,
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="self_assessment",
+                attempts=self.cfg.llm.structured_output_attempts,
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))

@@ -111,13 +111,25 @@ class PeerVoting:
 
         votes = [r for r in results if isinstance(r, PeerVoteDetail)]
         if not votes:
+            failures = [r for r in results if isinstance(r, BaseException)]
+            reasons = [availability.classify_failure(exc) for exc in failures]
+            reason = reasons[0] if reasons and len(set(reasons)) == 1 else availability.REASON_MODEL_FAILED
+            for voter, result in zip(voters, results, strict=False):
+                if isinstance(result, BaseException):
+                    log.warning(
+                        "peer_vote_failed",
+                        voter=voter.state.id,
+                        target=target.state.id,
+                        reason=availability.classify_failure(result),
+                        error=str(result),
+                    )
             return PeerVotesDetail(
                 votes=[],
                 aggregated_score=0.0,
                 aggregation_method=method,
                 num_votes=0,
                 available=False,
-                unavailable_reason=availability.REASON_MODEL_FAILED,
+                unavailable_reason=reason,
             )
 
         scores = [v.score for v in votes]
@@ -159,8 +171,9 @@ class PeerVoting:
             model=self.cfg.llm.explorer_model,
             schema=VOTE_SCHEMA,
             temperature=0.3,
-            max_tokens=1000,
+            max_tokens=self.cfg.llm.evaluation_max_tokens or None,
             purpose="peer_vote_detail",
+            attempts=self.cfg.llm.structured_output_attempts,
         )
         score = float(result.get("score", 0.5))
         score = max(0.0, min(1.0, score))
@@ -188,8 +201,9 @@ class PeerVoting:
             model=self.cfg.llm.explorer_model,
             schema=VOTE_SCHEMA,
             temperature=0.3,
-            max_tokens=1000,
+            max_tokens=self.cfg.llm.evaluation_max_tokens or None,
             purpose="peer_vote",
+            attempts=self.cfg.llm.structured_output_attempts,
         )
         score = float(result.get("score", 0.5))
         return max(0.0, min(1.0, score))

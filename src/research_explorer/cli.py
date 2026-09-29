@@ -30,7 +30,10 @@ app.add_typer(replay_app, name="replay")
 @app.command()
 def explore(
     seed_paper_id: str = typer.Argument(help="Seed paper ID (DOI, S2 ID, PMID, etc.)"),
-    seed_query: str = typer.Argument(help="Research line description to explore"),
+    seed_query: str = typer.Argument(
+        "",
+        help="Optional research scope (derived from the seed paper when omitted)",
+    ),
     config_path: str = typer.Option(
         "config/default.toml", "--config", "-c", help="Path to config TOML file"
     ),
@@ -383,6 +386,20 @@ def config(
         f"turns={rk.max_turns}, evaluator={rk.evaluator_enabled} ({rk.rubric_version})"
     )
     typer.echo(f"Quality weights: S={cfg.quality.w_self} P={cfg.quality.w_peers} J={cfg.quality.w_virgin} R={cfg.quality.w_structural}")
+    exam = cfg.examination
+    typer.echo(
+        f"Examination: enabled={exam.enabled}, examiner={exam.examiner_model} "
+        f"({exam.examiner_provider}), selection={exam.selection_count}, "
+        f"holdout={exam.holdout_count}, answer_model={exam.answer_model or '(unset)'}"
+    )
+    ts = cfg.terminal_selection
+    typer.echo(
+        f"Terminal weights: selection={ts.w_selection} process={ts.w_process} "
+        f"grounding={ts.w_grounding}"
+    )
+    typer.echo(
+        f"Memory: enabled={cfg.memory.enabled}, synthesis_words={cfg.memory.synthesis_words}"
+    )
 
 
 @replay_app.command("list")
@@ -533,9 +550,110 @@ def replay_serve(
     uvicorn.run(build_app(db, default_run_id=run_id), host=host, port=port)
 
 
+@app.command()
+def benchmark(
+    config_path: str = typer.Option(
+        "config/profiles/benchmark_test.toml",
+        "--config",
+        "-c",
+        help="Path to a benchmark config TOML file",
+    ),
+    output: str = typer.Option(
+        "data/benchmark", "--output", "-o", help="Directory for benchmark artifacts"
+    ),
+) -> None:
+    """Run a bounded, network-free survivor benchmark with deterministic clients."""
+    import json
+
+    from research_explorer.examination import (
+        BenchmarkConfig,
+        BenchmarkRunner,
+        FakeAnswerClient,
+        FakeExaminer,
+        SelectionWeights,
+        build_synthetic_corpus,
+    )
+    from research_explorer.examination.report import (
+        benchmark_report_markdown,
+        benchmark_result_json,
+        private_key_artifact,
+        public_exam_artifact,
+    )
+
+    cfg = load_config(config_path)
+    exam = cfg.examination
+    if exam.examiner_provider != "fake":
+        raise typer.BadParameter(
+            "the standalone benchmark command supports the bounded 'fake' examiner "
+            "profile only; live examinations run inside an exploration run."
+        )
+    if not exam.enabled:
+        raise typer.BadParameter(
+            "examination is disabled in the config; enable [examination].enabled."
+        )
+
+    pack, candidates, acquired = build_synthetic_corpus(count=6)
+    runner = BenchmarkRunner(
+        pack=pack,
+        generator=FakeExaminer(),
+        answer_client=FakeAnswerClient(),
+        config=BenchmarkConfig(
+            selection_count=exam.selection_count,
+            holdout_count=exam.holdout_count,
+            partition_seed=exam.partition_seed,
+            weights=SelectionWeights(
+                selection=cfg.terminal_selection.w_selection,
+                process=cfg.terminal_selection.w_process,
+                grounding=cfg.terminal_selection.w_grounding,
+            ),
+            min_coverage=exam.min_examination_coverage,
+            context_max_chars=cfg.baseline.context_max_chars,
+            model_ids={
+                "examiner_model": exam.examiner_model,
+                "answer_model": exam.answer_model or "fake-answer-v1",
+            },
+            prompt_versions={"examiner": "v1", "answer": "v1"},
+        ),
+    )
+    result = asyncio.run(runner.run(candidates, acquired))
+
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "benchmark_result.json").write_text(
+        benchmark_result_json(result), encoding="utf-8"
+    )
+    report = benchmark_report_markdown(
+        result,
+        pack,
+        scope=pack.scope,
+        scope_origin="derived",
+        evidence_bearing=len(pack.sources),
+        dossier_count=len(pack.sources) + len(pack.excluded),
+        bank=runner.bank,
+    )
+    (out_dir / "benchmark_report.md").write_text(report, encoding="utf-8")
+    if runner.bank is not None:
+        (out_dir / "exam_public.json").write_text(
+            public_exam_artifact(runner.bank), encoding="utf-8"
+        )
+    if runner.answer_key is not None:
+        (out_dir / "exam_key.private.json").write_text(
+            private_key_artifact(runner.answer_key), encoding="utf-8"
+        )
+
+    summary = {
+        "outcome": result.outcome,
+        "survivor": result.survivor_id,
+        "survivor_accuracy": result.survivor_accuracy,
+        "naive_accuracy": result.naive_accuracy,
+        "uplift": result.uplift,
+    }
+    typer.echo(json.dumps(summary, indent=2))
+    typer.echo(f"Artifacts written to {out_dir}/")
+
+
 def main() -> None:
     app()
-
 
 if __name__ == "__main__":
     main()

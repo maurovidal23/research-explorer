@@ -40,6 +40,8 @@ class LLMConfig:
     rerank_model: str = "rerank"
     temperature: float = 0.6
     max_tokens: int = 2000
+    evaluation_max_tokens: int = 4000
+    structured_output_attempts: int = 2
     fulltext_max_chars: int = 100000
 
 
@@ -200,6 +202,74 @@ class ResearchKernelConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Structured research memory and derived synthesis (SURV-2/3/4)."""
+
+    enabled: bool = True
+    synthesis_words: int = 2000
+    chunk_chars: int = 12_000
+    max_chunks: int = 8
+
+
+@dataclass
+class ExaminationConfig:
+    """Hidden examination configuration (EXAM-2, CFG-1).
+
+    Defaults are conservative and network-free; the examiner model defaults to
+    ``gpt-5.6-sol`` and is explicitly *not* assumed to be served by the NaN
+    explorer endpoint.
+    """
+
+    enabled: bool = False
+    examiner_provider: str = "openai"
+    examiner_base_url: str = "https://api.openai.com/v1"
+    examiner_api_key_env: str = "OPENAI_API_KEY"
+    examiner_model: str = "gpt-5.6-sol"
+    examiner_reasoning_effort: str = "medium"
+    examiner_temperature: float = 0.2
+    examiner_max_tokens: int = 4000
+    selection_count: int = 30
+    holdout_count: int = 20
+    options_per_item: int = 4
+    partition_seed: int = 0
+    max_validation_attempts: int = 2
+    allow_examiner_fallback: bool = False
+    fallback_examiner_model: str = ""
+    min_examination_coverage: float = 0.5
+    require_both_partitions: bool = True
+    evidence_max_chars: int = 40_000
+    answer_model: str = ""
+    answer_temperature: float = 0.0
+    answer_max_tokens: int = 1500
+    answer_batch_size: int = 5
+    answer_reasoning_effort: str = ""
+
+
+@dataclass
+class TerminalSelectionConfig:
+    """Terminal survivor score weights (EXAM-7)."""
+
+    w_selection: float = 0.70
+    w_process: float = 0.20
+    w_grounding: float = 0.10
+
+    def __post_init__(self) -> None:
+        values = (self.w_selection, self.w_process, self.w_grounding)
+        if any(value < 0 for value in values):
+            raise ValueError("terminal selection weights must be non-negative")
+        if abs(sum(values) - 1.0) > 1e-6:
+            raise ValueError("terminal selection weights must sum to 1.0")
+
+
+@dataclass
+class BaselineConfig:
+    """Matched naive baseline execution (EXAM-8)."""
+
+    enabled: bool = True
+    context_max_chars: int = 40_000
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     pipeline: str = "aco"
@@ -215,8 +285,43 @@ class Config:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     research_kernel: ResearchKernelConfig = field(default_factory=ResearchKernelConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    examination: ExaminationConfig = field(default_factory=ExaminationConfig)
+    terminal_selection: TerminalSelectionConfig = field(default_factory=TerminalSelectionConfig)
+    baseline: BaselineConfig = field(default_factory=BaselineConfig)
     log_level: str = "INFO"
     seed_query: str = ""
+
+
+def validate_config(cfg: Config) -> None:
+    """Validate examination/memory/selection settings at startup (CFG-1)."""
+    exam = cfg.examination
+    if exam.selection_count <= 0 or exam.holdout_count <= 0:
+        raise ValueError("examination selection_count and holdout_count must be positive")
+    if exam.options_per_item < 2:
+        raise ValueError("examination options_per_item must be at least 2")
+    if not 0.0 <= exam.examiner_temperature <= 2.0:
+        raise ValueError("examination examiner_temperature must be within [0, 2]")
+    if not 0.0 <= exam.answer_temperature <= 2.0:
+        raise ValueError("examination answer_temperature must be within [0, 2]")
+    if exam.examiner_max_tokens <= 0 or exam.answer_max_tokens <= 0:
+        raise ValueError("examination token limits must be positive")
+    if exam.answer_batch_size <= 0:
+        raise ValueError("examination answer_batch_size must be positive")
+    if exam.max_validation_attempts < 1:
+        raise ValueError("examination max_validation_attempts must be at least 1")
+    if not 0.0 <= exam.min_examination_coverage <= 1.0:
+        raise ValueError("examination min_examination_coverage must be within [0, 1]")
+    if not exam.examiner_model.strip():
+        raise ValueError("examination examiner_model must not be empty")
+    if exam.allow_examiner_fallback and not exam.fallback_examiner_model.strip():
+        raise ValueError("examiner fallback requires fallback_examiner_model")
+    if cfg.memory.synthesis_words <= 0:
+        raise ValueError("memory synthesis_words must be positive")
+    if cfg.memory.chunk_chars <= 0 or cfg.memory.max_chunks <= 0:
+        raise ValueError("memory chunk limits must be positive")
+    if cfg.baseline.context_max_chars <= 0:
+        raise ValueError("baseline context_max_chars must be positive")
 
 
 def _resolve_env(value: str | None) -> str | None:
@@ -276,6 +381,12 @@ def load_config(path: str | Path) -> Config:
             rerank_model=llm.get("rerank_model", cfg.llm.rerank_model),
             temperature=llm.get("temperature", cfg.llm.temperature),
             max_tokens=llm.get("max_tokens", cfg.llm.max_tokens),
+            evaluation_max_tokens=llm.get(
+                "evaluation_max_tokens", cfg.llm.evaluation_max_tokens
+            ),
+            structured_output_attempts=llm.get(
+                "structured_output_attempts", cfg.llm.structured_output_attempts
+            ),
             fulltext_max_chars=llm.get("fulltext_max_chars", cfg.llm.fulltext_max_chars),
         )
 
@@ -444,6 +555,83 @@ def load_config(path: str | Path) -> Config:
             weights=rk.get("weights", cfg.research_kernel.weights),
         )
 
+    if "memory" in data:
+        m = data["memory"]
+        cfg.memory = MemoryConfig(
+            enabled=m.get("enabled", cfg.memory.enabled),
+            synthesis_words=m.get("synthesis_words", cfg.memory.synthesis_words),
+            chunk_chars=m.get("chunk_chars", cfg.memory.chunk_chars),
+            max_chunks=m.get("max_chunks", cfg.memory.max_chunks),
+        )
+
+    if "examination" in data:
+        e = data["examination"]
+        cfg.examination = ExaminationConfig(
+            enabled=e.get("enabled", cfg.examination.enabled),
+            examiner_provider=e.get("examiner_provider", cfg.examination.examiner_provider),
+            examiner_base_url=e.get("examiner_base_url", cfg.examination.examiner_base_url),
+            examiner_api_key_env=e.get(
+                "examiner_api_key_env", cfg.examination.examiner_api_key_env
+            ),
+            examiner_model=e.get("examiner_model", cfg.examination.examiner_model),
+            examiner_reasoning_effort=e.get(
+                "examiner_reasoning_effort", cfg.examination.examiner_reasoning_effort
+            ),
+            examiner_temperature=e.get(
+                "examiner_temperature", cfg.examination.examiner_temperature
+            ),
+            examiner_max_tokens=e.get(
+                "examiner_max_tokens", cfg.examination.examiner_max_tokens
+            ),
+            selection_count=e.get("selection_count", cfg.examination.selection_count),
+            holdout_count=e.get("holdout_count", cfg.examination.holdout_count),
+            options_per_item=e.get("options_per_item", cfg.examination.options_per_item),
+            partition_seed=e.get("partition_seed", cfg.examination.partition_seed),
+            max_validation_attempts=e.get(
+                "max_validation_attempts", cfg.examination.max_validation_attempts
+            ),
+            allow_examiner_fallback=e.get(
+                "allow_examiner_fallback", cfg.examination.allow_examiner_fallback
+            ),
+            fallback_examiner_model=e.get(
+                "fallback_examiner_model", cfg.examination.fallback_examiner_model
+            ),
+            min_examination_coverage=e.get(
+                "min_examination_coverage", cfg.examination.min_examination_coverage
+            ),
+            require_both_partitions=e.get(
+                "require_both_partitions", cfg.examination.require_both_partitions
+            ),
+            evidence_max_chars=e.get(
+                "evidence_max_chars", cfg.examination.evidence_max_chars
+            ),
+            answer_model=e.get("answer_model", cfg.examination.answer_model),
+            answer_temperature=e.get(
+                "answer_temperature", cfg.examination.answer_temperature
+            ),
+            answer_max_tokens=e.get("answer_max_tokens", cfg.examination.answer_max_tokens),
+            answer_batch_size=e.get("answer_batch_size", cfg.examination.answer_batch_size),
+            answer_reasoning_effort=e.get(
+                "answer_reasoning_effort", cfg.examination.answer_reasoning_effort
+            ),
+        )
+
+    if "terminal_selection" in data:
+        ts = data["terminal_selection"]
+        cfg.terminal_selection = TerminalSelectionConfig(
+            w_selection=ts.get("w_selection", cfg.terminal_selection.w_selection),
+            w_process=ts.get("w_process", cfg.terminal_selection.w_process),
+            w_grounding=ts.get("w_grounding", cfg.terminal_selection.w_grounding),
+        )
+
+    if "baseline" in data:
+        b = data["baseline"]
+        cfg.baseline = BaselineConfig(
+            enabled=b.get("enabled", cfg.baseline.enabled),
+            context_max_chars=b.get("context_max_chars", cfg.baseline.context_max_chars),
+        )
+
+    validate_config(cfg)
     return cfg
 
 

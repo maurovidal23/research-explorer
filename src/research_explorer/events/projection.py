@@ -30,9 +30,13 @@ from research_explorer.events.models import (
     NODE_SKIPPED,
     OUTCOME_COMPLETED,
     OUTCOME_DEGRADED,
+    PHASE_BENCHMARK,
     PHASE_DECISION,
     PHASE_EVALUATION,
+    PHASE_EXAM_BUILD,
     PHASE_RESEARCH,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
     REASON_NO_WINNER,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -71,6 +75,15 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class RunProjection:
@@ -1274,6 +1287,86 @@ class RunProjection:
         ):
             self.state.status = status
 
+    # ---- examination / survivor (TUI-1) ----------------------------------
+
+    def _exam_phase(self, name: str) -> PhaseState:
+        record = self.state.exam_phases.get(name)
+        if record is None:
+            record = PhaseState(wave=0, phase=name)
+            self.state.exam_phases[name] = record
+        return record
+
+    def _on_evidence_pack_frozen(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_ACTIVE
+        record.papers_integrated = _as_int(
+            event.payload.get("source_count"), record.papers_integrated
+        )
+        record.evidence_added = _as_int(
+            event.payload.get("source_count"), record.evidence_added
+        )
+        self.state.current_phase = PHASE_EXAM_BUILD
+
+    def _on_exam_generated(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_ACTIVE
+        record.papers_attempted = _as_int(
+            event.payload.get("item_count"), record.papers_attempted
+        )
+        self.state.current_phase = PHASE_EXAM_BUILD
+
+    def _on_exam_validated(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_COMPLETED
+        self.state.exam_rejected_count = _as_int(
+            event.payload.get("rejected"), self.state.exam_rejected_count
+        )
+
+    def _on_exam_partitioned(self, event: RunEvent) -> None:
+        self.state.exam_selection_count = _as_int(
+            event.payload.get("selection_count"), self.state.exam_selection_count
+        )
+        self.state.exam_holdout_count = _as_int(
+            event.payload.get("holdout_count"), self.state.exam_holdout_count
+        )
+        record = self._exam_phase(PHASE_SELECTION)
+        record.status = NODE_ACTIVE
+        self.state.current_phase = PHASE_SELECTION
+
+    def _on_candidate_test_completed(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_SELECTION)
+        agent = str(event.payload.get("agent_id") or "")
+        if agent and agent not in record.completed:
+            record.completed.append(agent)
+
+    def _on_survivor_selected(self, event: RunEvent) -> None:
+        self.state.survivor_id = str(event.payload.get("survivor_id") or "")
+        record = self._exam_phase(PHASE_SURVIVOR)
+        record.status = NODE_COMPLETED
+        record.leader = self.state.survivor_id
+        self.state.current_phase = PHASE_BENCHMARK
+
+    def _on_baseline_completed(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.survivor_accuracy = _as_optional_float(p.get("survivor_accuracy"))
+        self.state.naive_accuracy = _as_optional_float(p.get("naive_accuracy"))
+        self.state.uplift = _as_optional_float(p.get("uplift"))
+
+    def _on_benchmark_completed(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.benchmark_outcome = str(p.get("outcome") or "")
+        self.state.benchmark_reason_code = str(p.get("reason_code") or "")
+        self.state.benchmark_reason = str(p.get("reason") or "")
+        if "survivor_accuracy" in p:
+            self.state.survivor_accuracy = _as_optional_float(p.get("survivor_accuracy"))
+        if "naive_accuracy" in p:
+            self.state.naive_accuracy = _as_optional_float(p.get("naive_accuracy"))
+        if "uplift" in p:
+            self.state.uplift = _as_optional_float(p.get("uplift"))
+        record = self._exam_phase(PHASE_BENCHMARK)
+        record.status = NODE_COMPLETED
+        self.state.current_phase = PHASE_BENCHMARK
+
     def _finalize_agents(self) -> None:
         for summary in self.state.agents.values():
             if summary.status == AGENT_FAILED:
@@ -1341,6 +1434,14 @@ _HANDLERS: dict[str, Any] = {
     EventType.RUN_INTERRUPTED: RunProjection._on_run_interrupted,
     EventType.ARTIFACT_SAVED: RunProjection._on_artifact,
     EventType.WARNING: RunProjection._on_warning,
+    EventType.EVIDENCE_PACK_FROZEN: RunProjection._on_evidence_pack_frozen,
+    EventType.EXAM_GENERATED: RunProjection._on_exam_generated,
+    EventType.EXAM_VALIDATED: RunProjection._on_exam_validated,
+    EventType.EXAM_PARTITIONED: RunProjection._on_exam_partitioned,
+    EventType.CANDIDATE_TEST_COMPLETED: RunProjection._on_candidate_test_completed,
+    EventType.SURVIVOR_SELECTED: RunProjection._on_survivor_selected,
+    EventType.BASELINE_COMPLETED: RunProjection._on_baseline_completed,
+    EventType.BENCHMARK_COMPLETED: RunProjection._on_benchmark_completed,
     "status": RunProjection._on_status,
     "provider_failure": RunProjection._on_warning,
     "id_title_mismatch": RunProjection._on_warning,

@@ -85,7 +85,11 @@ class Colony:
         self.init_failures: list[str] = []
 
     async def initialize(
-        self, seed_id: str, seed_query: str, tracer: RunTracer | None = None
+        self,
+        seed_id: str,
+        seed_query: str,
+        tracer: RunTracer | None = None,
+        scope_origin: str = "derived",
     ) -> None:
         """Initialize the colony: N agents at the seed with assigned castes.
 
@@ -119,6 +123,8 @@ class Colony:
                 narrative="",
                 budget=budget_per_agent,
                 caste=castes[i],
+                research_scope=seed_query,
+                scope_origin=scope_origin,
             )
 
             agent = ExplorerAgent(

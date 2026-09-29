@@ -202,6 +202,11 @@ async def test_every_selected_agent_gets_one_terminal_evaluation(tmp_path) -> No
     assert by_agent == {"a0": "complete", "a1": "complete", "a2": "skipped"}
     skipped = next(e for e in settled if e["payload"]["agent_id"] == "a2")
     assert skipped["payload"]["reason"] == "no_new_evidence"
+    details = [e for e in store.list_events(run_id) if e["type"] == "evaluation_detail"]
+    assert [e["payload"]["agent_id"] for e in details] == ["a0", "a1"]
+    assert all(e["payload"]["agent_id"] == e["payload"]["detail"]["agent_id"] for e in details)
+    artifacts = [e for e in store.list_events(run_id) if e["type"] == "artifact_saved"]
+    assert [e["payload"]["agent_id"] for e in artifacts] == ["a0", "a1"]
     store.close()
 
 

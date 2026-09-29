@@ -55,8 +55,9 @@ class VirginJudge:
                 model=self.cfg.llm.judge_model,  # different model — reduces bias
                 schema=JUDGE_SCHEMA,
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="virgin_judge",
+                attempts=self.cfg.llm.structured_output_attempts,
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))

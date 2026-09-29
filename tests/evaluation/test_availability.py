@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
+from research_explorer.agents.state import AgentState
 from research_explorer.config import Config
 from research_explorer.evaluation import availability
+from research_explorer.evaluation.peer_vote import PeerVoting
 from research_explorer.evaluation.self_assess import SelfAssessment
 from research_explorer.evaluation.virgin_judge import VirginJudge
 from research_explorer.events.models import EvaluationState, RunViewState
@@ -72,6 +75,20 @@ async def test_parse_failure_and_timeout_are_not_ordinary_zeros() -> None:
     assert model.score == 0.0
     assert model.available is False
     assert model.unavailable_reason == availability.REASON_MODEL_FAILED
+
+
+async def test_peer_parse_failure_is_not_hidden_as_model_failure() -> None:
+    target = SimpleNamespace(
+        state=AgentState(id="target", pos="seed", narrative="target narrative")
+    )
+    voter = SimpleNamespace(
+        state=AgentState(id="voter", pos="seed", narrative="voter narrative")
+    )
+    detail = await PeerVoting(
+        _StubLLM(error=json.JSONDecodeError("bad", "", 0)), Config()
+    ).vote_detail(target, [target, voter], "query")
+    assert detail.available is False
+    assert detail.unavailable_reason == availability.REASON_PARSE_FAILED
 
 
 def test_evaluation_render_separates_zero_from_unavailable() -> None:

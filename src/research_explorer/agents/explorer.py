@@ -58,6 +58,7 @@ from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.models import Paper, PaperSummary, normalize_id, parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
+from research_explorer.memory.extract import claims_from_dossier, dossier_from_paper
 from research_explorer.providers.base import ResilientProvider, TransientProviderError
 from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer
@@ -364,6 +365,8 @@ class ExplorerAgent:
                     src=src,
                     turn=self.state.turn_count,
                     analysis=self.state.paper_analyses.get(next_id),
+                    narrative_chars=len(narrative),
+                    narrative_available=bool(narrative.strip()),
                 )
 
                 self.state.visit(next_id, mode)
@@ -646,7 +649,7 @@ class ExplorerAgent:
                 messages,
                 model=self.cfg.llm.explorer_model,
                 temperature=0.3,
-                max_tokens=min(self.cfg.llm.max_tokens, 2000),
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="frontier_reference_evaluation",
             )
         except Exception as e:
@@ -821,7 +824,33 @@ class ExplorerAgent:
         if builder is not None and (paper.ref_entries or paper.bibliography_error):
             extracted = await self._build_references(paper, builder)
         narrative = await self._integrate_narrative(paper)
+        self._record_memory(paper)
         return narrative, extracted
+
+    def _record_memory(self, paper: Paper) -> None:
+        """Persist structured memory for an integrated paper (SURV-2/3).
+
+        Full text always reaches dossier extraction; a dossier is recorded even
+        when the integration narrative fails so acquired evidence is never lost.
+        Failures never delete earlier valid memory (``record_dossier``).
+        """
+        paper_id = normalize_id(paper.provider, paper.id)
+        analysis = self.state.paper_analyses.get(paper_id)
+        try:
+            dossier = dossier_from_paper(
+                paper,
+                analysis=analysis,
+                acquisition_event=self.state.turn_count,
+                scope=self.state.research_scope,
+            )
+            self.state.record_dossier(dossier)
+            if analysis:
+                self.state.record_claims(
+                    claims_from_dossier(dossier, analysis, self.state.turn_count)
+                )
+        except Exception as e:
+            log.warning("memory_extraction_failed", paper_id=paper_id, error=str(e))
+            self.state.extraction_failures.append(f"{paper_id}: {redact_secrets(str(e))}")
 
     async def _build_references(
         self, paper: Paper, builder: ReferenceGraphBuilder
@@ -856,11 +885,16 @@ class ExplorerAgent:
                 messages,
                 model=self.cfg.llm.explorer_model,
                 temperature=self.cfg.llm.temperature,
-                max_tokens=self.cfg.llm.max_tokens,
+                max_tokens=self.cfg.llm.max_tokens or None,
                 purpose="paper_integration",
             )
         except Exception as e:
             log.warning("integrate_failed", agent=self.state.id, error=str(e))
+            self._emit(
+                "paper_integration_failed",
+                paper_id=normalize_id(paper.provider, paper.id),
+                error=redact_secrets(str(e)),
+            )
             return self.state.narrative
         return normalize_narrative(narrative, self.state.narrative)
 

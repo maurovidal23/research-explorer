@@ -205,7 +205,11 @@ def test_discovery_and_frontier_events_replay_to_timeline_nodes(tmp_path) -> Non
 class _FakeCompletions:
     async def create(self, **kwargs):
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"), finish_reason="stop"
+                )
+            ],
             usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120),
         )
 
@@ -244,4 +248,51 @@ async def test_llm_client_producer_telemetry_persists_and_replays(tmp_path) -> N
     assert replayed.state.current_operation_model == "explorer-x"
     assert replayed.state.token_usage == 120
     assert replayed.state.operation_elapsed_seconds is not None
+    completed = next(e for e in store.list_events(run_id) if e["type"] == "llm_operation_completed")
+    assert completed["payload"]["finish_reason"] == "stop"
+    assert completed["payload"]["response_chars"] == 2
+    store.close()
+
+
+class _StructuredCompletions:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        self.requests.append(kwargs)
+        content = "not-json" if self.calls == 1 else '{"score": 0.75}'
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content), finish_reason="stop"
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+
+async def test_chat_json_retries_invalid_visible_output(tmp_path) -> None:
+    store = RunTraceStore(tmp_path / "replay.db")
+    run_id = store.create_run("seed-1", "how?")
+    tracer = RunTracer(store, run_id)
+    completions = _StructuredCompletions()
+    client = LLMClient(api_key="sk-test")
+    client.tracer = tracer
+    client.client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=completions)
+    )
+    result = await client.chat_json(
+        [{"role": "user", "content": "score"}], attempts=2, max_tokens=0
+    )
+    assert result == {"score": 0.75}
+    assert completions.calls == 2
+    assert all("max_tokens" not in request for request in completions.requests)
+    invalid = [
+        event
+        for event in store.list_events(run_id)
+        if event["type"] == "llm_structured_output_invalid"
+    ]
+    assert len(invalid) == 1
     store.close()

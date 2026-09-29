@@ -1,0 +1,73 @@
+"""Structured research memory: dossiers, claims, relations, gaps, synthesis."""
+
+from research_explorer.memory.extract import (
+    claims_from_dossier,
+    concepts_from_dossiers,
+    derive_content_kind,
+    dossier_from_paper,
+    gaps_from_claims,
+    memory_from_state,
+    merge_claims,
+    research_memory_from_dossiers,
+)
+from research_explorer.memory.ledger import (
+    dedupe_claims,
+    enforce_claim_ledger,
+    evidence_resolves,
+    resolving_support,
+    validate_claim,
+)
+from research_explorer.memory.models import (
+    MEMORY_SCHEMA_VERSION,
+    ClaimStatus,
+    Concept,
+    ContentKind,
+    DossierEvidence,
+    KnowledgeGap,
+    LedgerClaim,
+    PaperDossier,
+    PaperRelation,
+    RelationKind,
+    ResearchMemory,
+    canonical_json,
+    content_hash,
+    stable_id,
+)
+from research_explorer.memory.synthesis import (
+    DEFAULT_SYNTHESIS_WORDS,
+    synthesis_word_count,
+    synthesize_memory,
+)
+
+__all__ = [
+    "DEFAULT_SYNTHESIS_WORDS",
+    "MEMORY_SCHEMA_VERSION",
+    "ClaimStatus",
+    "Concept",
+    "ContentKind",
+    "DossierEvidence",
+    "KnowledgeGap",
+    "LedgerClaim",
+    "PaperDossier",
+    "PaperRelation",
+    "RelationKind",
+    "ResearchMemory",
+    "canonical_json",
+    "claims_from_dossier",
+    "concepts_from_dossiers",
+    "content_hash",
+    "dedupe_claims",
+    "derive_content_kind",
+    "dossier_from_paper",
+    "enforce_claim_ledger",
+    "evidence_resolves",
+    "gaps_from_claims",
+    "memory_from_state",
+    "merge_claims",
+    "research_memory_from_dossiers",
+    "resolving_support",
+    "stable_id",
+    "synthesis_word_count",
+    "synthesize_memory",
+    "validate_claim",
+]

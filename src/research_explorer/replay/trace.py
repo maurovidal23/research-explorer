@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from research_explorer.events.models import RunEvent
 from research_explorer.events.sink import EventSink
@@ -540,16 +541,53 @@ class RunTracer:
         except (TypeError, ValueError):
             full = None
         if full is not None:
-            self.emit("evaluation_detail", detail=full)
+            self.emit(
+                "evaluation_detail",
+                agent_id=detail.agent_id,
+                oleada=detail.oleada,
+                turn=detail.turn,
+                detail=full,
+            )
 
-    def record_artifact(self, name: str, kind: str, content: str) -> str:
+    def record_artifact(
+        self,
+        name: str,
+        kind: str,
+        content: str,
+        *,
+        agent_id: str | None = None,
+        oleada: int | None = None,
+        turn: int | None = None,
+    ) -> str:
+        artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
+        payload: dict[str, Any] = {
+            "artifact_id": artifact_id,
+            "name": name,
+            "kind": kind,
+            "content": redact_secrets(content),
+        }
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        if oleada is not None:
+            payload["oleada"] = oleada
+        if turn is not None:
+            payload["turn"] = turn
+        self.emit("artifact_saved", **payload)
+        return artifact_id
+
+    def record_private_artifact(self, name: str, kind: str, content: str) -> str:
+        """Persist a restricted artifact without leaking its content into events.
+
+        Used for the private exam answer key: the ordinary event stream records
+        only the artifact id, so keys never appear in trace events or TUI state.
+        """
         artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
         self.emit(
             "artifact_saved",
             artifact_id=artifact_id,
             name=name,
             kind=kind,
-            content=redact_secrets(content),
+            private=True,
         )
         return artifact_id
 

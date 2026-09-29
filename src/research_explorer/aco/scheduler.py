@@ -330,6 +330,10 @@ class Scheduler:
         for agent in k_agents:
             info = by_id.get(agent.state.id, {})
             turn = agent.state.turn_count
+            if self.tracer is not None:
+                set_context = getattr(self.tracer, "set_context", None)
+                if set_context is not None:
+                    set_context(agent_id=agent.state.id, oleada=wave, turn=turn)
             if info.get("status") == EVAL_FAILED:
                 failed.append(agent.state.id)
                 self._emit_settled(agent.state.id, wave, turn, EVAL_FAILED, info.get("reason", ""))
@@ -396,6 +400,9 @@ class Scheduler:
                     f"narrative_{agent.state.id}_t{turn}.md",
                     "narrative",
                     agent.state.narrative,
+                    agent_id=agent.state.id,
+                    oleada=wave,
+                    turn=turn,
                 )
             self._emit_settled(
                 agent.state.id,
