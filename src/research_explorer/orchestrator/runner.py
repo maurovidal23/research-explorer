@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import json
 import time
+from typing import TYPE_CHECKING
 
 from research_explorer.aco.colony import Colony
 from research_explorer.aco.convergence import ConvergenceChecker
@@ -43,6 +44,9 @@ from research_explorer.replay.trace import (
     RunTracer,
     RunTraceStore,
 )
+
+if TYPE_CHECKING:
+    from research_explorer.examination.models import BenchmarkResult
 
 log = get_logger("orchestrator")
 
@@ -81,7 +85,7 @@ class Orchestrator:
         self.stop_reason: str = ""
         self.effective_scope: str = ""
         self.scope_origin: str = "derived"
-        self.benchmark_result: object | None = None
+        self.benchmark_result: BenchmarkResult | None = None
         configure_logging(config.log_level)
 
         # Storage
@@ -663,6 +667,9 @@ class Orchestrator:
             outcome=self.outcome,
             terminal_reason=self.terminal_reason,
             stop_reason=self.stop_reason,
+            benchmark_result=getattr(self, "benchmark_result", None),
+            effective_scope=getattr(self, "effective_scope", ""),
+            scope_origin=getattr(self, "scope_origin", "derived"),
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:

@@ -364,5 +364,8 @@ class BenchmarkResult(BaseModel):
     naive_score: ExamScore | None = None
     paired_outcomes: dict[str, dict[str, bool]] = Field(default_factory=dict)
     selection: SurvivorSelection | None = None
+    selection_count: int = 0
+    holdout_count: int = 0
     config_fingerprint: str = ""
+    state_hash: str = ""
     model_ids: dict[str, str] = Field(default_factory=dict)

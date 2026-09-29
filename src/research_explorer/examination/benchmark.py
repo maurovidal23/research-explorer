@@ -221,6 +221,8 @@ class BenchmarkRunner:
         bank.selection_ids = selection_ids
         bank.holdout_ids = holdout_ids
         bank.partition_frozen = True
+        result.selection_count = len(selection_ids)
+        result.holdout_count = len(holdout_ids)
         key: AnswerKey = build_answer_key(bank, self.cfg.partition_seed)
         self.bank = bank
         self.answer_key = key
@@ -309,6 +311,7 @@ class BenchmarkRunner:
             prompt_versions=self.cfg.prompt_versions,
         )
         self.survivor_bundle = bundle
+        result.state_hash = bundle.state_hash
 
         # 3. Hidden holdout benchmark: survivor vs matched naive baseline.
         survivor_ctx = assemble_context(

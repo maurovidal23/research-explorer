@@ -7,6 +7,7 @@ discovered papers, and the colony's aggregate graph.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 
 from research_explorer.aco.colony import Colony
@@ -14,7 +15,50 @@ from research_explorer.aco.convergence import ConvergenceChecker
 from research_explorer.aco.scheduler import Scheduler
 from research_explorer.config import Config
 from research_explorer.events.models import OUTCOME_COMPLETED
+from research_explorer.examination.models import BenchmarkResult
 from research_explorer.graph.store import GraphStore
+
+
+def _benchmark_accuracy(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.4f}"
+
+
+def _benchmark_uplift(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value * 100:.2f} pp"
+
+
+def _benchmark_section(
+    result: BenchmarkResult, effective_scope: str, scope_origin: str
+) -> list[str]:
+    lines = ["## Survivor Benchmark\n"]
+    lines.append(f"- **Outcome:** {result.outcome}")
+    if result.reason_code:
+        lines.append(f"- **Reason:** {result.reason_code} — {result.reason}")
+    lines.append(f"- **Effective scope ({scope_origin}):** {effective_scope or '(derived)'}")
+    lines.append(f"- **Survivor:** {result.survivor_id or '(none)'}")
+    selection = result.selection
+    if selection is not None:
+        lines.append(
+            f"- **Terminal score:** {selection.terminal_score:.4f} "
+            f"(E_selection={_benchmark_accuracy(selection.selection_accuracy)}, "
+            f"Q_process={selection.process_score:.4f}, G={selection.grounding_score:.4f})"
+        )
+        lines.append(f"- **Candidate ranking:** {', '.join(selection.ranking) or '(none)'}")
+        lines.append(f"- **Process-peak agent:** {selection.process_peak_agent or '(none)'}")
+    lines.append(f"- **Selection items:** {result.selection_count}")
+    lines.append(f"- **Holdout items:** {result.holdout_count}")
+    lines.append(f"- **Survivor accuracy:** {_benchmark_accuracy(result.survivor_accuracy)}")
+    lines.append(f"- **Naive accuracy:** {_benchmark_accuracy(result.naive_accuracy)}")
+    lines.append(f"- **Research uplift:** {_benchmark_uplift(result.uplift)}")
+    if result.survivor_unavailable:
+        lines.append(f"- **Survivor arm unavailable:** {result.survivor_unavailable}")
+    if result.naive_unavailable:
+        lines.append(f"- **Naive arm unavailable:** {result.naive_unavailable}")
+    lines.append(f"- **Config fingerprint:** {result.config_fingerprint or 'unset'}")
+    lines.append(f"- **Models:** {json.dumps(result.model_ids, sort_keys=True)}")
+    lines.append(f"- **Frozen state hash:** {result.state_hash or 'unset'}")
+    lines.append("")
+    return lines
 
 
 def _fmt_papers_list(ids: list[str], graph: GraphStore, limit: int = 200) -> str:
@@ -44,6 +88,9 @@ def build_report(
     outcome: str = OUTCOME_COMPLETED,
     terminal_reason: str = "",
     stop_reason: str = "",
+    benchmark_result: BenchmarkResult | None = None,
+    effective_scope: str = "",
+    scope_origin: str = "derived",
 ) -> str:
     parts: list[str] = []
 
@@ -75,6 +122,10 @@ def build_report(
     if terminal_reason:
         parts.append(f"- **Terminal reason:** {terminal_reason}")
     parts.append("")
+
+    # ---- Survivor benchmark (OBS-1) -------------------------------------
+    if benchmark_result is not None:
+        parts.extend(_benchmark_section(benchmark_result, effective_scope, scope_origin))
 
     # ---- Winning narrative ----------------------------------------------
     parts.append("## Winning Narrative\n")

@@ -73,7 +73,7 @@ def survivor_payloads(result: BenchmarkResult) -> list[tuple[str, dict[str, Any]
     payloads.append(
         (
             EventType.SURVIVOR_FROZEN,
-            {"survivor_id": result.survivor_id, "state_hash": result.model_ids.get("state_hash", "")},
+            {"survivor_id": result.survivor_id, "state_hash": result.state_hash},
         )
     )
     payloads.append(
