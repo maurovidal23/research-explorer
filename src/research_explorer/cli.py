@@ -113,6 +113,16 @@ def _echo_report_stdout(report: str) -> None:
     typer.echo(report)
 
 
+def _format_ratio(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.4f}"
+
+
+def _format_uplift(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{value * 100:+.2f} percentage points"
+
+
 def _atomic_write_report(path: str, report: str) -> None:
     """Atomically replace ``path`` with ``report`` in the same directory.
 
@@ -574,8 +584,6 @@ def benchmark(
     ),
 ) -> None:
     """Run a bounded, network-free survivor benchmark with deterministic clients."""
-    import json
-
     from research_explorer.examination import (
         BenchmarkConfig,
         BenchmarkRunner,
@@ -653,14 +661,25 @@ def benchmark(
             private_key_artifact(runner.answer_key),
         )
 
-    summary = {
-        "outcome": result.outcome,
-        "survivor": result.survivor_id,
-        "survivor_accuracy": result.survivor_accuracy,
-        "naive_accuracy": result.naive_accuracy,
-        "uplift": result.uplift,
-    }
-    typer.echo(json.dumps(summary, indent=2))
+    typer.echo("\n" + "=" * 80)
+    typer.echo("SURVIVOR BENCHMARK")
+    typer.echo("=" * 80)
+    typer.echo(f"  Outcome: {result.outcome}")
+    if result.reason_code:
+        typer.echo(f"  Reason: {result.reason_code} — {result.reason}")
+    typer.echo(f"  Survivor: {result.survivor_id or '(none)'}")
+    typer.echo(f"  Survivor accuracy: {_format_ratio(result.survivor_accuracy)}")
+    typer.echo(f"  Naive accuracy: {_format_ratio(result.naive_accuracy)}")
+    typer.echo(f"  Research uplift: {_format_uplift(result.uplift)}")
+    if runner.bank is not None:
+        typer.echo(
+            f"  Exam bank: {runner.bank.accepted_count} accepted, "
+            f"{runner.bank.rejected_count} rejected"
+        )
+        typer.echo(
+            f"  Partitions: {len(runner.bank.selection_ids)} selection / "
+            f"{len(runner.bank.holdout_ids)} holdout"
+        )
     typer.echo(f"Artifacts written to {out_dir}/")
 
 

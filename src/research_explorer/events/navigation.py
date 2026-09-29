@@ -16,17 +16,23 @@ from pydantic import BaseModel, Field
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_EVALUATING,
+    EXAM_PHASE_ORDER,
     NODE_ACTIVE,
     NODE_COMPLETED,
     NODE_FAILED,
     NODE_PENDING,
     NODE_SKIPPED,
+    PHASE_BENCHMARK,
     PHASE_DECISION,
     PHASE_EVALUATION,
+    PHASE_EXAM_BUILD,
     PHASE_RESEARCH,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
     TERMINAL_STATUSES,
     WAVE_PHASE_ORDER,
     AgentSummary,
+    PhaseState,
     RunViewState,
     TimelineEntry,
 )
@@ -37,8 +43,16 @@ TURN_NODE = "turn"
 LEAF_NODE = "leaf"
 SETUP_NODE = "setup"
 PHASE_NODE = "phase"
+EXAM_NODE = "exam"
 FINAL_NODE = "final"
 DEBUG_NODE = "debug"
+
+EXAM_PHASE_LABELS: dict[str, str] = {
+    PHASE_EXAM_BUILD: "Exam build",
+    PHASE_SELECTION: "Selection",
+    PHASE_SURVIVOR: "Survivor",
+    PHASE_BENCHMARK: "Benchmark",
+}
 
 _PHASE_OF_KIND = {
     "turn": PHASE_RESEARCH,
@@ -249,9 +263,31 @@ def build_wave_navigation(state: RunViewState) -> list[NavNode]:
     roots: list[NavNode] = [_build_setup_node(state)]
     for wave in state.ordered_waves():
         roots.append(_build_wave_first_node(state, wave))
+    for phase in EXAM_PHASE_ORDER:
+        record = state.exam_phases.get(phase)
+        if record is not None:
+            roots.append(_build_exam_node(phase, record))
     roots.append(_build_final_node(state))
     roots.append(_build_debug_node(state))
     return roots
+
+
+def _build_exam_node(phase: str, record: PhaseState) -> NavNode:
+    """One terminal examination phase shown after the research waves (TUI-1)."""
+    return NavNode(
+        node_id=f"exam:{phase}",
+        kind=EXAM_NODE,
+        label=EXAM_PHASE_LABELS.get(phase, phase.replace("_", " ").title()),
+        status=record.status,
+        detail={
+            "phase": phase,
+            "sources": record.evidence_added,
+            "items": record.papers_attempted,
+            "completed": record.completed,
+            "leader": record.leader,
+            "reason": record.reason,
+        },
+    )
 
 
 def _build_setup_node(state: RunViewState) -> NavNode:
@@ -392,6 +428,8 @@ def active_phase_node_id(state: RunViewState) -> str:
     wave, phase = active_wave_phase(state)
     if state.status in TERMINAL_STATUSES:
         return "final"
+    if phase in EXAM_PHASE_ORDER and phase in state.exam_phases:
+        return f"exam:{phase}"
     if not wave:
         return "setup"
     if state.phase(wave, phase) is None and not any(
@@ -404,6 +442,8 @@ def active_phase_node_id(state: RunViewState) -> str:
 __all__ = [
     "AGENT_NODE",
     "DEBUG_NODE",
+    "EXAM_NODE",
+    "EXAM_PHASE_LABELS",
     "FINAL_NODE",
     "LEAF_NODE",
     "PHASE_NODE",

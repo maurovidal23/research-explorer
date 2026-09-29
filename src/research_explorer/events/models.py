@@ -434,6 +434,11 @@ class RunViewState(BaseModel):
     exam_selection_count: int = 0
     exam_holdout_count: int = 0
     exam_rejected_count: int = 0
+    survivor_terminal_score: float | None = None
+    survivor_selection_score: float | None = None
+    survivor_process_score: float | None = None
+    survivor_grounding_score: float | None = None
+    survivor_ranking: list[str] = Field(default_factory=list)
 
     def ordered_agents(self) -> list[AgentSummary]:
         return [self.agents[a] for a in self.agent_order if a in self.agents]

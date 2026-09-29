@@ -1340,7 +1340,22 @@ class RunProjection:
             record.completed.append(agent)
 
     def _on_survivor_selected(self, event: RunEvent) -> None:
-        self.state.survivor_id = str(event.payload.get("survivor_id") or "")
+        p = event.payload
+        self.state.survivor_id = str(p.get("survivor_id") or "")
+        self.state.survivor_terminal_score = _as_optional_float(p.get("terminal_score"))
+        self.state.survivor_selection_score = _as_optional_float(
+            p.get("selection_accuracy")
+        )
+        self.state.survivor_process_score = _as_optional_float(p.get("process_score"))
+        self.state.survivor_grounding_score = _as_optional_float(
+            p.get("grounding_score")
+        )
+        ranking = p.get("ranking")
+        if isinstance(ranking, list):
+            self.state.survivor_ranking = [str(item) for item in ranking]
+        selection = self.state.exam_phases.get(PHASE_SELECTION)
+        if selection is not None:
+            selection.status = NODE_COMPLETED
         record = self._exam_phase(PHASE_SURVIVOR)
         record.status = NODE_COMPLETED
         record.leader = self.state.survivor_id

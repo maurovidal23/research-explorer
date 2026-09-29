@@ -25,9 +25,13 @@ from research_explorer.events.models import (
     NODE_PENDING,
     NODE_SKIPPED,
     OUTCOME_DEGRADED,
+    PHASE_BENCHMARK,
     PHASE_DECISION,
     PHASE_EVALUATION,
+    PHASE_EXAM_BUILD,
     PHASE_RESEARCH,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
@@ -43,6 +47,8 @@ from research_explorer.events.models import (
 from research_explorer.events.navigation import (
     AGENT_NODE,
     DEBUG_NODE,
+    EXAM_NODE,
+    EXAM_PHASE_LABELS,
     FINAL_NODE,
     PHASE_NODE,
     SETUP_NODE,
@@ -133,6 +139,21 @@ def status_label(state: RunViewState) -> str:
     if state.outcome == OUTCOME_DEGRADED:
         return f"{label} ({OUTCOME_DEGRADED})"
     return label
+
+
+def phase_display_label(phase: str) -> str:
+    """Human label for an examination phase; wave phases keep their raw name."""
+    if phase in EXAM_PHASE_LABELS:
+        return EXAM_PHASE_LABELS[phase]
+    return phase.replace("_", " ") or DASH
+
+
+def _ratio_text(value: float | None) -> str:
+    return UNAVAILABLE if value is None else f"{value:.4f}"
+
+
+def _uplift_text(value: float | None) -> str:
+    return UNAVAILABLE if value is None else f"{value * 100:+.2f} pp"
 
 
 def phase_progress_text(state: RunViewState) -> str:
@@ -765,7 +786,9 @@ def render_dashboard_header(
     row1.append(f"  elapsed {format_duration(state.elapsed_seconds)}")
     row1.append(f"  fetch {state.fetches_used}/{state.max_fetches}")
     row1.append(f"  wave {state.current_wave}  turn {state.current_turn}")
-    row1.append(f"  phase {state.current_phase or DASH}")
+    row1.append(
+        f"  phase {phase_display_label(state.current_phase) if state.current_phase else DASH}"
+    )
     progress = phase_progress_text(state)
     if progress != DASH:
         row1.append(f"  {progress}")
@@ -797,6 +820,26 @@ def render_dashboard_header(
     header.append("\n")
     header.append_text(row2)
     return header
+
+
+def _exam_tree_detail(state: RunViewState, node: NavNode) -> str:
+    phase = str(node.detail.get("phase") or "")
+    if phase == PHASE_EXAM_BUILD:
+        return (
+            f"{node.detail.get('sources', 0)} sources · "
+            f"{node.detail.get('items', 0)} items"
+        )
+    if phase == PHASE_SELECTION:
+        return (
+            f"{state.exam_selection_count} selection / "
+            f"{state.exam_holdout_count} holdout"
+        )
+    if phase == PHASE_SURVIVOR:
+        survivor = state.survivor_id or str(node.detail.get("leader") or "")
+        return agent_label(state, survivor) if survivor else DASH
+    if phase == PHASE_BENCHMARK:
+        return f"uplift {_uplift_text(state.uplift)}"
+    return ""
 
 
 def render_tree_label(
@@ -875,6 +918,8 @@ def render_tree_label(
         detail = " · " + " · ".join(parts) if parts else ""
     elif node.kind == PHASE_NODE:
         detail = " · " + phase_summary_text(state, node.wave, node.node_id.split(":")[-1])
+    elif node.kind == EXAM_NODE:
+        detail = " · " + _exam_tree_detail(state, node)
     elif node.kind == FINAL_NODE:
         detail = f" · {state.outcome or UNAVAILABLE}"
         if state.stop_reason:
@@ -1042,6 +1087,8 @@ def render_research_tab(
     lines: list[str] = []
     if node is not None and node.kind == FINAL_NODE:
         return render_final_result(state)
+    if node is not None and node.kind == EXAM_NODE:
+        return render_exam_tab(state, node)
     if node is not None and node.kind in (WAVE_NODE, PHASE_NODE):
         wave = node.wave or state.current_wave
         lines.extend(render_wave_summary(state, wave))
@@ -1169,6 +1216,80 @@ def render_evaluation_state(
     return lines
 
 
+def render_exam_phase(state: RunViewState, phase: str) -> list[str]:
+    """Compact examination-phase detail; counts only, never a question key."""
+    record = state.exam_phases.get(phase)
+    lines: list[str] = [f"### {phase_display_label(phase)}", ""]
+    if record is None:
+        lines.append("_No examination telemetry recorded._")
+        return lines
+    lines.append(f"- status: {status_mark(record.status)}")
+    if phase == PHASE_EXAM_BUILD:
+        lines.append(f"- evidence sources: {record.evidence_added}")
+        lines.append(f"- generated items: {record.papers_attempted}")
+        lines.append(f"- rejected items: {state.exam_rejected_count}")
+    elif phase == PHASE_SELECTION:
+        lines.append(f"- selection items: {state.exam_selection_count}")
+        lines.append(f"- holdout items: {state.exam_holdout_count}")
+        lines.append(f"- candidates completed: {len(record.completed)}")
+    elif phase == PHASE_SURVIVOR:
+        survivor = state.survivor_id or record.leader
+        lines.append(
+            f"- survivor: {agent_label(state, survivor) if survivor else DASH}"
+        )
+        if state.survivor_terminal_score is not None:
+            lines.append(f"- terminal score: {state.survivor_terminal_score:.4f}")
+    elif phase == PHASE_BENCHMARK:
+        lines.append(f"- outcome: {state.benchmark_outcome or UNAVAILABLE}")
+        if state.benchmark_reason_code:
+            lines.append(
+                f"- reason: {state.benchmark_reason_code} — {state.benchmark_reason}"
+            )
+        lines.append(f"- survivor accuracy: {_ratio_text(state.survivor_accuracy)}")
+        lines.append(f"- naive accuracy: {_ratio_text(state.naive_accuracy)}")
+        lines.append(f"- research uplift: {_uplift_text(state.uplift)}")
+    if record.reason and phase != PHASE_BENCHMARK:
+        lines.append(f"- note: {record.reason}")
+    return lines
+
+
+def render_exam_tab(state: RunViewState, node: NavNode) -> str:
+    phase = str(node.detail.get("phase") or node.node_id.split(":")[-1])
+    lines = [f"## Examination · {phase_display_label(phase)}", ""]
+    lines.extend(render_exam_phase(state, phase))
+    return "\n".join(lines)
+
+
+def _render_terminal_breakdown(state: RunViewState) -> list[str]:
+    lines: list[str] = [
+        f"- Terminal score: {_ratio_text(state.survivor_terminal_score)} "
+        f"(E_selection={_ratio_text(state.survivor_selection_score)}, "
+        f"Q_process={_ratio_text(state.survivor_process_score)}, "
+        f"G={_ratio_text(state.survivor_grounding_score)})"
+    ]
+    if state.survivor_ranking:
+        lines.append(f"- Candidate ranking: {', '.join(state.survivor_ranking)}")
+    return lines
+
+
+def _render_benchmark_result(state: RunViewState) -> list[str]:
+    if not (state.benchmark_outcome or state.survivor_id):
+        return []
+    lines: list[str] = ["", "### Benchmark"]
+    lines.append(f"- Outcome: {state.benchmark_outcome or UNAVAILABLE}")
+    if state.benchmark_reason_code:
+        lines.append(
+            f"- Reason: {state.benchmark_reason_code} — {state.benchmark_reason}"
+        )
+    survivor = state.survivor_id
+    lines.append(f"- Survivor: {agent_label(state, survivor) if survivor else DASH}")
+    lines.extend(_render_terminal_breakdown(state))
+    lines.append(f"- Survivor accuracy: {_ratio_text(state.survivor_accuracy)}")
+    lines.append(f"- Naive accuracy: {_ratio_text(state.naive_accuracy)}")
+    lines.append(f"- Research uplift: {_uplift_text(state.uplift)}")
+    return lines
+
+
 def render_final_result(state: RunViewState) -> str:
     lines = ["## Final result", ""]
     lines.append(f"- Outcome: {state.outcome or UNAVAILABLE}")
@@ -1203,6 +1324,7 @@ def render_final_result(state: RunViewState) -> str:
         )
     else:
         lines.append("no winner evaluation recorded")
+    lines.extend(_render_benchmark_result(state))
     failed = sum(
         1 for record in state.evaluation_states.values() if record.status == EVAL_FAILED
     )
