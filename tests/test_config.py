@@ -155,6 +155,20 @@ def test_invalid_examination_settings_are_rejected(tmp_path) -> None:
         load_config(path)
 
 
+def test_examiner_key_never_falls_back_to_explorer_credential(monkeypatch) -> None:
+    import pytest
+
+    from research_explorer.orchestrator.runner import resolve_examiner_key
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("NAN_API_KEY", "nan-explorer-secret")
+    with pytest.raises(RuntimeError):
+        resolve_examiner_key("OPENAI_API_KEY")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "examiner-secret")
+    assert resolve_examiner_key("OPENAI_API_KEY") == "examiner-secret"
+
+
 def test_old_agent_state_loads_without_structured_memory() -> None:
     from research_explorer.agents.state import AgentState
 

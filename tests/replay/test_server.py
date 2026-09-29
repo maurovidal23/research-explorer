@@ -154,6 +154,27 @@ async def test_artifacts_endpoints(client):
     assert res.json()["content"] == "the narrative"
 
 
+async def test_private_answer_key_artifact_is_not_served(tmp_path):
+    db = tmp_path / "replay.db"
+    store = RunTraceStore(db)
+    run_id = store.create_run("seed", "q")
+    store.save_artifact(run_id, "narrative_a0.md", "narrative", "the narrative")
+    private_id = store.save_artifact(
+        run_id, "exam_key.private.json", "answer_key", '{"correct_option_id": "A"}'
+    )
+    store.close()
+
+    app = build_app(db)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        listing = (await c.get(f"/api/runs/{run_id}/artifacts")).json()
+        assert [a["artifact_id"] for a in listing] != [private_id]
+        assert all(a["artifact_id"] != private_id for a in listing)
+        direct = await c.get(f"/api/artifacts/{private_id}")
+        assert direct.status_code == 404
+        assert "correct_option_id" not in direct.text
+
+
 async def test_unknown_run_404(client):
     c, _ = client
     res = await c.get("/api/runs/missing/events")

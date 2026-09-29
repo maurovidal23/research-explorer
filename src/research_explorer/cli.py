@@ -95,6 +95,17 @@ def _emit_report(report: str, output: str | None, obsidian_dir: str | None) -> N
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
 
 
+def _write_private_artifact(path: Path, content: str) -> None:
+    """Write a restricted artifact readable only by the current user.
+
+    The exam answer key must not be world/group readable, unlike ordinary
+    reports and narrative artifacts.
+    """
+    path.write_text(content, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
 def _echo_report_stdout(report: str) -> None:
     typer.echo("\n" + "=" * 80)
     typer.echo("EXPLORATION REPORT")
@@ -637,8 +648,9 @@ def benchmark(
             public_exam_artifact(runner.bank), encoding="utf-8"
         )
     if runner.answer_key is not None:
-        (out_dir / "exam_key.private.json").write_text(
-            private_key_artifact(runner.answer_key), encoding="utf-8"
+        _write_private_artifact(
+            out_dir / "exam_key.private.json",
+            private_key_artifact(runner.answer_key),
         )
 
     summary = {

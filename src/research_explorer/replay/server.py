@@ -22,6 +22,8 @@ _HEARTBEAT_FIELDS = frozenset(
     {"process_id", "host_id", "heartbeat_at", "heartbeat_state", "interrupt_reason"}
 )
 
+_PRIVATE_ARTIFACT_KINDS = frozenset({"answer_key"})
+
 
 def _public_run(run: dict) -> dict:
     """Strip local process/host heartbeat metadata from an HTTP run payload.
@@ -79,12 +81,16 @@ def build_app(
     def get_artifacts(run_id: str) -> list[dict]:
         if store.get_run(run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
-        return store.list_artifacts(run_id)
+        return [
+            artifact
+            for artifact in store.list_artifacts(run_id)
+            if artifact.get("kind") not in _PRIVATE_ARTIFACT_KINDS
+        ]
 
     @app.get("/api/artifacts/{artifact_id}")
     def get_artifact(artifact_id: str) -> dict:
         artifact = store.get_artifact(artifact_id)
-        if artifact is None:
+        if artifact is None or artifact.get("kind") in _PRIVATE_ARTIFACT_KINDS:
             raise HTTPException(status_code=404, detail="artifact not found")
         return artifact
 

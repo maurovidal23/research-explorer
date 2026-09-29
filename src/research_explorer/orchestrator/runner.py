@@ -47,6 +47,23 @@ from research_explorer.replay.trace import (
 log = get_logger("orchestrator")
 
 
+def resolve_examiner_key(api_key_env: str) -> str:
+    """Resolve the examiner credential without reusing another provider's key.
+
+    The generic LLM client falls back to ``NAN_API_KEY`` when no explicit key
+    is supplied. For the examiner that would silently transmit the explorer
+    credential to the configured examiner provider, so an unset examiner key
+    variable fails closed instead.
+    """
+    key = get_api_key(api_key_env)
+    if not key:
+        raise RuntimeError(
+            f"examiner API key environment variable {api_key_env!r} is not set; "
+            "refusing to reuse the explorer credential for the examiner provider"
+        )
+    return key
+
+
 class Orchestrator:
     """Runs the full ACO exploration loop.
 
@@ -580,7 +597,7 @@ class Orchestrator:
         exam = self.cfg.examination
         examiner_llm = LLMClient(
             base_url=exam.examiner_base_url,
-            api_key=get_api_key(exam.examiner_api_key_env),
+            api_key=resolve_examiner_key(exam.examiner_api_key_env),
             max_concurrent=self.cfg.llm.max_concurrent,
             rpm=self.cfg.llm.rpm,
         )
