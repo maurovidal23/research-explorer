@@ -138,12 +138,17 @@ def action_by_id(action_id: str) -> UIAction | None:
 
 
 def footer_hints(narrow: bool = False) -> str:
+    visible = (
+        ("toggle_panes", "reader", "palette", "help", "quit")
+        if narrow
+        else ("focus_left", "focus_right", "palette", "help", "quit")
+    )
     hints = [
         f"{a.key_display or a.key} {a.label.lower()}"
         for a in ACTIONS
-        if a.footer and (narrow or not a.narrow)
+        if a.id in visible
     ]
-    return "  ".join(hints)
+    return " · ".join(hints)
 
 
 def help_text() -> str:

@@ -77,7 +77,9 @@ from research_explorer.tui.theme import (
     COLOR_WARN,
 )
 
-COMPACT_BREAKPOINT = 84
+COMPACT_BREAKPOINT = 96
+MIN_TERMINAL_WIDTH = 52
+MIN_TERMINAL_HEIGHT = 16
 
 TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -265,7 +267,7 @@ class ResearchTUIApp(App[None]):
     #main {{ height: 1fr; }}
     #main.narrow {{ layout: vertical; }}
     #left {{ width: 42%; height: 1fr; border: round {BORDER_DIM}; }}
-    #left.narrow {{ width: 100%; height: 34%; max-height: 16; }}
+    #left.narrow {{ width: 100%; height: 1fr; max-height: 100%; }}
     #left.focused {{ border: round {BORDER_ACCENT}; }}
     #tree-title {{ height: 1; padding: 0 1; color: {COLOR_MUTED}; }}
     #tree {{ height: 1fr; background: transparent; }}
@@ -273,7 +275,8 @@ class ResearchTUIApp(App[None]):
     #tree > ListItem.-highlight {{ background: {COLOR_ACCENT} 18%; color: {COLOR_TEXT}; }}
     #tree:focus > ListItem.-highlight {{ background: {COLOR_ACCENT} 28%; color: {COLOR_TEXT}; }}
     #right {{ width: 1fr; height: 1fr; }}
-    #activity {{ height: 7; border: round {BORDER_DIM}; padding: 0 1; }}
+    #right.narrow {{ width: 100%; height: 1fr; }}
+    #activity {{ height: 7; padding: 0 1; }}
     #activity.narrow {{ height: 5; }}
     #status-banner {{ height: auto; padding: 0 1; color: {COLOR_MUTED}; }}
     #tabbar {{ height: 2; background: transparent; }}
@@ -282,7 +285,8 @@ class ResearchTUIApp(App[None]):
     Tab:hover {{ color: {COLOR_TEXT}; }}
     #content-scroll {{ height: 1fr; border: round {BORDER_DIM}; padding: 0 1; }}
     #content-scroll.focused {{ border: round {BORDER_ACCENT}; }}
-    #footer {{ height: auto; max-height: 4; border: round {BORDER_DIM}; padding: 0 1; }}
+    #footer {{ height: auto; max-height: 3; padding: 0 1; }}
+    #too-small {{ display: none; width: 100%; height: 1fr; content-align: center middle; color: {COLOR_MUTED}; }}
     TextViewer {{ align: center middle; }}
     #viewer-title {{ height: 1; padding: 0 1; color: {COLOR_ACCENT}; }}
     #viewer-scroll {{ width: 90%; height: 85%; border: round {BORDER_ACCENT}; padding: 1 2; }}
@@ -398,6 +402,7 @@ class ResearchTUIApp(App[None]):
                 with VerticalScroll(id="content-scroll"):
                     yield Markdown("", id="content")
         yield FooterBar(id="footer")
+        yield Static("", id="too-small")
 
     def on_mount(self) -> None:
         self.register_theme(RESEARCH_THEME)
@@ -411,7 +416,7 @@ class ResearchTUIApp(App[None]):
                 self._run_runner(), name="research-runner", group="research-runner", exclusive=True
             )
         self.set_interval(1.0, self._tick_elapsed)
-        self._apply_narrow(self.size.width <= COMPACT_BREAKPOINT)
+        self._apply_layout(self.size.width, self.size.height)
         self.refresh_view()
 
     def on_unmount(self) -> None:
@@ -438,8 +443,20 @@ class ResearchTUIApp(App[None]):
             self.refresh_view()
 
     def on_resize(self, event: Resize) -> None:
-        self._apply_narrow(event.size.width <= COMPACT_BREAKPOINT)
+        self._apply_layout(event.size.width, event.size.height)
         self.refresh_view()
+
+    def _apply_layout(self, width: int, height: int) -> None:
+        too_small = width < MIN_TERMINAL_WIDTH or height < MIN_TERMINAL_HEIGHT
+        self.query_one("#too-small", Static).display = too_small
+        self.query_one("#too-small", Static).update(
+            f"Terminal too small — need {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT}\n"
+            f"Current size: {width}x{height}"
+        )
+        for selector in ("#header", "#main", "#footer"):
+            self.query_one(selector).display = not too_small
+        if not too_small:
+            self._apply_narrow(width < COMPACT_BREAKPOINT)
 
     def _apply_narrow(self, narrow: bool) -> None:
         if narrow == self.session.narrowed:
@@ -447,13 +464,25 @@ class ResearchTUIApp(App[None]):
         self.session.narrowed = narrow
         main = self.query("#main").first()
         left = self.query("#left").first()
+        right = self.query("#right").first()
         activity = self.query("#activity").first()
         if main is not None:
             main.set_class(narrow, "narrow")
         if left is not None:
             left.set_class(narrow, "narrow")
+        if right is not None:
+            right.set_class(narrow, "narrow")
         if activity is not None:
             activity.set_class(narrow, "narrow")
+        self._sync_pane_visibility()
+
+    def _sync_pane_visibility(self) -> None:
+        left = self.query("#left").first()
+        right = self.query("#right").first()
+        if left is not None:
+            left.display = not self.session.narrowed or self.session.focus == TREE_FOCUS
+        if right is not None:
+            right.display = not self.session.narrowed or self.session.focus == CONTENT_FOCUS
 
     async def _consume(self) -> None:
         assert self._queue is not None
@@ -743,12 +772,14 @@ class ResearchTUIApp(App[None]):
 
     def action_focus_left(self) -> None:
         self.session.focus = TREE_FOCUS
+        self._sync_pane_visibility()
         with contextlib.suppress(Exception):
             self.query_one("#tree", AgentTree).focus()
         self.refresh_view()
 
     def action_focus_right(self) -> None:
         self.session.focus = CONTENT_FOCUS
+        self._sync_pane_visibility()
         with contextlib.suppress(Exception):
             self.query_one("#content-scroll", VerticalScroll).focus()
         self.refresh_view()
@@ -768,7 +799,10 @@ class ResearchTUIApp(App[None]):
 
     def action_select_tab(self, tab: str) -> None:
         self.session.select_tab(tab)
-        self.refresh_view()
+        if self.session.narrowed:
+            self.action_focus_right()
+        else:
+            self.refresh_view()
 
     def action_tab_research(self) -> None:
         self.action_select_tab(TAB_RESEARCH)

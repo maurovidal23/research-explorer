@@ -376,20 +376,55 @@ async def test_wheel_scrolls_the_focused_panel() -> None:
         assert scroll.scroll_y > 0
 
 
-async def test_compact_layout_stacks_and_footer_adapts() -> None:
+async def test_compact_layout_uses_one_pane_and_footer_adapts() -> None:
     app = _app()
     async with app.run_test(size=(70, 24)) as pilot:
         await pilot.pause()
         assert app.session.narrowed
         assert app.query_one("#main").has_class("narrow")
         assert app.query_one("#left").has_class("narrow")
+        assert app.query_one("#left").display
+        assert not app.query_one("#right").display
         assert "toggle panes" in app.query_one("#footer").plain_text
         await pilot.press("t")
         await pilot.pause()
         assert app.session.focus == "content"
+        assert not app.query_one("#left").display
+        assert app.query_one("#right").display
         await pilot.press("t")
         await pilot.pause()
         assert app.session.focus == "tree"
+        assert app.query_one("#left").display
+        assert not app.query_one("#right").display
+
+
+async def test_standard_80x24_uses_single_pane_fallback() -> None:
+    app = _app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app.session.narrowed
+        assert app.query_one("#left").display
+        assert not app.query_one("#right").display
+        await pilot.press("2")
+        await pilot.pause()
+        assert app.session.active_tab == "paper"
+        assert not app.query_one("#left").display
+        assert app.query_one("#right").display
+
+
+async def test_too_small_terminal_has_truthful_resize_state() -> None:
+    app = _app()
+    async with app.run_test(size=(50, 14)) as pilot:
+        await pilot.pause()
+        message = app.query_one("#too-small")
+        assert message.display
+        assert "need 52x16" in str(message.content)
+        assert not app.query_one("#main").display
+        await pilot.resize_terminal(60, 20)
+        await pilot.pause()
+        assert not message.display
+        assert app.query_one("#main").display
+        assert app.session.narrowed
 
 
 async def test_resize_preserves_selection_and_tab() -> None:
@@ -648,6 +683,6 @@ async def test_footer_and_help_come_from_action_registry() -> None:
             key = action.key_display or action.key or ""
             assert key in help_body, action.id
         footer = app.query_one("#footer").plain_text
-        for action in ACTIONS:
-            if action.footer and not action.narrow:
-                assert (action.key_display or action.key) in footer, action.id
+        for action_id in ("focus_left", "focus_right", "palette", "help", "quit"):
+            action = next(action for action in ACTIONS if action.id == action_id)
+            assert (action.key_display or action.key) in footer, action.id
