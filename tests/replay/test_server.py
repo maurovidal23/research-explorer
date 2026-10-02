@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -90,6 +91,31 @@ async def test_get_run(client):
     assert res.json()["status"] == "completed"
 
 
+async def test_run_endpoints_omit_local_heartbeat_identity(tmp_path):
+    heartbeat_fields = {
+        "process_id",
+        "host_id",
+        "heartbeat_at",
+        "heartbeat_state",
+        "interrupt_reason",
+    }
+    db = tmp_path / "replay.db"
+    store = RunTraceStore(db)
+    run_id = store.create_run("seed", "q")
+    store.start_heartbeat(run_id, process_id=os.getpid(), host_id="some-host")
+    store.close()
+
+    app = build_app(db)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        detail = (await c.get(f"/api/runs/{run_id}")).json()
+        listing = (await c.get("/api/runs")).json()[0]
+
+    for payload in (detail, listing):
+        assert payload["status"] == "running"
+        assert heartbeat_fields.isdisjoint(payload.keys())
+
+
 async def test_events_ordered(client):
     c, run_id = client
     res = await c.get(f"/api/runs/{run_id}/events")
@@ -126,6 +152,27 @@ async def test_artifacts_endpoints(client):
     res = await c.get(f"/api/artifacts/{artifact_id}")
     assert res.status_code == 200
     assert res.json()["content"] == "the narrative"
+
+
+async def test_private_answer_key_artifact_is_not_served(tmp_path):
+    db = tmp_path / "replay.db"
+    store = RunTraceStore(db)
+    run_id = store.create_run("seed", "q")
+    store.save_artifact(run_id, "narrative_a0.md", "narrative", "the narrative")
+    private_id = store.save_artifact(
+        run_id, "exam_key.private.json", "answer_key", '{"correct_option_id": "A"}'
+    )
+    store.close()
+
+    app = build_app(db)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        listing = (await c.get(f"/api/runs/{run_id}/artifacts")).json()
+        assert [a["artifact_id"] for a in listing] != [private_id]
+        assert all(a["artifact_id"] != private_id for a in listing)
+        direct = await c.get(f"/api/artifacts/{private_id}")
+        assert direct.status_code == 404
+        assert "correct_option_id" not in direct.text
 
 
 async def test_unknown_run_404(client):

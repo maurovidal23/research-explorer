@@ -76,6 +76,7 @@ def test_parse_summary() -> None:
     p = ArxivProvider.__new__(ArxivProvider)
     s = p._parse_summary(_entry(_ENTRY_XML))
     assert s.id == "2301.00001"
+    assert s.arxiv_id == "2301.00001"
     assert s.doi == "10.1/xxx"
     assert s.title == "Attention Is All You Need"
     assert s.year == 2023
@@ -101,6 +102,7 @@ def test_parse_paper() -> None:
     p = ArxivProvider.__new__(ArxivProvider)
     paper = p._parse_paper(_entry(_ENTRY_XML))
     assert paper.id == "2301.00001"
+    assert paper.arxiv_id == "2301.00001"
     assert paper.doi == "10.1/xxx"
     assert paper.title == "Attention Is All You Need"
     assert paper.year == 2023

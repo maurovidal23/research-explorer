@@ -11,11 +11,15 @@ traversal.
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
 import sqlite3
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from research_explorer.events.models import RunEvent
 from research_explorer.events.sink import EventSink
@@ -29,6 +33,39 @@ from research_explorer.replay.models import (
 
 log = get_logger("replay.trace")
 
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+HEARTBEAT_STALE_SECONDS = 120.0
+
+
+def local_host_id() -> str:
+    return socket.gethostname()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
@@ -38,7 +75,12 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TEXT,
     status TEXT DEFAULT 'running',
     config_json TEXT,
-    best_quality REAL
+    best_quality REAL,
+    process_id INTEGER,
+    host_id TEXT,
+    heartbeat_at TEXT,
+    heartbeat_state TEXT,
+    interrupt_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -123,7 +165,24 @@ class RunTraceStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent additive migrations; preserves pre-existing databases."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")
+        }
+        additions = {
+            "process_id": "INTEGER",
+            "host_id": "TEXT",
+            "heartbeat_at": "TEXT",
+            "heartbeat_state": "TEXT",
+            "interrupt_reason": "TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -145,22 +204,118 @@ class RunTraceStore:
 
     def finish_run(self, run_id: str, status: str = "completed", best_quality: float | None = None) -> None:
         self._conn.execute(
-            "UPDATE runs SET status = ?, completed_at = ?, best_quality = COALESCE(?, best_quality) WHERE run_id = ?",
+            """UPDATE runs
+               SET status = ?, completed_at = ?, best_quality = COALESCE(?, best_quality),
+                   heartbeat_state = 'finalized', heartbeat_at = NULL
+               WHERE run_id = ?""",
             (status, utc_now(), best_quality, run_id),
         )
         self._conn.commit()
 
-    def list_runs(self) -> list[dict]:
+    def start_heartbeat(
+        self,
+        run_id: str,
+        process_id: int | None = None,
+        host_id: str | None = None,
+    ) -> None:
+        """Record process/host identity and begin the durable heartbeat."""
+        pid = process_id if process_id is not None else os.getpid()
+        host = host_id if host_id is not None else local_host_id()
+        self._conn.execute(
+            """UPDATE runs
+               SET process_id = ?, host_id = ?, heartbeat_at = ?, heartbeat_state = 'active',
+                   interrupt_reason = NULL
+               WHERE run_id = ?""",
+            (pid, host, utc_now(), run_id),
+        )
+        self._conn.commit()
+
+    def heartbeat(self, run_id: str) -> None:
+        """Refresh the heartbeat timestamp without emitting a replay event."""
+        self._conn.execute(
+            "UPDATE runs SET heartbeat_at = ? WHERE run_id = ? AND COALESCE(heartbeat_state, '') = 'active'",
+            (utc_now(), run_id),
+        )
+        self._conn.commit()
+
+    def heartbeat_state(self, run_id: str) -> dict | None:
+        row = self._conn.execute(
+            """SELECT process_id, host_id, heartbeat_at, heartbeat_state, interrupt_reason
+               FROM runs WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def reconcile_stale_runs(
+        self,
+        *,
+        now: datetime | None = None,
+        stale_after: float = HEARTBEAT_STALE_SECONDS,
+        local_host: str | None = None,
+        pid_alive: Callable[[int], bool] | None = None,
+    ) -> list[str]:
+        """Relabel provably dead local ``running`` rows as ``interrupted``.
+
+        Only rows whose heartbeat belongs to the local host are reconciled;
+        remote or heartbeat-less rows are left untouched so a potentially
+        active run on another machine is never mislabelled. The update is
+        idempotent, keeps every durable event and graph record, and never
+        fabricates a completion or a winner.
+        """
+        moment = now or datetime.now(timezone.utc)
+        host = local_host if local_host is not None else local_host_id()
+        alive = pid_alive if pid_alive is not None else _pid_alive
+        rows = self._conn.execute(
+            """SELECT run_id, process_id, host_id, heartbeat_at, heartbeat_state
+               FROM runs WHERE status = 'running'"""
+        ).fetchall()
+        interrupted: list[str] = []
+        for row in rows:
+            if (row["heartbeat_state"] or "") != "active":
+                continue
+            if not row["host_id"] or row["host_id"] != host:
+                continue
+            reason = ""
+            pid = row["process_id"]
+            if pid is not None and not alive(int(pid)):
+                reason = f"local process {pid} is no longer running"
+            else:
+                heartbeat_at = _parse_ts(row["heartbeat_at"])
+                if heartbeat_at is not None:
+                    age = (moment - heartbeat_at).total_seconds()
+                    if age > stale_after:
+                        reason = f"heartbeat stale for {int(age)}s"
+            if not reason:
+                continue
+            cursor = self._conn.execute(
+                """UPDATE runs
+                   SET status = 'interrupted', completed_at = ?,
+                       heartbeat_state = 'reconciled', interrupt_reason = ?
+                   WHERE run_id = ? AND status = 'running'""",
+                (utc_now(), reason, row["run_id"]),
+            )
+            if cursor.rowcount:
+                interrupted.append(row["run_id"])
+        if interrupted:
+            self._conn.commit()
+        return interrupted
+
+    def list_runs(self, reconcile: bool = True) -> list[dict]:
+        if reconcile:
+            self.reconcile_stale_runs()
         rows = self._conn.execute(
             """SELECT r.run_id, r.seed_paper_id, r.seed_query, r.started_at, r.completed_at,
-                      r.status, r.best_quality,
+                      r.status, r.best_quality, r.host_id, r.process_id,
+                      r.heartbeat_at, r.heartbeat_state, r.interrupt_reason,
                       (SELECT COUNT(*) FROM events e WHERE e.run_id = r.run_id) AS event_count,
                       (SELECT COUNT(*) FROM evaluation_results er WHERE er.run_id = r.run_id) AS evaluation_count
                FROM runs r ORDER BY r.started_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_run(self, run_id: str) -> dict | None:
+    def get_run(self, run_id: str, reconcile: bool = True) -> dict | None:
+        if reconcile:
+            self.reconcile_stale_runs()
         row = self._conn.execute(
             """SELECT r.*,
                       (SELECT COUNT(*) FROM events e WHERE e.run_id = r.run_id) AS event_count,
@@ -386,16 +541,53 @@ class RunTracer:
         except (TypeError, ValueError):
             full = None
         if full is not None:
-            self.emit("evaluation_detail", detail=full)
+            self.emit(
+                "evaluation_detail",
+                agent_id=detail.agent_id,
+                oleada=detail.oleada,
+                turn=detail.turn,
+                detail=full,
+            )
 
-    def record_artifact(self, name: str, kind: str, content: str) -> str:
+    def record_artifact(
+        self,
+        name: str,
+        kind: str,
+        content: str,
+        *,
+        agent_id: str | None = None,
+        oleada: int | None = None,
+        turn: int | None = None,
+    ) -> str:
+        artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
+        payload: dict[str, Any] = {
+            "artifact_id": artifact_id,
+            "name": name,
+            "kind": kind,
+            "content": redact_secrets(content),
+        }
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        if oleada is not None:
+            payload["oleada"] = oleada
+        if turn is not None:
+            payload["turn"] = turn
+        self.emit("artifact_saved", **payload)
+        return artifact_id
+
+    def record_private_artifact(self, name: str, kind: str, content: str) -> str:
+        """Persist a restricted artifact without leaking its content into events.
+
+        Used for the private exam answer key: the ordinary event stream records
+        only the artifact id, so keys never appear in trace events or TUI state.
+        """
         artifact_id = self.store.save_artifact(self.run_id, name, kind, content)
         self.emit(
             "artifact_saved",
             artifact_id=artifact_id,
             name=name,
             kind=kind,
-            content=redact_secrets(content),
+            private=True,
         )
         return artifact_id
 

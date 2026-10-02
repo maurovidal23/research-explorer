@@ -14,6 +14,8 @@ embedding_model = "qwen3-embedding"
 rerank_model = "rerank"
 temperature = 0.6
 max_tokens = 2000
+evaluation_max_tokens = 4000
+structured_output_attempts = 2
 
 [aco]
 colony_size = 15          # N — total agents in the colony
@@ -122,3 +124,43 @@ prompt_version = "v1"
 [storage]
 db_path = "data/explorer.db"
 cache_dir = "data/.cache"
+
+[memory]
+enabled = true            # structured per-paper memory + derived synthesis (SURV-2/3/4)
+synthesis_words = 2000    # safe default for a detailed research briefing
+chunk_chars = 12000       # bounded full-text chunk size for dossier extraction
+max_chunks = 8            # bounded number of full-text chunks retained per paper
+
+[examination]
+enabled = false           # opt-in hidden examination + matched naive baseline
+examiner_provider = "openai"          # examiner is a separate provider, not the NaN endpoint
+examiner_base_url = "https://api.openai.com/v1"
+examiner_api_key_env = "OPENAI_API_KEY"
+examiner_model = "gpt-5.6-sol"
+examiner_reasoning_effort = "medium"
+examiner_temperature = 0.2
+examiner_max_tokens = 4000
+selection_count = 30
+holdout_count = 20
+options_per_item = 4
+partition_seed = 0
+max_validation_attempts = 2
+allow_examiner_fallback = false       # a fallback must be explicit
+fallback_examiner_model = ""
+min_examination_coverage = 0.5
+require_both_partitions = true
+evidence_max_chars = 40000
+answer_model = ""                     # empty => examiner is not assumed to answer both arms
+answer_temperature = 0.0
+answer_max_tokens = 1500
+answer_batch_size = 5
+answer_reasoning_effort = ""
+
+[terminal_selection]
+w_selection = 0.70
+w_process = 0.20
+w_grounding = 0.10
+
+[baseline]
+enabled = true
+context_max_chars = 40000

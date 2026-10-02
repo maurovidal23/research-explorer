@@ -72,6 +72,7 @@ class UISession:
     tree_signature: tuple = ()
     event_outcome: str = ""
     event_agent: str = EVENT_AGENT_SCOPE
+    event_page: int = 0
     narrowed: bool = False
 
     def select_tab(self, tab: str) -> None:

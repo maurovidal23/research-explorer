@@ -1,11 +1,11 @@
-"""Derived agent-first navigation data.
+"""Derived navigation trees over the projected run view state.
 
-The durable timeline is grouped wave-first so replay and reports stay stable.
-The dashboard, however, navigates agent-first: each colony agent is a root whose
-children are waves, turns, and the papers, discoveries, frontiers, reference
-mappings, evaluations, and warnings recorded beneath them. This module derives
-that view from the projected
-:class:`~research_explorer.events.models.RunViewState` without introducing
+The default dashboard hierarchy is wave-first: ``Setup``, one root per wave with
+Research/Evaluation/Decision children, ``Final result``, and ``Debug`` (see
+:func:`build_wave_navigation`). :func:`build_agent_navigation` remains as the
+agent-grouped view of the same timeline for agent-scoped navigation and
+regression coverage. Both are pure derivations of the projected
+:class:`~research_explorer.events.models.RunViewState`; neither introduces
 durable events or a second source of truth.
 """
 
@@ -16,12 +16,23 @@ from pydantic import BaseModel, Field
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_EVALUATING,
+    EXAM_PHASE_ORDER,
     NODE_ACTIVE,
     NODE_COMPLETED,
     NODE_FAILED,
     NODE_PENDING,
     NODE_SKIPPED,
+    PHASE_BENCHMARK,
+    PHASE_DECISION,
+    PHASE_EVALUATION,
+    PHASE_EXAM_BUILD,
+    PHASE_RESEARCH,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
+    TERMINAL_STATUSES,
+    WAVE_PHASE_ORDER,
     AgentSummary,
+    PhaseState,
     RunViewState,
     TimelineEntry,
 )
@@ -30,6 +41,28 @@ AGENT_NODE = "agent"
 WAVE_NODE = "wave"
 TURN_NODE = "turn"
 LEAF_NODE = "leaf"
+SETUP_NODE = "setup"
+PHASE_NODE = "phase"
+EXAM_NODE = "exam"
+FINAL_NODE = "final"
+DEBUG_NODE = "debug"
+
+EXAM_PHASE_LABELS: dict[str, str] = {
+    PHASE_EXAM_BUILD: "Exam build",
+    PHASE_SELECTION: "Selection",
+    PHASE_SURVIVOR: "Survivor",
+    PHASE_BENCHMARK: "Benchmark",
+}
+
+_PHASE_OF_KIND = {
+    "turn": PHASE_RESEARCH,
+    "paper": PHASE_RESEARCH,
+    "discovery": PHASE_RESEARCH,
+    "frontier": PHASE_RESEARCH,
+    "reference_mapping": PHASE_RESEARCH,
+    "evaluation": PHASE_EVALUATION,
+    "warning": PHASE_DECISION,
+}
 
 _TERMINAL_NODE_STATUSES = frozenset({NODE_COMPLETED, NODE_FAILED, NODE_SKIPPED})
 _LEAF_KINDS = frozenset(
@@ -48,6 +81,7 @@ class NavNode(BaseModel):
     entry_id: str | None = None
     wave: int = 0
     turn: int = 0
+    detail: dict = Field(default_factory=dict)
     children: list[NavNode] = Field(default_factory=list)
 
 
@@ -218,15 +252,211 @@ def parent_ids(roots: list[NavNode]) -> dict[str, str]:
     return parents
 
 
+def build_wave_navigation(state: RunViewState) -> list[NavNode]:
+    """Build the default wave-first hierarchy.
+
+    Roots are ``Setup``, one node per wave (with Research/Evaluation/Decision
+    children), ``Final result``, and ``Debug``. Waves are never repeated beneath
+    individual agents; agent, paper, mapping, and raw-event detail is reachable
+    from the selected phase or Debug.
+    """
+    roots: list[NavNode] = [_build_setup_node(state)]
+    for wave in state.ordered_waves():
+        roots.append(_build_wave_first_node(state, wave))
+    for phase in EXAM_PHASE_ORDER:
+        record = state.exam_phases.get(phase)
+        if record is not None:
+            roots.append(_build_exam_node(phase, record))
+    roots.append(_build_final_node(state))
+    roots.append(_build_debug_node(state))
+    return roots
+
+
+def _build_exam_node(phase: str, record: PhaseState) -> NavNode:
+    """One terminal examination phase shown after the research waves (TUI-1)."""
+    return NavNode(
+        node_id=f"exam:{phase}",
+        kind=EXAM_NODE,
+        label=EXAM_PHASE_LABELS.get(phase, phase.replace("_", " ").title()),
+        status=record.status,
+        detail={
+            "phase": phase,
+            "sources": record.evidence_added,
+            "items": record.papers_attempted,
+            "completed": record.completed,
+            "leader": record.leader,
+            "reason": record.reason,
+        },
+    )
+
+
+def _build_setup_node(state: RunViewState) -> NavNode:
+    entries = [e for e in state.timeline if e.wave == 0]
+    node = NavNode(
+        node_id="setup",
+        kind=SETUP_NODE,
+        label="Setup",
+        status=_phase_or_entry_status(state, 0, entries),
+    )
+    node.children = [_leaf_node(e) for e in sorted(entries, key=lambda e: e.seq)]
+    return node
+
+
+def _build_wave_first_node(state: RunViewState, wave: int) -> NavNode:
+    global_entry = state.entry_by_id(f"wave:{wave}")
+    label = f"Wave {wave}"
+    if state.legacy_projection:
+        label += " (legacy)"
+    node = NavNode(
+        node_id=f"wave:{wave}",
+        kind=WAVE_NODE,
+        label=label,
+        status=global_entry.status if global_entry is not None else _entries_status(
+            [e for e in state.timeline if e.wave == wave]
+        ),
+        wave=wave,
+    )
+    for phase in WAVE_PHASE_ORDER:
+        node.children.append(_build_phase_node(state, wave, phase))
+    decisions = state.phase(wave, PHASE_DECISION)
+    if decisions is not None:
+        node.detail = {
+            "leader": decisions.leader,
+            "q_delta": decisions.q_delta,
+            "stop_reason": decisions.stop_reason,
+            "continue_reason": decisions.continue_reason,
+        }
+    return node
+
+
+def _build_phase_node(state: RunViewState, wave: int, phase: str) -> NavNode:
+    record = state.phase(wave, phase)
+    entries = [
+        e
+        for e in state.timeline
+        if e.wave == wave and _PHASE_OF_KIND.get(e.kind) == phase
+    ]
+    status = record.status if record is not None else _entries_status(entries)
+    node = NavNode(
+        node_id=f"wave:{wave}:{phase}",
+        kind=PHASE_NODE,
+        label=phase.title(),
+        status=status,
+        wave=wave,
+    )
+    if record is not None:
+        node.detail = {
+            "selected": record.selected,
+            "completed": record.completed,
+            "failed": record.failed,
+            "skipped": record.skipped,
+            "papers_attempted": record.papers_attempted,
+            "papers_integrated": record.papers_integrated,
+            "evidence_added": record.evidence_added,
+            "best_q": record.best_q,
+            "leader": record.leader,
+            "q_delta": record.q_delta,
+            "budget_used": record.budget_used,
+            "continue_reason": record.continue_reason,
+            "stop_reason": record.stop_reason,
+        }
+    node.children = [_leaf_node(e) for e in sorted(entries, key=lambda e: e.seq)]
+    return node
+
+
+def _build_final_node(state: RunViewState) -> NavNode:
+    status = NODE_COMPLETED if state.status in TERMINAL_STATUSES else NODE_PENDING
+    node = NavNode(node_id="final", kind=FINAL_NODE, label="Final result", status=status)
+    node.detail = {
+        "outcome": state.outcome,
+        "stop_reason": state.stop_reason or state.terminal_reason,
+        "winner": state.winner_agent,
+        "best_quality": state.best_quality,
+    }
+    return node
+
+
+def _build_debug_node(state: RunViewState) -> NavNode:
+    node = NavNode(
+        node_id="debug",
+        kind=DEBUG_NODE,
+        label="Debug",
+        status=NODE_COMPLETED if state.events else NODE_PENDING,
+    )
+    warnings = [e for e in state.timeline if e.kind == "warning"]
+    node.children = [_leaf_node(e) for e in sorted(warnings, key=lambda e: e.seq)]
+    node.detail = {
+        "events_seen": state.events_seen_total,
+        "events_dropped": state.events_dropped,
+        "warnings": len(state.warnings),
+        "failures": len(state.failures),
+    }
+    return node
+
+
+def _entries_status(entries: list[TimelineEntry]) -> str:
+    if any(e.status == NODE_ACTIVE for e in entries):
+        return NODE_ACTIVE
+    statuses = [e.status for e in entries]
+    if statuses and all(s in _TERMINAL_NODE_STATUSES for s in statuses):
+        return NODE_COMPLETED
+    if any(e.status == NODE_FAILED for e in entries):
+        return NODE_FAILED
+    return NODE_PENDING
+
+
+def _phase_or_entry_status(
+    state: RunViewState, wave: int, entries: list[TimelineEntry]
+) -> str:
+    if wave == 0:
+        if entries and all(e.status in _TERMINAL_NODE_STATUSES for e in entries):
+            return NODE_COMPLETED
+        return NODE_ACTIVE if state.status not in TERMINAL_STATUSES else NODE_COMPLETED
+    return _entries_status(entries)
+
+
+def active_wave_phase(state: RunViewState) -> tuple[int, str]:
+    """The wave/phase the follow cursor should track while a run is live."""
+    wave = state.current_wave
+    phase = state.current_phase
+    if not phase:
+        phase = PHASE_RESEARCH
+    return wave, phase
+
+
+def active_phase_node_id(state: RunViewState) -> str:
+    wave, phase = active_wave_phase(state)
+    if state.status in TERMINAL_STATUSES:
+        return "final"
+    if phase in EXAM_PHASE_ORDER and phase in state.exam_phases:
+        return f"exam:{phase}"
+    if not wave:
+        return "setup"
+    if state.phase(wave, phase) is None and not any(
+        e.wave == wave and _PHASE_OF_KIND.get(e.kind) == phase for e in state.timeline
+    ):
+        return f"wave:{wave}"
+    return f"wave:{wave}:{phase}"
+
+
 __all__ = [
     "AGENT_NODE",
+    "DEBUG_NODE",
+    "EXAM_NODE",
+    "EXAM_PHASE_LABELS",
+    "FINAL_NODE",
     "LEAF_NODE",
+    "PHASE_NODE",
+    "SETUP_NODE",
     "TURN_NODE",
     "WAVE_NODE",
     "NavNode",
     "active_agent_id",
     "active_leaf_entry",
+    "active_phase_node_id",
+    "active_wave_phase",
     "build_agent_navigation",
+    "build_wave_navigation",
     "find_node",
     "flatten_navigation",
     "parent_ids",

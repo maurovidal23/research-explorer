@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from research_explorer.events.limits import LIVE_CANDIDATE_WINDOW, LIVE_EVENT_WINDOW
 from research_explorer.events.models import (
     AGENT_ACTIVE,
     AGENT_COMPLETED,
@@ -20,6 +21,8 @@ from research_explorer.events.models import (
     AGENT_EXHAUSTED,
     AGENT_FAILED,
     AGENT_WAITING,
+    EVAL_COMPLETE,
+    EVAL_FAILED,
     NODE_ACTIVE,
     NODE_COMPLETED,
     NODE_FAILED,
@@ -27,14 +30,24 @@ from research_explorer.events.models import (
     NODE_SKIPPED,
     OUTCOME_COMPLETED,
     OUTCOME_DEGRADED,
+    PHASE_BENCHMARK,
+    PHASE_DECISION,
+    PHASE_EVALUATION,
+    PHASE_EXAM_BUILD,
+    PHASE_RESEARCH,
+    PHASE_SELECTION,
+    PHASE_SURVIVOR,
     REASON_NO_WINNER,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EVALUATING,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
     STATUS_RUNNING,
     AgentSummary,
+    EvaluationState,
     EventType,
+    PhaseState,
     RunEvent,
     RunViewState,
     TimelineEntry,
@@ -64,14 +77,45 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bucket_map(value: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        return {}
+    buckets: dict[str, dict[str, int]] = {}
+    for name, bucket in value.items():
+        if not isinstance(bucket, dict):
+            continue
+        buckets[str(name)] = {
+            "correct": _as_int(bucket.get("correct")),
+            "total": _as_int(bucket.get("total")),
+        }
+    return buckets
+
+
 class RunProjection:
     """Reduces ordered events into a :class:`RunViewState`."""
 
-    def __init__(self, state: RunViewState | None = None) -> None:
+    def __init__(
+        self,
+        state: RunViewState | None = None,
+        event_window: int = LIVE_EVENT_WINDOW,
+        candidate_window: int = LIVE_CANDIDATE_WINDOW,
+    ) -> None:
         self.state = state if state is not None else RunViewState()
-        self._seen_seq: set[int] = set()
+        self._max_seq: int = 0
+        self._event_window = max(1, event_window)
+        self._candidate_window = max(1, candidate_window)
         self._open_frontier: dict[tuple[str, int, int], str] = {}
         self._current_agent: str = ""
+        self._saw_phase_event: bool = False
 
     @classmethod
     def from_events(cls, events: Iterable[RunEvent | dict]) -> RunProjection:
@@ -108,12 +152,12 @@ class RunProjection:
 
     def apply(self, event: RunEvent) -> None:
         if event.seq > 0:
-            if event.seq in self._seen_seq:
+            if event.seq <= self._max_seq:
                 return
-            self._seen_seq.add(event.seq)
+            self._max_seq = event.seq
         if event.payload:
             event = event.model_copy(update={"payload": redact_obj(event.payload)})
-        self.state.events.append(event)
+        self._append_event(event)
         # ``no_winner`` is a durable legacy event that must stay readable but
         # carries richer semantics than the generic completed handler.
         handler: Any
@@ -129,6 +173,24 @@ class RunProjection:
                     redact_secrets(f"projection_error type={event.type}")
                 )
         self._sync_follow()
+
+    def _append_event(self, event: RunEvent) -> None:
+        events = self.state.events
+        events.append(event)
+        self.state.events_seen_total += 1
+        overflow = len(events) - self._event_window
+        if overflow > 0:
+            del events[:overflow]
+            self.state.events_dropped += overflow
+
+    def _append_candidate_score(self, score: CandidateScore) -> None:
+        scores = self.state.candidate_scores
+        scores.append(score)
+        self.state.candidate_scores_seen_total += 1
+        overflow = len(scores) - self._candidate_window
+        if overflow > 0:
+            del scores[:overflow]
+            self.state.candidate_scores_dropped += overflow
 
     # ---- helpers ----------------------------------------------------------
 
@@ -175,6 +237,36 @@ class RunProjection:
             ):
                 return entry
         return None
+
+    def _phase_entry(self, wave: int, phase: str) -> TimelineEntry | None:
+        entry_id = f"phase:{wave}:{phase}"
+        return self.state.entry_by_id(entry_id)
+
+    def _ensure_phase(self, wave: int, phase: str, status: str = NODE_ACTIVE) -> PhaseState:
+        record = self.state.phase(wave, phase)
+        if record is None:
+            record = PhaseState(wave=wave, phase=phase, status=status)
+            self.state.phases[record.key] = record
+        else:
+            record.status = status
+        self.state.current_wave = max(self.state.current_wave, wave)
+        self.state.current_phase = phase
+        label = phase.title()
+        entry = self._phase_entry(wave, phase)
+        if entry is None:
+            self._add_entry(
+                TimelineEntry(
+                    entry_id=f"phase:{wave}:{phase}",
+                    kind="phase",
+                    label=f"{label}",
+                    status=status,
+                    wave=wave,
+                    parent_id=f"wave:{wave}",
+                )
+            )
+        else:
+            entry.status = status
+        return record
 
     def _set_wave_status(self, wave: int, status: str) -> None:
         for entry in self.state.timeline:
@@ -242,6 +334,11 @@ class RunProjection:
     def _on_seed_routing(self, event: RunEvent) -> None:
         self.state.status = STATUS_RUNNING
 
+    def _on_research_scope(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.effective_scope = str(p.get("scope") or self.state.effective_scope)
+        self.state.scope_origin = str(p.get("origin") or self.state.scope_origin)
+
     def _on_colony_init(self, event: RunEvent) -> None:
         p = event.payload
         self.state.colony_size = _as_int(p.get("size"), self.state.colony_size)
@@ -279,6 +376,12 @@ class RunProjection:
             summary = self._ensure_agent(str(agent_id))
             if summary.status in (AGENT_WAITING, AGENT_ACTIVE):
                 summary.status = AGENT_WAITING
+        selected = [str(a) for a in (p.get("active", []) or [])]
+        self.state.selected_agents[wave] = selected
+        phase = self._ensure_phase(wave, PHASE_RESEARCH, NODE_ACTIVE)
+        phase.selected = selected
+        phase.status = NODE_ACTIVE
+        self.state.current_phase = PHASE_RESEARCH
 
     def _on_wave_completed(self, event: RunEvent) -> None:
         p = event.payload
@@ -291,11 +394,162 @@ class RunProjection:
             self.state.max_fetches = _as_int(p.get("max_fetches"), self.state.max_fetches)
         if "elapsed" in p:
             self.state.elapsed_seconds = _as_float(p.get("elapsed"), self.state.elapsed_seconds)
+        decision = self.state.phase(wave, PHASE_DECISION)
+        if decision is not None:
+            if p.get("leader"):
+                decision.leader = str(p.get("leader"))
+            if "q_delta" in p:
+                decision.q_delta = _as_float(p.get("q_delta"), decision.q_delta)
+            if p.get("continue_reason"):
+                decision.continue_reason = str(p.get("continue_reason"))
+            if p.get("stop_reason"):
+                decision.stop_reason = str(p.get("stop_reason"))
+                self.state.stop_reason = str(p.get("stop_reason"))
         if self.state.status == STATUS_EVALUATING:
             self.state.status = STATUS_RUNNING
 
     def current_wave_done(self, wave: int) -> None:
         self._set_wave_status(wave, NODE_COMPLETED)
+
+    def _on_phase_started(self, event: RunEvent) -> None:
+        p = event.payload
+        self._saw_phase_event = True
+        wave = _as_int(p.get("oleada", p.get("wave")), self.state.current_wave)
+        phase = str(p.get("phase") or PHASE_RESEARCH)
+        record = self._ensure_phase(wave, phase, NODE_ACTIVE)
+        record.selected = [str(a) for a in (p.get("selected", []) or [])]
+        self.state.selected_agents[wave] = record.selected
+        self.state.status = STATUS_EVALUATING if phase == PHASE_EVALUATION else STATUS_RUNNING
+        for agent_id in record.selected:
+            summary = self._ensure_agent(agent_id)
+            if phase == PHASE_EVALUATION and summary.status in (AGENT_WAITING, AGENT_ACTIVE):
+                summary.status = AGENT_EVALUATING
+
+    def _on_phase_completed(self, event: RunEvent) -> None:
+        p = event.payload
+        self._saw_phase_event = True
+        wave = _as_int(p.get("oleada", p.get("wave")), self.state.current_wave)
+        phase = str(p.get("phase") or PHASE_RESEARCH)
+        record = self._ensure_phase(wave, phase, NODE_COMPLETED)
+        record.status = NODE_COMPLETED
+        for key in ("selected", "completed", "failed", "skipped"):
+            if key in p:
+                setattr(record, key, [str(a) for a in (p.get(key) or [])])
+        if "papers_attempted" in p:
+            record.papers_attempted = _as_int(p.get("papers_attempted"), 0)
+        if "papers_integrated" in p:
+            record.papers_integrated = _as_int(p.get("papers_integrated"), 0)
+        if "evidence_added" in p:
+            record.evidence_added = _as_int(p.get("evidence_added"), 0)
+        if p.get("best_Q") is not None:
+            record.best_q = _as_float(p.get("best_Q"), 0.0)
+        if p.get("leader"):
+            record.leader = str(p.get("leader"))
+            self.state.winner_agent = record.leader
+            for agent_id, summary in self.state.agents.items():
+                summary.is_winner = agent_id == record.leader
+        if "q_delta" in p:
+            record.q_delta = _as_float(p.get("q_delta"), 0.0)
+        if "budget_used" in p:
+            record.budget_used = _as_int(p.get("budget_used"), 0)
+            self.state.fetches_used = record.budget_used
+        if p.get("continue_reason"):
+            record.continue_reason = str(p.get("continue_reason"))
+        if p.get("stop_reason"):
+            record.stop_reason = str(p.get("stop_reason"))
+            self.state.stop_reason = str(p.get("stop_reason"))
+        if "converged" in p:
+            record.converged = bool(p.get("converged"))
+        if "pheromone_concentration" in p:
+            record.pheromone_concentration = _as_float(
+                p.get("pheromone_concentration"), record.pheromone_concentration
+            )
+        if "elapsed" in p:
+            record.elapsed_seconds = _as_float(p.get("elapsed"), 0.0)
+        if "top_ranking" in p or "ranking" in p:
+            ranking = p.get("ranking") or []
+            with contextlib.suppress(Exception):
+                record.leader = str(ranking[0][0]) if ranking else record.leader
+        entry = self._phase_entry(wave, phase)
+        if entry is not None:
+            entry.status = NODE_COMPLETED
+            entry.label = self._phase_label(record, phase)
+        self.state.current_phase = phase
+        if phase == PHASE_EVALUATION and "best_Q" in p:
+            with contextlib.suppress(Exception):
+                self.state.best_quality = max(
+                    self.state.best_quality, _as_float(p.get("best_Q"), 0.0)
+                )
+        if phase == PHASE_DECISION and self.state.status == STATUS_EVALUATING:
+            self.state.status = STATUS_RUNNING
+
+    def _on_phase_failed(self, event: RunEvent) -> None:
+        p = event.payload
+        wave = _as_int(p.get("oleada", p.get("wave")), self.state.current_wave)
+        phase = str(p.get("phase") or PHASE_RESEARCH)
+        record = self._ensure_phase(wave, phase, NODE_FAILED)
+        record.status = NODE_FAILED
+        record.reason = redact_secrets(str(p.get("reason") or p.get("error") or ""))
+        entry = self._phase_entry(wave, phase)
+        if entry is not None:
+            entry.status = NODE_FAILED
+
+    def _phase_label(self, record: PhaseState, phase: str) -> str:
+        if phase == PHASE_RESEARCH:
+            return (
+                f"Research · {len(record.completed)}/{len(record.selected)} agents · "
+                f"{record.papers_integrated} papers"
+            )
+        if phase == PHASE_EVALUATION:
+            best = f" · best Q {record.best_q:.3f}" if record.best_q is not None else ""
+            return (
+                f"Evaluation · {len(record.completed)} complete / "
+                f"{len(record.skipped)} skipped / {len(record.failed)} failed{best}"
+            )
+        leader = record.leader or "—"
+        return (
+            f"Decision · leader {leader} · Δ{record.q_delta:+.3f} · "
+            f"{record.stop_reason or record.continue_reason or 'continue'}"
+        )
+
+    def _on_eval_settled(self, event: RunEvent) -> None:
+        p = event.payload
+        self._saw_phase_event = True
+        agent_id = self._agent_id(event)
+        if not agent_id:
+            return
+        wave = _as_int(p.get("oleada", p.get("wave")), self.state.current_wave)
+        turn = _as_int(p.get("turn"), self.state.current_turn)
+        status = str(p.get("status") or EVAL_COMPLETE)
+        unavailable = {
+            str(k): str(v) for k, v in (p.get("unavailable") or {}).items()
+        }
+        state = EvaluationState(
+            agent_id=agent_id,
+            wave=wave,
+            turn=turn,
+            status=status,
+            reason=redact_secrets(str(p.get("reason") or "")),
+            q=_as_float(p.get("Q")) if status == EVAL_COMPLETE and "Q" in p else None,
+            q_delta=_as_float(p.get("delta_q")) if "delta_q" in p else None,
+            components={
+                key: (None if key in unavailable else _as_float(p.get(key)) if key in p else None)
+                for key in ("S", "P", "J", "R")
+            },
+            unavailable=unavailable,
+            evidence_papers=_as_int(p.get("evidence_papers"), 0),
+        )
+        self.state.evaluation_states[state.key] = state
+        summary = self._ensure_agent(agent_id)
+        summary.evaluation_status = status
+        summary.evaluation_reason = state.reason
+        if status == EVAL_COMPLETE and state.q is not None:
+            summary.quality = state.q
+            summary.delta_q = state.q_delta or 0.0
+        if status == EVAL_FAILED:
+            summary.status = AGENT_FAILED
+        elif summary.status == AGENT_EVALUATING:
+            summary.status = AGENT_WAITING
 
     def _on_turn_queued(self, event: RunEvent) -> None:
         agent_id = self._agent_id(event)
@@ -314,6 +568,7 @@ class RunProjection:
         turn = _as_int(p.get("turn"), self.state.current_turn)
         summary = self._ensure_agent(agent_id, str(p.get("caste", "")))
         summary.status = AGENT_ACTIVE
+        summary.research_status = NODE_ACTIVE
         self._current_agent = agent_id
         self.state.current_turn = turn
         turn_entry = self._turn_entry(wave, turn, agent_id)
@@ -346,6 +601,14 @@ class RunProjection:
                 summary.quality = _as_float(p.get(key), summary.quality)
         summary.delta_q = _as_float(p.get("delta_q"), summary.delta_q)
         summary.budget = _as_int(p.get("budget"), summary.budget)
+        fetches = _as_int(p.get("fetches"), -1)
+        if fetches == 0 and event.canonical_type() == EventType.AGENT_TURN_COMPLETED:
+            summary.research_status = NODE_SKIPPED
+        else:
+            summary.research_status = NODE_COMPLETED
+        if fetches > 0:
+            summary.papers_attempted += fetches
+            summary.evidence_added += fetches
         if "frontier" in p:
             summary.frontier = _as_int(p.get("frontier"), summary.frontier)
             self.state.frontier_size = summary.frontier
@@ -363,6 +626,7 @@ class RunProjection:
         summary = self._ensure_agent(agent_id) if agent_id else None
         if summary is not None:
             summary.status = AGENT_FAILED
+            summary.research_status = NODE_FAILED
         error = redact_secrets(str(event.payload.get("error", "")))
         if error:
             self.state.failures.append(f"{agent_id or 'agent'}: {error}")
@@ -562,7 +826,7 @@ class RunProjection:
     def _on_candidate_score(self, event: RunEvent) -> None:
         p = event.payload
         with contextlib.suppress(Exception):
-            self.state.candidate_scores.append(CandidateScore.model_validate(p))
+            self._append_candidate_score(CandidateScore.model_validate(p))
 
     def _on_candidate_selected(self, event: RunEvent) -> None:
         p = event.payload
@@ -950,6 +1214,8 @@ class RunProjection:
                 summary.is_winner = agent_id == winner
         self.state.best_quality = _as_float(p.get("peak_Q", p.get("best_Q", p.get("Q"))), self.state.best_quality)
         self._apply_terminal_fields(p)
+        if not self._saw_phase_event and self.state.current_wave:
+            self.state.legacy_projection = True
         if "total_fetches" in p:
             self.state.fetches_used = _as_int(p.get("total_fetches"), self.state.fetches_used)
         if "elapsed" in p:
@@ -972,6 +1238,8 @@ class RunProjection:
         """
         p = event.payload
         self._apply_terminal_fields(p, default_outcome=OUTCOME_DEGRADED)
+        if not self._saw_phase_event and self.state.current_wave:
+            self.state.legacy_projection = True
         enriched = bool(p.get("reason") or p.get("reason_code"))
         if not enriched:
             reason = reason_text(REASON_NO_WINNER)
@@ -1006,6 +1274,8 @@ class RunProjection:
             self.state.terminal_reason = reason
         elif reason_code:
             self.state.terminal_reason = reason_text(reason_code)
+        if p.get("stop_reason"):
+            self.state.stop_reason = str(p.get("stop_reason"))
         if "total_waves" in p:
             self.state.total_waves = _as_int(p.get("total_waves"), self.state.total_waves)
 
@@ -1019,6 +1289,15 @@ class RunProjection:
         self.state.status = STATUS_CANCELLED
         self._finalize_agents()
 
+    def _on_run_interrupted(self, event: RunEvent) -> None:
+        """Present a stale/heartbeat-reconciled run without fabricating a winner."""
+        reason = redact_secrets(str(event.payload.get("reason", ""))).strip()
+        if reason:
+            self.state.terminal_reason = reason
+        self.state.status = STATUS_INTERRUPTED
+        self.state.outcome = str(event.payload.get("outcome") or self.state.outcome)
+        self._finalize_agents()
+
     def _on_status(self, event: RunEvent) -> None:
         status = str(event.payload.get("status", ""))
         if status in (
@@ -1026,6 +1305,128 @@ class RunProjection:
             STATUS_CANCELLED, STATUS_FAILED, "converged", "exhausted",
         ):
             self.state.status = status
+
+    # ---- examination / survivor (TUI-1) ----------------------------------
+
+    def _exam_phase(self, name: str) -> PhaseState:
+        record = self.state.exam_phases.get(name)
+        if record is None:
+            record = PhaseState(wave=0, phase=name)
+            self.state.exam_phases[name] = record
+        return record
+
+    def _on_evidence_pack_frozen(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_ACTIVE
+        record.papers_integrated = _as_int(
+            event.payload.get("source_count"), record.papers_integrated
+        )
+        record.evidence_added = _as_int(
+            event.payload.get("source_count"), record.evidence_added
+        )
+        self.state.current_phase = PHASE_EXAM_BUILD
+
+    def _on_exam_generated(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_ACTIVE
+        record.papers_attempted = _as_int(
+            event.payload.get("item_count"), record.papers_attempted
+        )
+        self.state.current_phase = PHASE_EXAM_BUILD
+
+    def _on_exam_validated(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_EXAM_BUILD)
+        record.status = NODE_COMPLETED
+        self.state.exam_rejected_count = _as_int(
+            event.payload.get("rejected"), self.state.exam_rejected_count
+        )
+
+    def _on_exam_partitioned(self, event: RunEvent) -> None:
+        self.state.exam_selection_count = _as_int(
+            event.payload.get("selection_count"), self.state.exam_selection_count
+        )
+        self.state.exam_holdout_count = _as_int(
+            event.payload.get("holdout_count"), self.state.exam_holdout_count
+        )
+        record = self._exam_phase(PHASE_SELECTION)
+        record.status = NODE_ACTIVE
+        self.state.current_phase = PHASE_SELECTION
+
+    def _on_candidate_test_started(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_SELECTION)
+        record.status = NODE_ACTIVE
+        self.state.current_phase = PHASE_SELECTION
+
+    def _on_candidate_test_completed(self, event: RunEvent) -> None:
+        record = self._exam_phase(PHASE_SELECTION)
+        agent = str(event.payload.get("agent_id") or "")
+        if agent and agent not in record.completed:
+            record.completed.append(agent)
+
+    def _on_survivor_selected(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.survivor_id = str(p.get("survivor_id") or "")
+        self.state.survivor_terminal_score = _as_optional_float(p.get("terminal_score"))
+        self.state.survivor_selection_score = _as_optional_float(
+            p.get("selection_accuracy")
+        )
+        self.state.survivor_process_score = _as_optional_float(p.get("process_score"))
+        self.state.survivor_grounding_score = _as_optional_float(
+            p.get("grounding_score")
+        )
+        ranking = p.get("ranking")
+        if isinstance(ranking, list):
+            self.state.survivor_ranking = [str(item) for item in ranking]
+        selection = self.state.exam_phases.get(PHASE_SELECTION)
+        if selection is not None:
+            selection.status = NODE_COMPLETED
+        record = self._exam_phase(PHASE_SURVIVOR)
+        record.status = NODE_COMPLETED
+        record.leader = self.state.survivor_id
+        self.state.current_phase = PHASE_BENCHMARK
+
+    def _on_baseline_completed(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.survivor_accuracy = _as_optional_float(p.get("survivor_accuracy"))
+        self.state.naive_accuracy = _as_optional_float(p.get("naive_accuracy"))
+        self.state.uplift = _as_optional_float(p.get("uplift"))
+
+    def _on_benchmark_completed(self, event: RunEvent) -> None:
+        p = event.payload
+        self.state.benchmark_outcome = str(p.get("outcome") or "")
+        self.state.benchmark_reason_code = str(p.get("reason_code") or "")
+        self.state.benchmark_reason = str(p.get("reason") or "")
+        synthesis = p.get("survivor_synthesis")
+        if isinstance(synthesis, str) and synthesis:
+            self.state.survivor_synthesis = synthesis
+        if "survivor_accuracy" in p:
+            self.state.survivor_accuracy = _as_optional_float(p.get("survivor_accuracy"))
+        if "naive_accuracy" in p:
+            self.state.naive_accuracy = _as_optional_float(p.get("naive_accuracy"))
+        if "uplift" in p:
+            self.state.uplift = _as_optional_float(p.get("uplift"))
+        outcomes = p.get("item_outcomes")
+        if isinstance(outcomes, dict):
+            self.state.benchmark_item_outcomes = {
+                str(key): bool(value) for key, value in outcomes.items()
+            }
+        naive_outcomes = p.get("naive_item_outcomes")
+        if isinstance(naive_outcomes, dict):
+            self.state.benchmark_naive_item_outcomes = {
+                str(key): bool(value) for key, value in naive_outcomes.items()
+            }
+        for key, field in (
+            ("by_category", "benchmark_by_category"),
+            ("by_difficulty", "benchmark_by_difficulty"),
+            ("naive_by_category", "benchmark_naive_by_category"),
+            ("naive_by_difficulty", "benchmark_naive_by_difficulty"),
+        ):
+            buckets = p.get(key)
+            if isinstance(buckets, dict):
+                setattr(self.state, field, _bucket_map(buckets))
+        record = self._exam_phase(PHASE_BENCHMARK)
+        record.status = NODE_COMPLETED
+        self.state.current_phase = PHASE_BENCHMARK
 
     def _finalize_agents(self) -> None:
         for summary in self.state.agents.values():
@@ -1045,6 +1446,7 @@ class RunProjection:
 
 _HANDLERS: dict[str, Any] = {
     EventType.RUN_STARTED: RunProjection._on_run_started,
+    EventType.RESEARCH_SCOPE_RESOLVED: RunProjection._on_research_scope,
     EventType.SEED_ROUTING_STARTED: RunProjection._on_seed_routing,
     EventType.SEED_ROUTING_COMPLETED: RunProjection._on_seed_routing,
     EventType.SEED_ROUTING_FAILED: RunProjection._on_run_failed,
@@ -1052,6 +1454,10 @@ _HANDLERS: dict[str, Any] = {
     EventType.COLONY_INIT_COMPLETED: RunProjection._on_colony_init,
     EventType.WAVE_STARTED: RunProjection._on_wave_started,
     EventType.WAVE_COMPLETED: RunProjection._on_wave_completed,
+    EventType.WAVE_PHASE_STARTED: RunProjection._on_phase_started,
+    EventType.WAVE_PHASE_COMPLETED: RunProjection._on_phase_completed,
+    EventType.WAVE_PHASE_FAILED: RunProjection._on_phase_failed,
+    EventType.EVALUATION_SETTLED: RunProjection._on_eval_settled,
     EventType.AGENT_TURN_QUEUED: RunProjection._on_turn_queued,
     EventType.AGENT_TURN_STARTED: RunProjection._on_turn_started,
     EventType.AGENT_TURN_COMPLETED: RunProjection._on_turn_completed,
@@ -1087,8 +1493,18 @@ _HANDLERS: dict[str, Any] = {
     EventType.RUN_COMPLETED: RunProjection._on_run_completed,
     EventType.RUN_FAILED: RunProjection._on_run_failed,
     EventType.RUN_CANCELLED: RunProjection._on_run_cancelled,
+    EventType.RUN_INTERRUPTED: RunProjection._on_run_interrupted,
     EventType.ARTIFACT_SAVED: RunProjection._on_artifact,
     EventType.WARNING: RunProjection._on_warning,
+    EventType.EVIDENCE_PACK_FROZEN: RunProjection._on_evidence_pack_frozen,
+    EventType.EXAM_GENERATED: RunProjection._on_exam_generated,
+    EventType.EXAM_VALIDATED: RunProjection._on_exam_validated,
+    EventType.EXAM_PARTITIONED: RunProjection._on_exam_partitioned,
+    EventType.CANDIDATE_TEST_STARTED: RunProjection._on_candidate_test_started,
+    EventType.CANDIDATE_TEST_COMPLETED: RunProjection._on_candidate_test_completed,
+    EventType.SURVIVOR_SELECTED: RunProjection._on_survivor_selected,
+    EventType.BASELINE_COMPLETED: RunProjection._on_baseline_completed,
+    EventType.BENCHMARK_COMPLETED: RunProjection._on_benchmark_completed,
     "status": RunProjection._on_status,
     "provider_failure": RunProjection._on_warning,
     "id_title_mismatch": RunProjection._on_warning,

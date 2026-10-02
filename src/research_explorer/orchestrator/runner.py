@@ -6,9 +6,12 @@ winning agent's narrative.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import json
 import time
+from typing import TYPE_CHECKING, Any
 
 from research_explorer.aco.colony import Colony
 from research_explorer.aco.convergence import ConvergenceChecker
@@ -19,7 +22,10 @@ from research_explorer.evaluation.structural import StructuralMetrics
 from research_explorer.events.models import (
     OUTCOME_COMPLETED,
     OUTCOME_DEGRADED,
+    REASON_EMPTY_WINNER_NARRATIVE,
+    REASON_NO_EVALUATED_EVIDENCE,
     REASON_NO_WINNER,
+    REASON_WINNER_EVALUATION_MISSING,
     STATUS_RUNNING,
     reason_text,
 )
@@ -29,13 +35,70 @@ from research_explorer.graph.feromone import PheromoneManager
 from research_explorer.graph.models import normalize_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import configure_logging, get_logger
+from research_explorer.memory.scope import resolve_scope
 from research_explorer.providers.base import ResilientProvider
 from research_explorer.providers.factory import build_all_providers
 from research_explorer.providers.routing import SeedRef, route_seed_provider
 from research_explorer.redaction import redact_secrets
-from research_explorer.replay.trace import RunTracer, RunTraceStore
+from research_explorer.replay.trace import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    RunTracer,
+    RunTraceStore,
+)
+
+if TYPE_CHECKING:
+    from research_explorer.examination.models import BenchmarkResult
+    from research_explorer.survivor.models import SurvivorBundle
 
 log = get_logger("orchestrator")
+
+
+def _source_distances(
+    seed_nid: str, agents: list, paper_ids: dict
+) -> dict[str, str]:
+    """Classify evidence sources by citation distance from the seed (EXAM-3/8).
+
+    Uses the union of the agents' private reference/citation edges around the
+    seed: seed, its direct references, its citants, and everything else reached
+    at a deeper path. This keeps the reported source-distance breakdown honest
+    instead of collapsing every non-seed paper to ``direct_reference``.
+    """
+    seed_refs: set[str] = set()
+    seed_cits: set[str] = set()
+    for agent in agents:
+        state = getattr(agent, "state", None)
+        if state is None:
+            continue
+        seed_refs.update(state.local_refs.get(seed_nid, []))
+        seed_cits.update(state.local_cits.get(seed_nid, []))
+    distances: dict[str, str] = {}
+    for paper_id in paper_ids:
+        if paper_id == seed_nid:
+            distances[paper_id] = "seed"
+        elif paper_id in seed_refs:
+            distances[paper_id] = "direct_reference"
+        elif paper_id in seed_cits:
+            distances[paper_id] = "citant"
+        else:
+            distances[paper_id] = "deeper"
+    return distances
+
+
+def resolve_examiner_key(api_key_env: str) -> str:
+    """Resolve the examiner credential without reusing another provider's key.
+
+    The generic LLM client falls back to ``NAN_API_KEY`` when no explicit key
+    is supplied. For the examiner that would silently transmit the explorer
+    credential to the configured examiner provider, so an unset examiner key
+    variable fails closed instead.
+    """
+    key = get_api_key(api_key_env)
+    if not key:
+        raise RuntimeError(
+            f"examiner API key environment variable {api_key_env!r} is not set; "
+            "refusing to reuse the explorer credential for the examiner provider"
+        )
+    return key
 
 
 class Orchestrator:
@@ -52,6 +115,11 @@ class Orchestrator:
         self.run_id: str = ""
         self.outcome: str = OUTCOME_COMPLETED
         self.terminal_reason: str = ""
+        self.stop_reason: str = ""
+        self.effective_scope: str = ""
+        self.scope_origin: str = "derived"
+        self.benchmark_result: BenchmarkResult | None = None
+        self.survivor_bundle: SurvivorBundle | None = None
         configure_logging(config.log_level)
 
         # Storage
@@ -97,6 +165,7 @@ class Orchestrator:
         # Evaluation replay trace store (lazily opened)
         self.trace = RunTraceStore(config.storage.trace_db_path)
         self.tracer: RunTracer | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     def _provider_for_seed(self, seed_paper_id: str) -> tuple[ResilientProvider, SeedRef]:
         """Route the seed to a enabled, capable provider (see providers.routing)."""
@@ -128,6 +197,8 @@ class Orchestrator:
         self.tracer = RunTracer(self.trace, run_id, sink=self.event_sink)
         self.llm.tracer = self.tracer
         self.scheduler.tracer = self.tracer
+        self.trace.start_heartbeat(run_id)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         log.info(
             "orchestrator_start",
@@ -155,6 +226,23 @@ class Orchestrator:
                 )
             self.trace.finish_run(run_id, "failed")
             raise
+        finally:
+            await self._stop_heartbeat()
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            with contextlib.suppress(Exception):
+                self.trace.heartbeat(self.run_id)
+
+    async def _stop_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        if task is None:
+            return
+        self._heartbeat_task = None
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def _run_impl(
         self,
@@ -183,6 +271,8 @@ class Orchestrator:
         )
 
         # 1. Fetch the seed paper and cache it
+        setup_started = time.monotonic()
+        tracer.emit("wave_phase_started", oleada=0, phase="setup", selected=[])
         tracer.emit("seed_routing_started", seed=seed_paper_id)
         tracer.emit(
             "seed_routed",
@@ -197,18 +287,44 @@ class Orchestrator:
         self.graph.cache_paper(seed_paper)
         seed_nid = normalize_id(seed_paper.provider, seed_paper.id)
 
+        # SURV-1: the positional text is an optional research scope, not the
+        # literal final-answer question. When blank, derive a bounded profile.
+        self.effective_scope, self.scope_origin = resolve_scope(seed_query, seed_paper)
+        tracer.emit(
+            "research_scope_resolved",
+            seed=seed_nid,
+            scope=self.effective_scope,
+            origin=self.scope_origin,
+        )
+
         # 2. Initialize the colony (each agent reads the seed). The tracer is
         # attached before seed discovery so its telemetry is durable/replayable.
         tracer.emit("colony_init_started", seed=seed_nid)
-        await self.colony.initialize(seed_nid, seed_query, tracer=tracer)
+        await self.colony.initialize(
+            seed_nid,
+            self.effective_scope,
+            tracer=tracer,
+            scope_origin=self.scope_origin,
+        )
         tracer.emit(
             "colony_initialized",
             size=len(self.colony.agents),
             seed=seed_nid,
             agents=[a.state.id for a in self.colony.agents],
         )
+        tracer.emit(
+            "wave_phase_completed",
+            oleada=0,
+            phase="setup",
+            selected=[],
+            completed=[],
+            failed=[],
+            skipped=[],
+            elapsed=round(time.monotonic() - setup_started, 1),
+        )
 
         # 3. Run oleadas until convergence
+        stop_reason = ""
         while not self.convergence.should_stop(
             self.colony.best_quality,
             self.scheduler.total_fetches,
@@ -219,7 +335,11 @@ class Orchestrator:
             # Check if all agents are exhausted
             if not self.colony.active_candidates():
                 log.info("all_agents_exhausted")
+                stop_reason = "all_agents_exhausted"
                 break
+        if not stop_reason:
+            stop_reason = getattr(self.convergence, "last_reason", "") or "converged"
+        self.stop_reason = stop_reason
 
         # 4. Final event/artifact before marking run complete
         winner = self.colony.best_agent
@@ -250,41 +370,88 @@ class Orchestrator:
                 reason_code=reason_code or REASON_NO_WINNER,
                 reason=reason,
                 elapsed=round(self._elapsed, 1),
+                stop_reason=stop_reason,
                 total_fetches=self.scheduler.total_fetches,
                 total_waves=self.scheduler.oleada_count,
             )
         else:
-            self.outcome = OUTCOME_COMPLETED
-            self.terminal_reason = ""
-            log.info(
-                "orchestrator_complete",
-                winner=self.colony.best_snapshot_agent,
-                best_Q=winner.state.quality,
-                peak_Q=self.colony.best_quality,
-                snapshot_oleada=self.colony.best_snapshot_oleada,
-                total_fetches=self.scheduler.total_fetches,
-                oleadas=self.scheduler.oleada_count,
-                elapsed=self._elapsed,
-            )
-            tracer.emit(
-                "orchestrator_complete",
-                run_id=run_id,
-                status="completed",
-                outcome=OUTCOME_COMPLETED,
-                winner=self.colony.best_snapshot_agent,
-                best_Q=round(winner.state.quality, 4),
-                peak_Q=round(self.colony.best_quality, 4),
-                snapshot_oleada=self.colony.best_snapshot_oleada,
-                total_fetches=self.scheduler.total_fetches,
-                total_waves=self.scheduler.oleada_count,
-                oleadas=self.scheduler.oleada_count,
-                elapsed=round(self._elapsed, 1),
-            )
-            tracer.record_artifact(
-                f"narrative_{self.colony.best_snapshot_agent}.md",
-                "narrative",
-                self.colony.best_narrative,
-            )
+            winner_id = self.colony.best_snapshot_agent or winner.state.id
+            narrative = (self.colony.best_narrative or "").strip()
+            degraded_reason = self._outcome_gap(winner_id, narrative)
+            if degraded_reason:
+                self.outcome = OUTCOME_DEGRADED
+                self.terminal_reason = reason_text(degraded_reason)
+                log.warning(
+                    "completed_degraded",
+                    reason_code=degraded_reason,
+                    winner=winner_id,
+                )
+                tracer.emit(
+                    "warning",
+                    run_id=run_id,
+                    classification="warning",
+                    outcome=OUTCOME_DEGRADED,
+                    reason_code=degraded_reason,
+                    reason=self.terminal_reason,
+                    winner=winner_id,
+                    elapsed=round(self._elapsed, 1),
+                )
+                tracer.emit(
+                    "orchestrator_complete",
+                    run_id=run_id,
+                    status="completed",
+                    outcome=OUTCOME_DEGRADED,
+                    reason_code=degraded_reason,
+                    reason=self.terminal_reason,
+                    winner=winner_id,
+                    best_Q=round(winner.state.quality, 4),
+                    peak_Q=round(self.colony.best_quality, 4),
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    stop_reason=stop_reason,
+                    total_fetches=self.scheduler.total_fetches,
+                    total_waves=self.scheduler.oleada_count,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=round(self._elapsed, 1),
+                )
+                if narrative:
+                    tracer.record_artifact(f"narrative_{winner_id}.md", "narrative", narrative)
+            else:
+                self.outcome = OUTCOME_COMPLETED
+                self.terminal_reason = ""
+                log.info(
+                    "orchestrator_complete",
+                    winner=winner_id,
+                    best_Q=winner.state.quality,
+                    peak_Q=self.colony.best_quality,
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    total_fetches=self.scheduler.total_fetches,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=self._elapsed,
+                    stop_reason=stop_reason,
+                )
+                tracer.emit(
+                    "orchestrator_complete",
+                    run_id=run_id,
+                    status="completed",
+                    outcome=OUTCOME_COMPLETED,
+                    winner=winner_id,
+                    best_Q=round(winner.state.quality, 4),
+                    peak_Q=round(self.colony.best_quality, 4),
+                    snapshot_oleada=self.colony.best_snapshot_oleada,
+                    stop_reason=stop_reason,
+                    total_fetches=self.scheduler.total_fetches,
+                    total_waves=self.scheduler.oleada_count,
+                    oleadas=self.scheduler.oleada_count,
+                    elapsed=round(self._elapsed, 1),
+                )
+                tracer.record_artifact(
+                    f"narrative_{winner_id}.md",
+                    "narrative",
+                    narrative,
+                )
+
+        if self.cfg.examination.enabled and winner is not None:
+            await self._run_terminal_benchmark(seed_nid, tracer)
 
         self.trace.finish_run(
             run_id,
@@ -292,6 +459,275 @@ class Orchestrator:
             best_quality=round(self.colony.best_quality, 6),
         )
         return self.colony.best_narrative if winner is not None else ""
+
+    async def _run_terminal_benchmark(self, seed_nid: str, tracer: RunTracer) -> None:
+        """Run the hidden examination and matched naive baseline (EXAM-1..9)."""
+        try:
+            await self._benchmark_impl(seed_nid, tracer)
+        except Exception as exc:
+            from research_explorer.events.models import (
+                OUTCOME_SURVIVOR_UNBENCHMARKED,
+                REASON_SURVIVOR_UNAVAILABLE,
+            )
+
+            self.outcome = OUTCOME_SURVIVOR_UNBENCHMARKED
+            self.terminal_reason = redact_secrets(str(exc))
+            tracer.emit(
+                "warning",
+                classification="warning",
+                outcome=self.outcome,
+                reason_code=REASON_SURVIVOR_UNAVAILABLE,
+                reason=self.terminal_reason,
+            )
+        log.info("terminal_benchmark_done", outcome=self.outcome)
+
+    async def _benchmark_impl(self, seed_nid: str, tracer: RunTracer) -> None:
+        from research_explorer.examination import (
+            BenchmarkConfig,
+            BenchmarkRunner,
+            FakeAnswerClient,
+            FakeExaminer,
+            SelectionWeights,
+            build_evidence_pack,
+            config_fingerprint,
+        )
+        from research_explorer.examination.benchmark import (
+            OUTCOME_BENCHMARKED,
+            OUTCOME_DEGRADED,
+            OUTCOME_EXAM_INSUFFICIENT,
+            OUTCOME_FAILED,
+            OUTCOME_SURVIVOR_UNBENCHMARKED,
+        )
+        from research_explorer.examination.events import (
+            evidence_pack_frozen_payload,
+            exam_payloads,
+            survivor_payloads,
+        )
+        from research_explorer.examination.report import (
+            benchmark_report_markdown,
+            benchmark_result_json,
+            private_key_artifact,
+            public_exam_artifact,
+        )
+        from research_explorer.memory.extract import memory_from_state
+
+        exam = self.cfg.examination
+        union: dict = {}
+        for agent in self.colony.agents:
+            for paper_id, dossier in agent.state.dossiers.items():
+                union.setdefault(paper_id, dossier)
+        if not union:
+            self.outcome = OUTCOME_DEGRADED
+            tracer.emit(
+                "warning",
+                classification="warning",
+                outcome=self.outcome,
+                reason_code="no_evidence_bearing_dossier",
+            )
+            return
+
+        distances = _source_distances(seed_nid, self.colony.agents, union)
+        pack = build_evidence_pack(
+            seed_nid, self.effective_scope, union, distances=distances
+        ).freeze()
+        tracer.emit("evidence_pack_frozen", **evidence_pack_frozen_payload(pack))
+        tracer.record_artifact(
+            "evidence_pack.json", "evidence_pack", pack.model_dump_json(indent=2)
+        )
+
+        if exam.examiner_provider == "fake":
+            generator = FakeExaminer()
+            answer_client = FakeAnswerClient()
+            fallback_generator = None
+            answer_model = exam.answer_model or "fake-answer-v1"
+        else:
+            answer_model = self._require_answer_model(exam)
+            generator, answer_client, fallback_generator = self._build_live_exam_clients(
+                answer_model
+            )
+
+        candidates = []
+        acquired: dict = {}
+        for agent in self.colony.agents:
+            state = agent.state
+            candidates.append((state.id, state.quality, memory_from_state(state)))
+            acquired[state.id] = state.acquired_index()
+
+        weights = SelectionWeights(
+            selection=self.cfg.terminal_selection.w_selection,
+            process=self.cfg.terminal_selection.w_process,
+            grounding=self.cfg.terminal_selection.w_grounding,
+        )
+        config = BenchmarkConfig(
+            selection_count=exam.selection_count,
+            holdout_count=exam.holdout_count,
+            partition_seed=exam.partition_seed,
+            weights=weights,
+            min_coverage=exam.min_examination_coverage,
+            context_max_chars=self.cfg.baseline.context_max_chars,
+            include_seed_context=self.cfg.baseline.include_seed_context,
+            answer_batch_size=exam.answer_batch_size,
+            max_validation_attempts=exam.max_validation_attempts,
+            config_fingerprint=config_fingerprint(
+                {
+                    "examiner": exam.examiner_model,
+                    "answer": answer_model,
+                    "seed": exam.partition_seed,
+                    "selection": exam.selection_count,
+                    "holdout": exam.holdout_count,
+                    "include_seed_context": self.cfg.baseline.include_seed_context,
+                }
+            ),
+            model_ids={
+                "examiner_model": exam.examiner_model,
+                "answer_model": answer_model,
+            },
+            prompt_versions={"examiner": "v1", "answer": "v1"},
+        )
+        runner = BenchmarkRunner(
+            pack,
+            generator,
+            answer_client,
+            config,
+            tracer=tracer,
+            fallback_generator=fallback_generator,
+        )
+        result = await runner.run(candidates, acquired)
+        self.benchmark_result = result
+        self.survivor_bundle = runner.survivor_bundle
+
+        if runner.bank is not None:
+            for event_type, payload in exam_payloads(
+                runner.bank,
+                runner.bank.accepted_count,
+                runner.bank.rejected_count,
+                runner.bank.rejection_reasons,
+            ):
+                tracer.emit(event_type, **payload)
+        synthesis = runner.survivor_bundle.synthesis if runner.survivor_bundle else ""
+        for event_type, payload in survivor_payloads(result, synthesis=synthesis):
+            tracer.emit(event_type, **payload)
+
+        if runner.bank is not None:
+            tracer.record_artifact(
+                "exam_public.json", "exam", public_exam_artifact(runner.bank)
+            )
+        if runner.answer_key is not None:
+            tracer.record_private_artifact(
+                "exam_key.private.json", "answer_key", private_key_artifact(runner.answer_key)
+            )
+        tracer.record_artifact(
+            "benchmark_result.json", "benchmark", benchmark_result_json(result)
+        )
+        tracer.record_artifact(
+            "benchmark_report.md",
+            "report",
+            benchmark_report_markdown(result, pack, scope=self.effective_scope, bank=runner.bank),
+        )
+
+        outcome_map = {
+            OUTCOME_BENCHMARKED: OUTCOME_BENCHMARKED,
+            OUTCOME_SURVIVOR_UNBENCHMARKED: OUTCOME_SURVIVOR_UNBENCHMARKED,
+            OUTCOME_DEGRADED: OUTCOME_DEGRADED,
+            OUTCOME_EXAM_INSUFFICIENT: OUTCOME_EXAM_INSUFFICIENT,
+            OUTCOME_FAILED: OUTCOME_FAILED,
+        }
+        self.outcome = outcome_map.get(result.outcome, OUTCOME_DEGRADED)
+        self.terminal_reason = result.reason or result.reason_code
+        tracer.emit(
+            "benchmark_completed",
+            outcome=self.outcome,
+            reason_code=result.reason_code,
+            reason=self.terminal_reason,
+            survivor=result.survivor_id,
+            survivor_accuracy=result.survivor_accuracy,
+            naive_accuracy=result.naive_accuracy,
+            uplift=result.uplift,
+        )
+
+    def _require_answer_model(self, exam) -> str:
+        """Return the configured answer model or fail closed (EXAM-8).
+
+        The answer model must be explicit for a live run. Silently reusing the
+        examiner model would violate the matched-baseline contract because the
+        examiner is not assumed to serve the answer role.
+        """
+        if exam.answer_model.strip():
+            return exam.answer_model
+        raise RuntimeError(
+            "examination.answer_model must be set for a live examination; "
+            "refusing to reuse the examiner model for the answer arms (EXAM-8)"
+        )
+
+    def _build_live_exam_clients(self, answer_model: str):
+        """Build the examiner/answer clients (live path, not used by tests).
+
+        A fallback examiner is built only when ``allow_examiner_fallback`` is
+        set and a fallback model is configured; it is never used silently
+        (EXAM-2).
+        """
+        from research_explorer.examination import LLMAnswerClient, LLMExaminer
+
+        exam = self.cfg.examination
+        examiner_llm: Any
+        if exam.examiner_provider == "opencode":
+            from research_explorer.agents.opencode_client import OpenCodeLLMClient
+
+            examiner_llm = OpenCodeLLMClient()
+        else:
+            from research_explorer.agents.llm_client import LLMClient
+
+            examiner_llm = LLMClient(
+                base_url=exam.examiner_base_url,
+                api_key=resolve_examiner_key(exam.examiner_api_key_env),
+                max_concurrent=self.cfg.llm.max_concurrent,
+                rpm=self.cfg.llm.rpm,
+            )
+        self._examiner_llm = examiner_llm
+        generator = LLMExaminer(
+            examiner_llm,
+            exam.examiner_model,
+            exam.examiner_max_tokens,
+            temperature=exam.examiner_temperature,
+            reasoning_effort=exam.examiner_reasoning_effort or None,
+            evidence_max_chars=exam.evidence_max_chars,
+        )
+        fallback_generator = None
+        if exam.allow_examiner_fallback and exam.fallback_examiner_model.strip():
+            fallback_generator = LLMExaminer(
+                examiner_llm,
+                exam.fallback_examiner_model,
+                exam.examiner_max_tokens,
+                temperature=exam.examiner_temperature,
+                reasoning_effort=exam.examiner_reasoning_effort or None,
+                evidence_max_chars=exam.evidence_max_chars,
+            )
+        answer_client = LLMAnswerClient(
+            examiner_llm,
+            answer_model,
+            temperature=exam.answer_temperature,
+            max_tokens=exam.answer_max_tokens,
+            reasoning_effort=exam.answer_reasoning_effort or None,
+        )
+        return generator, answer_client, fallback_generator
+
+    def _outcome_gap(self, winner_id: str, narrative: str) -> str:
+        """Return the stable degraded reason for an otherwise-completed run.
+
+        A normal success requires a non-empty narrative, at least one
+        evidence-bearing evaluated turn, and a terminal evaluation for the
+        winner. Anything else is surfaced as ``completed``/``degraded`` rather
+        than as a fabricated success.
+        """
+        if not narrative:
+            return REASON_EMPTY_WINNER_NARRATIVE
+        evaluations = getattr(self.scheduler, "evaluations", []) or []
+        completed = [r for r in evaluations if getattr(r, "status", "complete") == "complete"]
+        if not any(getattr(r, "new_papers", []) for r in completed):
+            return REASON_NO_EVALUATED_EVIDENCE
+        if not any(r.agent_id == winner_id for r in completed):
+            return REASON_WINNER_EVALUATION_MISSING
+        return ""
 
     def mark_cancelled(self) -> None:
         """Persist a distinct ``cancelled`` status for the active run.
@@ -312,6 +748,8 @@ class Orchestrator:
         """Build a full markdown exploration report after run() has completed."""
         from research_explorer.orchestrator.report import build_report
 
+        bundle = getattr(self, "survivor_bundle", None)
+        survivor_synthesis = bundle.synthesis if bundle is not None else ""
         return build_report(
             config=self.cfg,
             colony=self.colony,
@@ -323,6 +761,11 @@ class Orchestrator:
             elapsed=getattr(self, "_elapsed", 0.0),
             outcome=self.outcome,
             terminal_reason=self.terminal_reason,
+            stop_reason=self.stop_reason,
+            benchmark_result=getattr(self, "benchmark_result", None),
+            effective_scope=getattr(self, "effective_scope", ""),
+            scope_origin=getattr(self, "scope_origin", "derived"),
+            survivor_synthesis=survivor_synthesis,
         )
 
     def generate_obsidian(self, seed_query: str, output_dir: str = "obsidian") -> str | None:
@@ -345,7 +788,11 @@ class Orchestrator:
 
     async def aclose(self) -> None:
         """Clean up resources."""
+        await self._stop_heartbeat()
         await self.llm.aclose()
+        examiner_llm = getattr(self, "_examiner_llm", None)
+        if examiner_llm is not None:
+            await examiner_llm.aclose()
         for p in self.providers.values():
             await p.aclose()
         self.graph.close()

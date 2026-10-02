@@ -77,9 +77,32 @@ class QualityAssessor:
         structural = self.structural.compute_detail(agent.state)
 
         s, p, j = await asyncio.gather(s_task, p_task, j_task)
-        weights = {"S": q.w_self, "P": q.w_peers, "J": q.w_virgin, "R": q.w_structural}
-
-        score = q.w_self * s.score + q.w_peers * p.aggregated_score + q.w_virgin * j.score + q.w_structural * structural.r
+        weights = {
+            "S": q.w_self,
+            "P": q.w_peers,
+            "J": q.w_virgin,
+            "R": q.w_structural,
+        }
+        component_scores: dict[str, float | None] = {
+            "S": s.score if s.available else None,
+            "P": p.aggregated_score if p.available else None,
+            "J": j.score if j.available else None,
+            "R": structural.r if structural.available else None,
+        }
+        unavailable = {
+            "S": s.unavailable_reason,
+            "P": p.unavailable_reason,
+            "J": j.unavailable_reason,
+            "R": structural.unavailable_reason,
+        }
+        unavailable = {k: v for k, v in unavailable.items() if component_scores[k] is None}
+        score = sum(
+            weights[k] * (value if value is not None else 0.0)
+            for k, value in component_scores.items()
+        )
+        reason = ""
+        if unavailable:
+            reason = "unavailable:" + ",".join(sorted(unavailable))
         log.debug(
             "quality_computed",
             agent=agent.state.id,
@@ -88,6 +111,7 @@ class QualityAssessor:
             J=j.score,
             R=structural.r,
             Q=score,
+            unavailable=unavailable,
         )
         clamped = max(0.0, min(1.0, score))
         return DetailedEvaluation(
@@ -103,4 +127,7 @@ class QualityAssessor:
             virgin_judge=j,
             structural=structural,
             new_papers=[normalize_id(p.provider, p.id) for p in (new_papers or [])],
+            status="complete",
+            reason=reason,
+            unavailable=unavailable,
         )

@@ -673,6 +673,8 @@ def build_reference_builder(
     resolution: ResolutionConfig = config.resolution
     order = [resolution.primary, *resolution.fallbacks]
     available = [name for name in order if name in providers]
+    if "arxiv" in providers and "arxiv" not in available:
+        available.append("arxiv")
     verification = build_verification_providers(
         available, providers, title_limit=resolution.title_search_limit
     )

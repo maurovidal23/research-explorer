@@ -28,12 +28,11 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Input, ListItem, ListView, Markdown, Static, Tab, Tabs
 
+from research_explorer.events.limits import TUI_REFRESH_INTERVAL_SECONDS
 from research_explorer.events.models import (
-    STATUS_CANCELLED,
-    STATUS_COMPLETED,
     STATUS_EVALUATING,
-    STATUS_FAILED,
     STATUS_RUNNING,
+    TERMINAL_STATUSES,
     EventType,
     RunEvent,
     RunViewState,
@@ -42,8 +41,8 @@ from research_explorer.events.models import (
 from research_explorer.events.navigation import (
     NavNode,
     active_agent_id,
-    active_leaf_entry,
-    build_agent_navigation,
+    active_phase_node_id,
+    build_wave_navigation,
     find_node,
     flatten_navigation,
     parent_ids,
@@ -79,6 +78,15 @@ from research_explorer.tui.theme import (
 )
 
 COMPACT_BREAKPOINT = 84
+
+TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.RUN_COMPLETED,
+        EventType.RUN_FAILED,
+        EventType.RUN_CANCELLED,
+        EventType.RUN_INTERRUPTED,
+    }
+)
 
 RESEARCH_THEME_NAME = "research-explorer"
 
@@ -135,7 +143,7 @@ class FooterBar(TextPane):
 
 
 class AgentTree(ListView):
-    """Selectable agent-first execution tree."""
+    """Selectable wave-first execution tree with agent/paper drill-down."""
 
 
 class ContentTabBar(Tabs):
@@ -332,6 +340,8 @@ class ResearchTUIApp(App[None]):
         self._tree_nodes: list[NavNode] = []
         self._rows: list[tuple[int, NavNode]] = []
         self._tree_width = 120
+        self._render_interval = TUI_REFRESH_INTERVAL_SECONDS
+        self._refresh_timer: Any = None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -353,6 +363,10 @@ class ResearchTUIApp(App[None]):
         if node is not None and node.entry_id:
             return self.state.entry_by_id(node.entry_id)
         return None
+
+    @property
+    def selected_node(self) -> NavNode | None:
+        return find_node(self._tree_nodes, self.session.selected_node_id)
 
     @property
     def agent_roster_text(self) -> str:
@@ -400,6 +414,15 @@ class ResearchTUIApp(App[None]):
         self._apply_narrow(self.size.width <= COMPACT_BREAKPOINT)
         self.refresh_view()
 
+    def on_unmount(self) -> None:
+        self._cancel_scheduled_refresh()
+        for worker in (self._consumer_worker, self._runner_worker):
+            if worker is not None and not worker.is_finished:
+                with contextlib.suppress(Exception):
+                    worker.cancel()
+        self._consumer_worker = None
+        self._runner_worker = None
+
     def _tick_elapsed(self) -> None:
         if self.read_only:
             return
@@ -438,9 +461,13 @@ class ResearchTUIApp(App[None]):
             event = await self._queue.get()
             try:
                 if event is None:
+                    self.refresh_view()
                     break
                 self.projection.apply(event)
-                self.refresh_view()
+                if event.canonical_type() in TERMINAL_EVENT_TYPES:
+                    self.refresh_view()
+                else:
+                    self._schedule_refresh()
             finally:
                 with contextlib.suppress(ValueError):
                     self._queue.task_done()
@@ -475,12 +502,41 @@ class ResearchTUIApp(App[None]):
     def _durable_terminal_received(self) -> bool:
         if self._terminal():
             return True
-        terminal = (EventType.RUN_FAILED, EventType.RUN_CANCELLED, EventType.RUN_COMPLETED)
-        return any(event.canonical_type() in terminal for event in self.state.events)
+        return any(
+            event.canonical_type() in TERMINAL_EVENT_TYPES
+            for event in self.state.events
+        )
 
     # ---- rendering --------------------------------------------------------
 
     def refresh_view(self) -> None:
+        """Render the newest fully applied projection immediately.
+
+        Any pending scheduled refresh is collapsed into this call so a burst
+        never renders an intermediate snapshot after an explicit refresh.
+        """
+        self._cancel_scheduled_refresh()
+        try:
+            self._refresh()
+        except Exception as exc:
+            self._request_render_shutdown(exc)
+
+    def _schedule_refresh(self) -> None:
+        if self._refresh_timer is not None:
+            return
+        self._refresh_timer = self.set_timer(
+            self._render_interval, self._flush_scheduled_refresh
+        )
+
+    def _cancel_scheduled_refresh(self) -> None:
+        timer = self._refresh_timer
+        self._refresh_timer = None
+        if timer is not None:
+            with contextlib.suppress(Exception):
+                timer.stop()
+
+    def _flush_scheduled_refresh(self) -> None:
+        self._refresh_timer = None
         try:
             self._refresh()
         except Exception as exc:
@@ -495,7 +551,7 @@ class ResearchTUIApp(App[None]):
             )
         )
 
-        roots = build_agent_navigation(state)
+        roots = build_wave_navigation(state)
         self._tree_nodes = roots
         self._ensure_selection(roots)
         self._render_tree(roots)
@@ -517,7 +573,9 @@ class ResearchTUIApp(App[None]):
         self._render_status_banner()
         self._sync_tabbar()
         self.query_one("#content", Markdown).update(
-            render.render_tab_body(state, self.session, self.selected_entry)
+            render.render_tab_body(
+                state, self.session, self.selected_entry, self.selected_node
+            )
         )
         self.query_one("#footer", FooterBar).set_text(
             render.render_footer_text(state, self.session, self._settling)
@@ -538,20 +596,25 @@ class ResearchTUIApp(App[None]):
             self.session.selected_agent_id = ""
             self.session.selected_node_id = None
             return
-        agent_ids = {node.agent_id for node in roots}
-        if self.session.selected_agent_id not in agent_ids:
-            self.session.selected_agent_id = active_agent_id(self.state) or roots[0].agent_id
+        agent_ids = set(self.state.agent_order)
+        if (
+            not self.session.selected_agent_id
+            or self.session.selected_agent_id not in agent_ids
+        ):
+            fallback = self.state.agent_order[0] if self.state.agent_order else ""
+            self.session.selected_agent_id = active_agent_id(self.state) or fallback
         if self.session.follow_live:
             self._follow(roots)
         elif find_node(roots, self.session.selected_node_id) is None:
-            self.session.selected_node_id = f"agent:{self.session.selected_agent_id}"
+            self.session.selected_node_id = active_phase_node_id(self.state)
 
     def _follow(self, roots: list[NavNode]) -> None:
         agent_id = active_agent_id(self.state)
         if agent_id:
             self.session.selected_agent_id = agent_id
-        node_id = active_leaf_entry(self.state, agent_id) or f"agent:{agent_id}"
+        node_id = active_phase_node_id(self.state)
         self.session.selected_node_id = node_id
+        self.session.expanded.add(node_id)
         parents = parent_ids(roots)
         cursor = node_id
         guard = 0
@@ -735,7 +798,9 @@ class ResearchTUIApp(App[None]):
         self.push_screen(TextViewer(title, body))
 
     def action_open_reader(self) -> None:
-        title, body = render.render_reader(self.state, self.session, self.selected_entry)
+        title, body = render.render_reader(
+            self.state, self.session, self.selected_entry, self.selected_node
+        )
         self._open_viewer(title, body)
 
     def action_view_evaluation(self) -> None:
@@ -759,7 +824,9 @@ class ResearchTUIApp(App[None]):
 
     def action_view_events(self) -> None:
         scope = self._events_scope_agent()
-        body = render.render_events_tab(self.state, scope, self.session.event_outcome)
+        body = render.render_events_tab(
+            self.state, scope, self.session.event_outcome, page=self.session.event_page
+        )
         self._open_viewer("Events", body)
 
     def action_view_metadata(self) -> None:
@@ -767,10 +834,24 @@ class ResearchTUIApp(App[None]):
 
     def action_cycle_event_outcome(self) -> None:
         self.session.event_outcome = next_event_outcome(self.session.event_outcome)
+        self.session.event_page = 0
         self.action_select_tab(TAB_EVENTS)
 
     def action_cycle_event_agent(self) -> None:
         self.session.event_agent = next_event_agent(self.session.event_agent)
+        self.session.event_page = 0
+        self.action_select_tab(TAB_EVENTS)
+
+    def action_events_older(self) -> None:
+        scoped = render.filter_events(
+            self.state, self._events_scope_agent(), self.session.event_outcome
+        )
+        last_page = render.event_page_count(len(scoped)) - 1
+        self.session.event_page = min(self.session.event_page + 1, last_page)
+        self.action_select_tab(TAB_EVENTS)
+
+    def action_events_newer(self) -> None:
+        self.session.event_page = max(0, self.session.event_page - 1)
         self.action_select_tab(TAB_EVENTS)
 
     def _scope_agent(self) -> str:
@@ -801,7 +882,7 @@ class ResearchTUIApp(App[None]):
     # ---- quit / cancellation ---------------------------------------------
 
     def _terminal(self) -> bool:
-        return self.state.status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_FAILED)
+        return self.state.status in TERMINAL_STATUSES
 
     def action_close_view(self) -> None:
         if self.screen is not self.screen_stack[0]:

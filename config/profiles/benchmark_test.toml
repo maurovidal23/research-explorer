@@ -1,0 +1,76 @@
+# Bounded, network-free benchmark profile (CFG-1 test profile).
+# Uses deterministic fake examiner and answer clients: no provider or LLM calls.
+# Use: uv run research-explorer benchmark --config config/profiles/benchmark_test.toml
+
+log_level = "INFO"
+
+[llm]
+base_url = "https://api.nan.builders/v1"
+api_key_env = "NAN_API_KEY"
+max_concurrent = 2
+rpm = 60
+explorer_model = "qwen3.6"
+judge_model = "deepseek-v4-flash"
+embedding_model = "qwen3-embedding"
+rerank_model = "rerank"
+temperature = 0.6
+max_tokens = 4000
+evaluation_max_tokens = 4000
+structured_output_attempts = 2
+fulltext_max_chars = 40000
+
+[aco]
+colony_size = 2
+max_concurrent = 2
+k_per_turn = 2
+
+[providers]
+default = "arxiv"
+active = ["arxiv"]
+
+[providers.arxiv]
+rate = 1
+period = 3
+concurrency = 2
+timeout = 30.0
+
+[budget]
+type = "fetches"
+max_fetches = 8
+max_time_seconds = 120
+
+[convergence]
+plateau_T = 2
+epsilon = 0.01
+theta = 1.0
+
+[storage]
+db_path = "data/benchmark_test.db"
+cache_dir = "data/.benchmark_cache"
+
+[memory]
+enabled = true
+synthesis_words = 1200
+
+[examination]
+enabled = true
+examiner_provider = "fake"
+examiner_model = "fake-examiner-v1"
+answer_model = "fake-answer-v1"
+selection_count = 6
+holdout_count = 4
+options_per_item = 4
+partition_seed = 7
+max_validation_attempts = 2
+min_examination_coverage = 0.5
+require_both_partitions = true
+evidence_max_chars = 20000
+
+[terminal_selection]
+w_selection = 0.70
+w_process = 0.20
+w_grounding = 0.10
+
+[baseline]
+enabled = true
+context_max_chars = 20000

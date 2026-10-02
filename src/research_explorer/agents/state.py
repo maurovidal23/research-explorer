@@ -16,6 +16,18 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from research_explorer.memory.extract import merge_claims
+from research_explorer.memory.models import (
+    Concept,
+    ContentKind,
+    KnowledgeGap,
+    LedgerClaim,
+    PaperDossier,
+    PaperRelation,
+    ResearchMemory,
+)
+from research_explorer.memory.synthesis import synthesize_memory
+
 
 def normalize_narrative(value: Any, fallback: str = "") -> str:
     if isinstance(value, str):
@@ -114,6 +126,94 @@ class AgentState(BaseModel):
         default=0,
         description="Provider work units consumed by the most recent turn",
     )
+
+    # ---- Structured research memory (SURV-2/3/4) --------------------------
+    research_scope: str = Field(
+        default="",
+        description="Effective research scope used to rank exploration",
+    )
+    scope_origin: str = Field(
+        default="derived",
+        description="Whether the scope was 'user' supplied or 'derived' from the seed",
+    )
+    dossiers: dict[str, PaperDossier] = Field(
+        default_factory=dict,
+        description="Typed, evidence-backed per-paper research memory",
+    )
+    claims: dict[str, LedgerClaim] = Field(
+        default_factory=dict,
+        description="Atomic typed claims, separate from rendered prose",
+    )
+    concepts: dict[str, Concept] = Field(default_factory=dict)
+    relations: list[PaperRelation] = Field(default_factory=list)
+    knowledge_gaps: list[KnowledgeGap] = Field(default_factory=list)
+    extraction_failures: list[str] = Field(
+        default_factory=list,
+        description="Dossier extraction failures retained without deleting prior memory",
+    )
+    synthesis: str = Field(
+        default="",
+        description="Derived readable synthesis over structured memory (not authoritative)",
+    )
+    synthesis_words: int = Field(
+        default=2000,
+        description="Word budget used to derive the synthesis view",
+    )
+
+    def record_dossier(self, dossier: PaperDossier) -> bool:
+        """Persist a dossier, preserving prior valid memory on failed re-extraction."""
+        existing = self.dossiers.get(dossier.paper_id)
+        if dossier.extraction_status == "failed":
+            if dossier.extraction_error:
+                self.extraction_failures.append(
+                    f"{dossier.paper_id}: {dossier.extraction_error}"
+                )
+            if existing is not None and existing.has_evidence_credit:
+                return False
+            if existing is not None:
+                self.dossiers[dossier.paper_id] = dossier
+                return True
+            self.dossiers[dossier.paper_id] = dossier
+            return True
+        self.dossiers[dossier.paper_id] = dossier
+        return True
+
+    def record_claims(self, claims: list[LedgerClaim]) -> None:
+        for claim in claims:
+            existing = self.claims.get(claim.id)
+            if existing is None:
+                self.claims[claim.id] = claim
+            else:
+                self.claims[claim.id] = merge_claims(existing, claim)
+
+    def record_relation(self, relation: PaperRelation) -> None:
+        if all(existing.id != relation.id for existing in self.relations):
+            self.relations.append(relation)
+
+    def record_gap(self, gap: KnowledgeGap) -> None:
+        if all(existing.id != gap.id for existing in self.knowledge_gaps):
+            self.knowledge_gaps.append(gap)
+
+    def regenerate_synthesis(self, max_words: int | None = None) -> str:
+        """Regenerate the derived synthesis view without mutating memory."""
+        if max_words is not None:
+            self.synthesis_words = max_words
+        memory = ResearchMemory(
+            agent_id=self.id,
+            scope=self.research_scope,
+            scope_origin=self.scope_origin,
+            dossiers=self.dossiers,
+            claims=self.claims,
+            concepts=self.concepts,
+            relations=self.relations,
+            gaps=self.knowledge_gaps,
+        )
+        self.synthesis = synthesize_memory(memory, self.synthesis_words)
+        return self.synthesis
+
+    def acquired_index(self) -> dict[str, ContentKind]:
+        """paper_id -> acquired ContentKind for evidence resolution."""
+        return {pid: dossier.content_kind for pid, dossier in self.dossiers.items()}
 
     def start_turn(self) -> None:
         """Reset per-turn accumulators."""

@@ -26,6 +26,8 @@ class SelfAssessmentDetail(BaseModel):
 
     score: float = 0.0
     reasoning: str = Field(default="", description="Explicit rationale behind the score")
+    available: bool = True
+    unavailable_reason: str = ""
 
 
 class PeerVoteDetail(BaseModel):
@@ -43,6 +45,8 @@ class PeerVotesDetail(BaseModel):
     aggregated_score: float = 0.5
     aggregation_method: str = "median"
     num_votes: int = 0
+    available: bool = True
+    unavailable_reason: str = ""
 
 
 class VirginJudgeDetail(BaseModel):
@@ -51,6 +55,8 @@ class VirginJudgeDetail(BaseModel):
     score: float = 0.0
     coverage: str = Field(default="", description="What the narrative covers")
     gaps: str = Field(default="", description="Explicit gaps the judge identified")
+    available: bool = True
+    unavailable_reason: str = ""
 
 
 class StructuralComponentsDetail(BaseModel):
@@ -61,6 +67,8 @@ class StructuralComponentsDetail(BaseModel):
     depth: float = 0.0
     coherence: float = 0.0
     r: float = Field(default=0.0, description="Aggregate structural score")
+    available: bool = True
+    unavailable_reason: str = ""
 
 
 class DetailedEvaluation(BaseModel):
@@ -78,6 +86,9 @@ class DetailedEvaluation(BaseModel):
     virgin_judge: VirginJudgeDetail = Field(default_factory=VirginJudgeDetail)
     structural: StructuralComponentsDetail = Field(default_factory=StructuralComponentsDetail)
     new_papers: list[str] = Field(default_factory=list)
+    status: str = "complete"
+    reason: str = ""
+    unavailable: dict[str, str] = Field(default_factory=dict)
     timestamp: str = Field(default_factory=utc_now)
 
     @property
@@ -88,6 +99,16 @@ class DetailedEvaluation(BaseModel):
             "J": self.virgin_judge.score,
             "R": self.structural.r,
         }
+
+    def component_states(self) -> dict[str, float | None]:
+        """Return each component score, or ``None`` when it is unavailable."""
+        return {
+            "S": self.self_assessment.score if self.self_assessment.available else None,
+            "P": self.peers.aggregated_score if self.peers.available else None,
+            "J": self.virgin_judge.score if self.virgin_judge.available else None,
+            "R": self.structural.r if self.structural.available else None,
+        }
+
 
 
 class CandidateScore(BaseModel):

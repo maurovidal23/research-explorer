@@ -58,6 +58,18 @@ from research_explorer.graph.embeddings import EmbeddingService
 from research_explorer.graph.models import Paper, PaperSummary, normalize_id, parse_normalized_id
 from research_explorer.graph.store import GraphStore
 from research_explorer.logging_setup import get_logger
+from research_explorer.memory.extract import (
+    claims_from_dossier,
+    concepts_from_dossiers,
+    dossier_from_paper,
+    gaps_from_claims,
+)
+from research_explorer.memory.models import (
+    KnowledgeGap,
+    PaperRelation,
+    RelationKind,
+    stable_id,
+)
 from research_explorer.providers.base import ResilientProvider, TransientProviderError
 from research_explorer.redaction import redact_secrets
 from research_explorer.replay.trace import RunTracer
@@ -69,6 +81,46 @@ if TYPE_CHECKING:
 log = get_logger("agent")
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+_MEMORY_ANALYSIS_SYSTEM = (
+    "You extract structured research memory from one scientific paper. Use only "
+    "the supplied title, abstract, and full-text excerpt. Return strict JSON. "
+    "Every substantive item must be traceable to the supplied content; never "
+    "invent data, citations, results, or limitations."
+)
+
+
+def _memory_analysis_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "research_problem": {"type": "string"},
+            "contribution": {"type": "string"},
+            "key_concepts": {"type": "array", "items": {"type": "string"}},
+            "method": {"type": "string"},
+            "design": {"type": "string"},
+            "datasets": {"type": "array", "items": {"type": "string"}},
+            "baselines": {"type": "array", "items": {"type": "string"}},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "findings": {"type": "array", "items": {"type": "string"}},
+            "limitations": {"type": "array", "items": {"type": "string"}},
+            "relevance": {"type": "string"},
+            "relations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target_paper_id": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["target_paper_id", "kind"],
+                },
+            },
+            "knowledge_gaps": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["findings"],
+    }
 
 
 @dataclass
@@ -364,6 +416,8 @@ class ExplorerAgent:
                     src=src,
                     turn=self.state.turn_count,
                     analysis=self.state.paper_analyses.get(next_id),
+                    narrative_chars=len(narrative),
+                    narrative_available=bool(narrative.strip()),
                 )
 
                 self.state.visit(next_id, mode)
@@ -646,7 +700,7 @@ class ExplorerAgent:
                 messages,
                 model=self.cfg.llm.explorer_model,
                 temperature=0.3,
-                max_tokens=min(self.cfg.llm.max_tokens, 2000),
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="frontier_reference_evaluation",
             )
         except Exception as e:
@@ -821,7 +875,151 @@ class ExplorerAgent:
         if builder is not None and (paper.ref_entries or paper.bibliography_error):
             extracted = await self._build_references(paper, builder)
         narrative = await self._integrate_narrative(paper)
+        await self._extract_memory(paper)
         return narrative, extracted
+
+    async def _extract_memory(self, paper: Paper) -> None:
+        """Populate ``paper_analyses`` and persist structured memory (SURV-2/3).
+
+        The live integration path requests a typed analysis from the explorer
+        model (bounded to the acquired content) and stores it on the existing
+        ``paper_analyses`` boundary before recording the dossier, claims,
+        relations, concepts, and gaps. When the model or memory is unavailable
+        the dossier is still recorded from acquired evidence.
+        """
+        paper_id = normalize_id(paper.provider, paper.id)
+        analysis = await self._analysis_for(paper)
+        if analysis:
+            self.state.paper_analyses[paper_id] = analysis
+        self._record_memory(paper, analysis)
+
+    async def _analysis_for(self, paper: Paper) -> dict | None:
+        paper_id = normalize_id(paper.provider, paper.id)
+        existing = self.state.paper_analyses.get(paper_id)
+        if existing:
+            return existing
+        memory_cfg = getattr(self.cfg, "memory", None)
+        if memory_cfg is None or not getattr(memory_cfg, "enabled", False):
+            return None
+        chat_json = getattr(self.llm, "chat_json", None)
+        if chat_json is None:
+            return None
+        content = self._bounded_content(paper, memory_cfg)
+        if not content.strip():
+            return None
+        llm_cfg = self.cfg.llm
+        try:
+            payload = await chat_json(
+                [
+                    {"role": "system", "content": _MEMORY_ANALYSIS_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Title: {paper.title}\nYear: {paper.year}\n"
+                            f"Authors: {', '.join(paper.authors)}\n\n{content}"
+                        ),
+                    },
+                ],
+                model=llm_cfg.explorer_model,
+                schema=_memory_analysis_schema(),
+                temperature=getattr(llm_cfg, "temperature", 0.6),
+                max_tokens=getattr(llm_cfg, "evaluation_max_tokens", None) or None,
+                attempts=getattr(llm_cfg, "structured_output_attempts", 2),
+                purpose="paper_analysis",
+            )
+        except Exception as e:
+            log.warning(
+                "memory_analysis_failed", paper_id=paper_id, error=redact_secrets(str(e))
+            )
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _bounded_content(self, paper: Paper, memory_cfg) -> str:
+        fulltext = getattr(paper, "fulltext", None)
+        if isinstance(fulltext, str) and fulltext.strip():
+            chunk_chars = getattr(memory_cfg, "chunk_chars", 12_000)
+            max_chunks = getattr(memory_cfg, "max_chunks", 8)
+            return fulltext[: max(1, chunk_chars) * max(1, max_chunks)]
+        abstract = getattr(paper, "abstract", None)
+        return abstract if isinstance(abstract, str) else ""
+
+    def _record_memory(self, paper: Paper, analysis: dict | None = None) -> None:
+        """Persist structured memory for an integrated paper (SURV-2/3).
+
+        Full text always reaches dossier extraction; a dossier is recorded even
+        when the integration narrative fails so acquired evidence is never lost.
+        Failures never delete earlier valid memory (``record_dossier``).
+        """
+        paper_id = normalize_id(paper.provider, paper.id)
+        if analysis is None:
+            analysis = self.state.paper_analyses.get(paper_id)
+        try:
+            dossier = dossier_from_paper(
+                paper,
+                analysis=analysis,
+                acquisition_event=self.state.turn_count,
+                scope=self.state.research_scope,
+            )
+            self.state.record_dossier(dossier)
+            claims = claims_from_dossier(dossier, analysis, self.state.turn_count)
+            self.state.record_claims(claims)
+            self._record_concepts(dossier)
+            self._record_relations(paper_id, analysis, dossier)
+            self._record_gaps(paper_id, analysis, claims)
+        except Exception as e:
+            log.warning("memory_extraction_failed", paper_id=paper_id, error=str(e))
+            self.state.extraction_failures.append(f"{paper_id}: {redact_secrets(str(e))}")
+
+    def _record_concepts(self, dossier) -> None:
+        for concept_id, concept in concepts_from_dossiers([dossier]).items():
+            existing = self.state.concepts.get(concept_id)
+            if existing is None:
+                self.state.concepts[concept_id] = concept
+                continue
+            for pid in concept.paper_ids:
+                if pid not in existing.paper_ids:
+                    existing.paper_ids.append(pid)
+
+    def _record_relations(self, paper_id: str, analysis: dict | None, dossier) -> None:
+        if not analysis:
+            return
+        evidence = [ref.model_copy() for ref in dossier.evidence if ref.resolves]
+        for raw in analysis.get("relations", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            target = str(raw.get("target_paper_id") or "").strip()
+            if not target:
+                continue
+            try:
+                kind = RelationKind(str(raw.get("kind") or "").strip().lower())
+            except ValueError:
+                kind = RelationKind.EXTENSION
+            self.state.record_relation(
+                PaperRelation(
+                    id=stable_id("rel", paper_id, target, kind.value),
+                    source_paper_id=paper_id,
+                    target_paper_id=target,
+                    kind=kind,
+                    rationale=str(raw.get("rationale") or ""),
+                    evidence=[ref.model_copy() for ref in evidence],
+                )
+            )
+
+    def _record_gaps(self, paper_id: str, analysis: dict | None, claims) -> None:
+        if analysis:
+            for text in analysis.get("knowledge_gaps", []) or []:
+                text = str(text).strip()
+                if not text:
+                    continue
+                self.state.record_gap(
+                    KnowledgeGap(
+                        id=stable_id("gap", paper_id, text),
+                        text=text,
+                        related_papers=[paper_id],
+                    )
+                )
+        for gap in gaps_from_claims({claim.id: claim for claim in claims}):
+            self.state.record_gap(gap)
 
     async def _build_references(
         self, paper: Paper, builder: ReferenceGraphBuilder
@@ -856,11 +1054,16 @@ class ExplorerAgent:
                 messages,
                 model=self.cfg.llm.explorer_model,
                 temperature=self.cfg.llm.temperature,
-                max_tokens=self.cfg.llm.max_tokens,
+                max_tokens=self.cfg.llm.max_tokens or None,
                 purpose="paper_integration",
             )
         except Exception as e:
             log.warning("integrate_failed", agent=self.state.id, error=str(e))
+            self._emit(
+                "paper_integration_failed",
+                paper_id=normalize_id(paper.provider, paper.id),
+                error=redact_secrets(str(e)),
+            )
             return self.state.narrative
         return normalize_narrative(narrative, self.state.narrative)
 

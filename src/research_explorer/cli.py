@@ -30,7 +30,10 @@ app.add_typer(replay_app, name="replay")
 @app.command()
 def explore(
     seed_paper_id: str = typer.Argument(help="Seed paper ID (DOI, S2 ID, PMID, etc.)"),
-    seed_query: str = typer.Argument(help="Research line description to explore"),
+    seed_query: str = typer.Argument(
+        "",
+        help="Optional research scope (derived from the seed paper when omitted)",
+    ),
     config_path: str = typer.Option(
         "config/default.toml", "--config", "-c", help="Path to config TOML file"
     ),
@@ -92,11 +95,32 @@ def _emit_report(report: str, output: str | None, obsidian_dir: str | None) -> N
         typer.echo(f"Obsidian graph written to {obsidian_dir}/")
 
 
+def _write_private_artifact(path: Path, content: str) -> None:
+    """Write a restricted artifact readable only by the current user.
+
+    The exam answer key must not be world/group readable, unlike ordinary
+    reports and narrative artifacts.
+    """
+    path.write_text(content, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
 def _echo_report_stdout(report: str) -> None:
     typer.echo("\n" + "=" * 80)
     typer.echo("EXPLORATION REPORT")
     typer.echo("=" * 80)
     typer.echo(report)
+
+
+def _format_ratio(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.4f}"
+
+
+def _format_uplift(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{value * 100:+.2f} percentage points"
 
 
 def _atomic_write_report(path: str, report: str) -> None:
@@ -383,6 +407,20 @@ def config(
         f"turns={rk.max_turns}, evaluator={rk.evaluator_enabled} ({rk.rubric_version})"
     )
     typer.echo(f"Quality weights: S={cfg.quality.w_self} P={cfg.quality.w_peers} J={cfg.quality.w_virgin} R={cfg.quality.w_structural}")
+    exam = cfg.examination
+    typer.echo(
+        f"Examination: enabled={exam.enabled}, examiner={exam.examiner_model} "
+        f"({exam.examiner_provider}), selection={exam.selection_count}, "
+        f"holdout={exam.holdout_count}, answer_model={exam.answer_model or '(unset)'}"
+    )
+    ts = cfg.terminal_selection
+    typer.echo(
+        f"Terminal weights: selection={ts.w_selection} process={ts.w_process} "
+        f"grounding={ts.w_grounding}"
+    )
+    typer.echo(
+        f"Memory: enabled={cfg.memory.enabled}, synthesis_words={cfg.memory.synthesis_words}"
+    )
 
 
 @replay_app.command("list")
@@ -429,6 +467,13 @@ def replay_show(
         f"started={run['started_at']}  completed={run['completed_at']}  "
         f"best_Q={run['best_quality']}  events={run['event_count']}"
     )
+    if run["status"] in ("running", "interrupted"):
+        events = store.list_events(run_id)
+        last = events[-1] if events else None
+        if last is not None:
+            typer.echo(f"last_activity={last['ts']}  last_operation={last['type']}")
+        if run.get("interrupt_reason"):
+            typer.echo(f"interrupted: {run['interrupt_reason']}")
     if timeline:
         typer.echo("\n=== Timeline ===")
         for ev in store.list_events(run_id):
@@ -480,7 +525,7 @@ def replay_tui(
     from research_explorer.events.projection import RunProjection
     from research_explorer.replay.trace import RunTraceStore
     from research_explorer.tui import build_app
-    from research_explorer.tui.replay import hydrate_from_store
+    from research_explorer.tui.replay import apply_reconciled_status, hydrate_from_store
 
     store = RunTraceStore(db)
     run = store.get_run(run_id)
@@ -491,6 +536,7 @@ def replay_tui(
 
     projection = RunProjection.from_events(store.list_events(run_id))
     hydrate_from_store(projection, store, run_id)
+    apply_reconciled_status(projection, run)
     store.close()
 
     app = build_app(projection, read_only=True)
@@ -523,6 +569,124 @@ def replay_serve(
     from research_explorer.replay.server import build_app
 
     uvicorn.run(build_app(db, default_run_id=run_id), host=host, port=port)
+
+
+@app.command()
+def benchmark(
+    config_path: str = typer.Option(
+        "config/profiles/benchmark_test.toml",
+        "--config",
+        "-c",
+        help="Path to a benchmark config TOML file",
+    ),
+    output: str = typer.Option(
+        "data/benchmark", "--output", "-o", help="Directory for benchmark artifacts"
+    ),
+) -> None:
+    """Run a bounded, network-free survivor benchmark with deterministic clients."""
+    from research_explorer.examination import (
+        BenchmarkConfig,
+        BenchmarkRunner,
+        FakeAnswerClient,
+        FakeExaminer,
+        SelectionWeights,
+        build_synthetic_corpus,
+    )
+    from research_explorer.examination.report import (
+        benchmark_report_markdown,
+        benchmark_result_json,
+        private_key_artifact,
+        public_exam_artifact,
+    )
+
+    cfg = load_config(config_path)
+    exam = cfg.examination
+    if exam.examiner_provider != "fake":
+        raise typer.BadParameter(
+            "the standalone benchmark command supports the bounded 'fake' examiner "
+            "profile only; live examinations run inside an exploration run."
+        )
+    if not exam.enabled:
+        raise typer.BadParameter(
+            "examination is disabled in the config; enable [examination].enabled."
+        )
+
+    pack, candidates, acquired = build_synthetic_corpus(count=6)
+    runner = BenchmarkRunner(
+        pack=pack,
+        generator=FakeExaminer(),
+        answer_client=FakeAnswerClient(),
+        config=BenchmarkConfig(
+            selection_count=exam.selection_count,
+            holdout_count=exam.holdout_count,
+            partition_seed=exam.partition_seed,
+            weights=SelectionWeights(
+                selection=cfg.terminal_selection.w_selection,
+                process=cfg.terminal_selection.w_process,
+                grounding=cfg.terminal_selection.w_grounding,
+            ),
+            min_coverage=exam.min_examination_coverage,
+            context_max_chars=cfg.baseline.context_max_chars,
+            include_seed_context=cfg.baseline.include_seed_context,
+            answer_batch_size=exam.answer_batch_size,
+            max_validation_attempts=exam.max_validation_attempts,
+            model_ids={
+                "examiner_model": exam.examiner_model,
+                "answer_model": exam.answer_model or "fake-answer-v1",
+            },
+            prompt_versions={"examiner": "v1", "answer": "v1"},
+        ),
+    )
+    result = asyncio.run(runner.run(candidates, acquired))
+
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "evidence_pack.json").write_text(
+        pack.model_dump_json(indent=2), encoding="utf-8"
+    )
+    (out_dir / "benchmark_result.json").write_text(
+        benchmark_result_json(result), encoding="utf-8"
+    )
+    report = benchmark_report_markdown(
+        result,
+        pack,
+        scope=pack.scope,
+        scope_origin="derived",
+        evidence_bearing=len(pack.sources),
+        dossier_count=len(pack.sources) + len(pack.excluded),
+        bank=runner.bank,
+    )
+    (out_dir / "benchmark_report.md").write_text(report, encoding="utf-8")
+    if runner.bank is not None:
+        (out_dir / "exam_public.json").write_text(
+            public_exam_artifact(runner.bank), encoding="utf-8"
+        )
+    if runner.answer_key is not None:
+        _write_private_artifact(
+            out_dir / "exam_key.private.json",
+            private_key_artifact(runner.answer_key),
+        )
+
+    typer.echo("\n" + "=" * 80)
+    typer.echo("SURVIVOR BENCHMARK")
+    typer.echo("=" * 80)
+    typer.echo(f"  Outcome: {result.outcome}")
+    if result.reason_code:
+        typer.echo(f"  Reason: {result.reason_code} — {result.reason}")
+    typer.echo(f"  Survivor: {result.survivor_id or '(none)'}")
+    typer.echo(f"  Survivor accuracy: {_format_ratio(result.survivor_accuracy)}")
+    typer.echo(f"  Naive accuracy: {_format_ratio(result.naive_accuracy)}")
+    typer.echo(f"  Research uplift: {_format_uplift(result.uplift)}")
+    if runner.bank is not None:
+        typer.echo(
+            f"  Exam bank: {runner.bank.accepted_count} accepted, "
+            f"{runner.bank.rejected_count} rejected"
+        )
+        typer.echo(
+            f"  Partitions: {len(runner.bank.selection_ids)} selection / "
+            f"{len(runner.bank.holdout_ids)} holdout"
+        )
+    typer.echo(f"Artifacts written to {out_dir}/")
 
 
 def main() -> None:

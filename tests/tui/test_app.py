@@ -174,7 +174,8 @@ async def test_initial_dashboard_layout() -> None:
         assert "run-abc" in header
         assert "explorer-x" in header
         rows = app.tree_row_texts()
-        assert any("A01" in row and "foundations" in row for row in rows)
+        assert any("A01" in row for row in rows)
+        assert any(row.startswith("Setup") or "Setup" in row for row in rows)
         assert any("Paper One" in row for row in rows)
         activity = app.query_one("#activity").plain_text
         assert "Agent" in activity and "Paper One" in activity
@@ -183,7 +184,7 @@ async def test_initial_dashboard_layout() -> None:
         assert not app.session.narrowed
 
 
-async def test_tree_navigation_is_agent_first_and_home_restores_follow() -> None:
+async def test_tree_navigation_is_wave_first_and_home_restores_follow() -> None:
     app = _app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
@@ -244,13 +245,14 @@ async def test_enter_toggles_tree_expansion() -> None:
         await pilot.pause()
         await pilot.press("left")
         await pilot.pause()
-        # Select the first agent root explicitly.
-        app._on_tree_select(app._tree_nodes[0])
+        # Select the first wave with phase children explicitly.
+        wave = next(node for node in app._tree_nodes if node.node_id == "wave:1")
+        app._on_tree_select(wave)
         await pilot.pause()
-        assert app._tree_nodes[0].node_id in app.session.expanded
+        assert "wave:1" in app.session.expanded
         await pilot.press("enter")
         await pilot.pause()
-        assert app._tree_nodes[0].node_id not in app.session.expanded
+        assert "wave:1" not in app.session.expanded
 
 
 async def test_reader_and_help_overlays() -> None:

@@ -115,6 +115,14 @@ ACTIONS: tuple[UIAction, ...] = (
         "Cycle the Events tab agent filter", "Filters",
     ),
     UIAction(
+        "events_older", "events_older", "Older events", "shift+left", "Shift+\u2190",
+        "Page to older events in the bounded Events tab", "Filters",
+    ),
+    UIAction(
+        "events_newer", "events_newer", "Newer events", "shift+right", "Shift+\u2192",
+        "Page to newer events in the bounded Events tab", "Filters",
+    ),
+    UIAction(
         "toggle_panes", "toggle_panes", "Toggle panes", "t", "t",
         "Switch the visible pane on compact terminals", "Layout",
         footer=True, narrow=True,

@@ -8,6 +8,7 @@ from __future__ import annotations
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import self_assess
 from research_explorer.config import Config
+from research_explorer.evaluation import availability
 from research_explorer.logging_setup import get_logger
 from research_explorer.replay.models import SelfAssessmentDetail
 
@@ -38,7 +39,12 @@ class SelfAssessment:
     async def score_detail(self, narrative: str, seed_query: str) -> SelfAssessmentDetail:
         """Return the S component with the agent's explicit reasoning."""
         if not narrative.strip():
-            return SelfAssessmentDetail(score=0.0, reasoning="empty narrative")
+            return SelfAssessmentDetail(
+                score=0.0,
+                reasoning="empty narrative",
+                available=False,
+                unavailable_reason=availability.REASON_EMPTY_NARRATIVE,
+            )
         messages = self_assess(narrative, seed_query)
         try:
             result = await self.llm.chat_json(
@@ -46,8 +52,9 @@ class SelfAssessment:
                 model=self.cfg.llm.explorer_model,
                 schema=SCORE_SCHEMA,
                 temperature=0.3,
-                max_tokens=1000,
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="self_assessment",
+                attempts=self.cfg.llm.structured_output_attempts,
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))
@@ -55,4 +62,9 @@ class SelfAssessment:
             return SelfAssessmentDetail(score=score, reasoning=reasoning)
         except Exception as e:
             log.warning("self_assess_failed", error=str(e))
-            return SelfAssessmentDetail(score=0.0, reasoning=f"self assessment failed: {e}")
+            return SelfAssessmentDetail(
+                score=0.0,
+                reasoning=f"self assessment failed: {e}",
+                available=False,
+                unavailable_reason=availability.classify_failure(e),
+            )

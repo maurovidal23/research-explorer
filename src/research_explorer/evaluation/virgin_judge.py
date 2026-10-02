@@ -9,6 +9,7 @@ from __future__ import annotations
 from research_explorer.agents.llm_client import LLMClient
 from research_explorer.agents.prompts import virgin_judge
 from research_explorer.config import Config
+from research_explorer.evaluation import availability
 from research_explorer.logging_setup import get_logger
 from research_explorer.replay.models import VirginJudgeDetail
 
@@ -40,7 +41,13 @@ class VirginJudge:
     async def judge_detail(self, narrative: str, seed_query: str) -> VirginJudgeDetail:
         """Return the J component plus the judge's coverage and gaps."""
         if not narrative.strip():
-            return VirginJudgeDetail(score=0.0, coverage="", gaps="empty narrative")
+            return VirginJudgeDetail(
+                score=0.0,
+                coverage="",
+                gaps="empty narrative",
+                available=False,
+                unavailable_reason=availability.REASON_EMPTY_NARRATIVE,
+            )
         messages = virgin_judge(narrative, seed_query)
         try:
             result = await self.llm.chat_json(
@@ -48,8 +55,9 @@ class VirginJudge:
                 model=self.cfg.llm.judge_model,  # different model — reduces bias
                 schema=JUDGE_SCHEMA,
                 temperature=0.2,
-                max_tokens=1500,
+                max_tokens=self.cfg.llm.evaluation_max_tokens or None,
                 purpose="virgin_judge",
+                attempts=self.cfg.llm.structured_output_attempts,
             )
             score = float(result.get("score", 0.5))
             score = max(0.0, min(1.0, score))
@@ -60,4 +68,10 @@ class VirginJudge:
             )
         except Exception as e:
             log.warning("virgin_judge_failed", error=str(e))
-            return VirginJudgeDetail(score=0.0, coverage="", gaps=f"virgin judge failed: {e}")
+            return VirginJudgeDetail(
+                score=0.0,
+                coverage="",
+                gaps=f"virgin judge failed: {e}",
+                available=False,
+                unavailable_reason=availability.classify_failure(e),
+            )

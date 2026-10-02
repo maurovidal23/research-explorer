@@ -41,3 +41,16 @@ def test_explore_rejects_kernel_run_without_enabled_providers(tmp_path) -> None:
     )
     assert result.exit_code != 0
     assert "No providers enabled" in result.output
+
+
+def test_private_answer_key_file_is_owner_only(tmp_path) -> None:
+    import os
+    import stat
+
+    from research_explorer.cli import _write_private_artifact
+
+    path = tmp_path / "exam_key.private.json"
+    _write_private_artifact(path, '{"correct_option_id": "A"}')
+    assert path.read_text(encoding="utf-8") == '{"correct_option_id": "A"}'
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
