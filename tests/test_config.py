@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from research_explorer.config import _load_env, load_config
+from research_explorer.config import Config, _load_env, load_config
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
@@ -25,6 +25,19 @@ def test_linked_worktree_loads_main_worktree_env(tmp_path, monkeypatch) -> None:
     _load_env(linked / "config" / "default.toml")
 
     assert os.environ["RESEARCH_EXPLORER_TEST_KEY"] == "available"
+
+
+def test_default_judge_model_is_glm_flash() -> None:
+    assert Config().llm.judge_model == "glm-5.3-flash"
+    cfg = load_config(CONFIG_DIR / "default.toml")
+    assert cfg.llm.judge_model == "glm-5.3-flash"
+
+
+def test_explicit_judge_model_overrides_default(tmp_path) -> None:
+    path = tmp_path / "judge.toml"
+    path.write_text('[llm]\njudge_model = "custom-judge"\n', encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.llm.judge_model == "custom-judge"
 
 
 def test_default_config_keeps_aco_and_gains_kernel_defaults() -> None:

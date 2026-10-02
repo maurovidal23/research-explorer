@@ -5,15 +5,22 @@ from research_explorer.research.agent import (
     LLMReferenceMapper,
     LLMResearchAgent,
     ReferenceMapper,
+    ReferenceMappingError,
     ResearchAgent,
     parse_agent_brief,
+    reference_schema,
 )
 from research_explorer.research.answer import build_final_answer
-from research_explorer.research.context import build_agent_prompt, build_evaluation_prompt
+from research_explorer.research.context import (
+    build_agent_prompt,
+    build_evaluation_prompt,
+    rubric_schema,
+)
 from research_explorer.research.evaluator import (
     CompositeEvaluator,
     DeterministicIntegrity,
     LLMRubricEvaluator,
+    parse_claim_verdicts,
 )
 from research_explorer.research.loop import (
     Acquisition,
@@ -21,6 +28,7 @@ from research_explorer.research.loop import (
     GraphEvidenceGateway,
     KernelOptions,
     ResearchKernel,
+    SearchOutcome,
 )
 from research_explorer.research.models import (
     ActionKind,
@@ -31,6 +39,7 @@ from research_explorer.research.models import (
     Claim,
     ClaimMutation,
     ClaimStatus,
+    ClaimVerdict,
     EvidenceRef,
     FinalAnswer,
     OpenQuestion,
@@ -42,6 +51,8 @@ from research_explorer.research.models import (
     ResearchObjective,
     ResearchState,
     SlotState,
+    VerdictAssessment,
+    normalize_query,
 )
 from research_explorer.research.policy import ExplorationPolicy, GreedyPolicy
 from research_explorer.research.store import ResearchStore
@@ -57,6 +68,7 @@ __all__ = [
     "Claim",
     "ClaimMutation",
     "ClaimStatus",
+    "ClaimVerdict",
     "CompositeEvaluator",
     "DeterministicIntegrity",
     "EvidenceGateway",
@@ -73,6 +85,7 @@ __all__ = [
     "OpenQuestionStatus",
     "ProviderOutcome",
     "ReferenceMapper",
+    "ReferenceMappingError",
     "ResearchAction",
     "ResearchAgent",
     "ResearchEvaluation",
@@ -81,9 +94,15 @@ __all__ = [
     "ResearchObjective",
     "ResearchState",
     "ResearchStore",
+    "SearchOutcome",
     "SlotState",
+    "VerdictAssessment",
     "build_agent_prompt",
     "build_evaluation_prompt",
     "build_final_answer",
+    "normalize_query",
     "parse_agent_brief",
+    "parse_claim_verdicts",
+    "reference_schema",
+    "rubric_schema",
 ]

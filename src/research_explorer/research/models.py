@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -17,9 +18,22 @@ from pydantic import BaseModel, Field, field_validator
 
 SCHEMA_VERSION = "research-kernel/1"
 
+_WS = re.compile(r"\s+")
+_PUNCT = re.compile(r"[^\w\s]+")
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_query(query: str) -> str:
+    """Normalize a search query for equivalence and de-duplication."""
+    return _WS.sub(" ", query.strip().casefold())
+
+
+def normalize_claim_text(text: str) -> str:
+    """Normalize claim/limitation text for equivalence comparison."""
+    return _WS.sub(" ", _PUNCT.sub(" ", text.casefold())).strip()
 
 
 def canonical_json(value: Any) -> str:
@@ -51,7 +65,22 @@ class OpenQuestionStatus(str, Enum):
 class ActionKind(str, Enum):
     READ_EVIDENCE = "read_evidence"
     INVESTIGATE_QUESTION = "investigate_question"
+    SEARCH = "search"
     STOP = "stop"
+
+
+class VerdictAssessment(str, Enum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+    CONTRADICTED = "contradicted"
+
+
+class ClaimVerdict(BaseModel):
+    """Structured evaluator judgment keyed by an existing claim identifier."""
+
+    claim_id: str = Field(min_length=1)
+    assessment: VerdictAssessment
+    reason: str = ""
 
 
 class ProviderOutcome(str, Enum):
@@ -69,6 +98,8 @@ class BudgetState(BaseModel):
     max_turns: int = 20
     fetches_used: int = 0
     tokens_used: int = 0
+    agent_tokens_used: int = 0
+    evaluator_tokens_used: int = 0
     time_used: float = 0.0
     turns_used: int = 0
 
@@ -106,6 +137,10 @@ class EvidenceRef(BaseModel):
     locator: str | None = None
     content_hash: str | None = None
     acquisition_event: int | None = None
+    setting: str | None = Field(
+        default=None,
+        description="Source setting/field of the acquired evidence, for cross-setting coverage",
+    )
 
 
 class Claim(BaseModel):
@@ -198,6 +233,9 @@ class RubricResult(BaseModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     recommended_questions: list[str] = Field(default_factory=list)
+    claim_verdicts: list[ClaimVerdict] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
     error: str | None = None
     # Raw judge output, carried to the controller so it can persist it as the
     # evaluation's raw artifact. Excluded from state serialization to avoid
@@ -215,6 +253,7 @@ class ResearchEvaluation(BaseModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     recommended_questions: list[str] = Field(default_factory=list)
+    claim_verdicts: list[ClaimVerdict] = Field(default_factory=list)
     evaluator_id: str = "composite"
     evaluator_version: str = "v1"
     raw_artifact_ref: str | None = None
@@ -234,6 +273,7 @@ class ResearchAction(BaseModel):
     kind: ActionKind = ActionKind.READ_EVIDENCE
     paper_id: str | None = None
     question_id: str | None = None
+    query: str | None = None
     reason: str = ""
     predicted_value: float = 0.0
     predicted_cost: int = 1
@@ -263,6 +303,8 @@ class ResearchState(BaseModel):
     questions: dict[str, OpenQuestion] = Field(default_factory=dict)
     evidence: list[EvidenceRef] = Field(default_factory=list)
     visited: list[str] = Field(default_factory=list)
+    search_queries: list[str] = Field(default_factory=list)
+    blocked_search_queries: list[str] = Field(default_factory=list)
     notebook: AgentNotebook
     latest_evaluation: ResearchEvaluation | None = None
     final_answer: str | None = None
@@ -296,9 +338,21 @@ class FinalAnswer(BaseModel):
     contradictions: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     citations: list[str] = Field(default_factory=list)
+    terminal_reason: str | None = None
+    evidence_sufficient: bool = True
+    provisional: bool = False
 
     def render_markdown(self) -> str:
         lines = ["# Research answer", "", f"**Question:** {self.question}"]
+        if self.terminal_reason:
+            lines.append(f"**Terminal reason:** `{self.terminal_reason}`")
+        if not self.evidence_sufficient:
+            sufficiency = "insufficient"
+        elif self.provisional:
+            sufficiency = "provisional"
+        else:
+            sufficiency = "sufficient"
+        lines.append(f"**Evidence sufficiency:** {sufficiency}")
         self._section(lines, "Supported conclusions", self.supported_conclusions)
         self._section(lines, "Plausible interpretations", self.plausible_interpretations)
         self._section(lines, "Unknowns", self.unknowns)

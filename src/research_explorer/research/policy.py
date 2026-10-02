@@ -19,6 +19,7 @@ from research_explorer.research.models import (
     ResearchEvaluation,
     ResearchState,
     SlotState,
+    normalize_query,
 )
 
 
@@ -49,9 +50,17 @@ class GreedyPolicy:
     on the instance for the controller to record.
     """
 
-    def __init__(self, seed: int = 0, max_actions: int = 1) -> None:
+    def __init__(
+        self,
+        seed: int = 0,
+        max_actions: int = 1,
+        search_enabled: bool = True,
+        max_search_queries: int = 3,
+    ) -> None:
         self.seed = seed
         self.max_actions = max_actions
+        self.search_enabled = search_enabled
+        self.max_search_queries = max_search_queries
         self.last_considered: list[CandidateAction] = []
         self.last_reasons: dict[str, str] = {}
         self.observations: list[ResearchEvaluation] = []
@@ -61,6 +70,26 @@ class GreedyPolicy:
         rng = random.Random(self.seed)
         rng.shuffle(ids)
         return {pid: rank for rank, pid in enumerate(ids)}
+
+    def _pending_queries(self, state: ResearchState) -> list[str]:
+        """Return unused search queries derived from the question and evaluator."""
+        evaluation = state.latest_evaluation
+        issues: list[str] = []
+        if evaluation is not None:
+            issues.extend(evaluation.missing_knowledge)
+            issues.extend(evaluation.recommended_questions)
+        if not any(issue.strip() for issue in issues):
+            return []
+        issued = set(state.search_queries) | set(state.blocked_search_queries)
+        pending: list[str] = []
+        seen: set[str] = set()
+        for raw in [*issues, state.objective.question]:
+            normalized = normalize_query(raw)
+            if not normalized or normalized in issued or normalized in seen:
+                continue
+            seen.add(normalized)
+            pending.append(raw.strip())
+        return pending
 
     async def select_actions(
         self,
@@ -96,16 +125,41 @@ class GreedyPolicy:
         if budget.tokens_remaining <= 0:
             capacity = 0
         selected = ordered[:capacity]
-        return [
-            ResearchAction(
-                kind=ActionKind.READ_EVIDENCE,
-                paper_id=candidate.paper_id,
-                reason=candidate.reason or "greedy_top_score",
-                predicted_value=candidate.score,
-                predicted_cost=1,
-            )
-            for candidate in selected
-        ]
+        if selected:
+            return [
+                ResearchAction(
+                    kind=ActionKind.READ_EVIDENCE,
+                    paper_id=candidate.paper_id,
+                    reason=candidate.reason or "greedy_top_score",
+                    predicted_value=candidate.score,
+                    predicted_cost=1,
+                )
+                for candidate in selected
+            ]
+
+        if (
+            self.search_enabled
+            and not eligible
+            and budget.fetches_remaining > 0
+            and budget.tokens_remaining > 0
+            and len(state.search_queries) < self.max_search_queries
+        ):
+            pending = self._pending_queries(state)
+            if pending:
+                query = pending[0]
+                self.last_reasons = {
+                    normalize_query(query): "frontier_empty_search"
+                }
+                return [
+                    ResearchAction(
+                        kind=ActionKind.SEARCH,
+                        query=query,
+                        reason="frontier_empty_search",
+                        predicted_value=0.4,
+                        predicted_cost=1,
+                    )
+                ]
+        return []
 
     async def observe(
         self,

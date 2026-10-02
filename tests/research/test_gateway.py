@@ -103,6 +103,7 @@ async def test_success_caches_paper_and_builds_candidates(graph: GraphStore) -> 
     assert acquisition.evidence is not None
     assert acquisition.evidence.paper_id == "openalex:W1"
     assert acquisition.evidence.content_hash
+    assert acquisition.evidence.setting == "openalex"
     assert provider.native_calls == ["W1"]
     assert graph.get_paper_summary("openalex:W1") is not None
     candidates = {c.paper_id: c for c in acquisition.candidates}
@@ -174,3 +175,108 @@ async def test_explicit_arxiv_id_survives_mapping_failure(
     assert [candidate.paper_id for candidate in acquisition.candidates] == [
         "arxiv:2301.00002"
     ]
+    assert acquisition.mapping_attempted is True
+    assert acquisition.mapping_failed is True
+    assert acquisition.mapping_fallback is True
+    assert acquisition.mapped_count == 0
+
+
+class ExtraReferenceMapper:
+    async def map_references(
+        self, paper: Paper, question: str, limit: int
+    ) -> list[PaperSummary]:
+        return [
+            PaperSummary(id="2301.00009", title="Recovered", provider="arxiv")
+        ]
+
+
+async def test_successful_mapping_records_recovered_count(graph: GraphStore) -> None:
+    paper = Paper(id="2301.00001", provider="arxiv", title="Seed")
+    provider = FulltextProvider(result=paper)
+    gateway = GraphEvidenceGateway(
+        graph,
+        {"arxiv": provider},
+        "arxiv",
+        reference_mapper=ExtraReferenceMapper(),
+    )
+    acquisition = await gateway.acquire("arxiv:2301.00001", turn=1)
+    assert acquisition.mapping_attempted is True
+    assert acquisition.mapping_failed is False
+    assert acquisition.mapping_recovered == 1
+    assert {c.paper_id for c in acquisition.candidates} == {
+        "arxiv:2301.00002",
+        "arxiv:2301.00009",
+    }
+
+
+class SearchProvider(FakeProvider):
+    def __init__(
+        self,
+        *,
+        results: list[PaperSummary] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.results = results or []
+        self.search_error = error
+
+    async def search(self, query: str, limit: int = 10) -> list[PaperSummary]:
+        if self.search_error is not None:
+            raise self.search_error
+        return self.results
+
+
+async def test_search_success_returns_candidates(graph: GraphStore) -> None:
+    provider = SearchProvider(
+        results=[PaperSummary(id="W7", title="Found", provider="openalex")]
+    )
+    result = await GraphEvidenceGateway(
+        graph, {"openalex": provider}, "openalex"
+    ).search("fields", 5)
+    assert result.outcome is ProviderOutcome.SUCCESS
+    assert [c.paper_id for c in result.candidates] == ["openalex:W7"]
+    assert result.candidates[0].mode == "search"
+
+
+async def test_search_transient_failure_is_typed(graph: GraphStore) -> None:
+    provider = SearchProvider(
+        error=TransientProviderError("openalex", "retry_exhausted", status=503)
+    )
+    result = await GraphEvidenceGateway(
+        graph, {"openalex": provider}, "openalex"
+    ).search("fields", 5)
+    assert result.outcome is ProviderOutcome.TRANSIENT
+    assert result.provider == "openalex"
+
+
+async def test_search_definitive_empty_is_absent(graph: GraphStore) -> None:
+    provider = SearchProvider(results=[])
+    result = await GraphEvidenceGateway(
+        graph, {"openalex": provider}, "openalex"
+    ).search("fields", 5)
+    assert result.outcome is ProviderOutcome.ABSENT
+
+
+async def test_search_mixed_empty_and_transient_is_transient(graph: GraphStore) -> None:
+    empty = SearchProvider(results=[])
+    failing = SearchProvider(
+        error=TransientProviderError("arxiv", "retry_exhausted", status=503)
+    )
+    result = await GraphEvidenceGateway(
+        graph, {"openalex": empty, "arxiv": failing}, "openalex"
+    ).search("fields", 5)
+    assert result.outcome is ProviderOutcome.TRANSIENT
+    assert result.provider == "arxiv"
+
+
+class NoSearchProvider(FakeProvider):
+    async def search(self, query: str, limit: int = 10) -> list[PaperSummary]:
+        raise NotImplementedError
+
+
+async def test_search_skips_providers_without_implementation(graph: GraphStore) -> None:
+    empty = SearchProvider(results=[])
+    result = await GraphEvidenceGateway(
+        graph, {"openalex": NoSearchProvider(), "arxiv": empty}, "openalex"
+    ).search("fields", 5)
+    assert result.outcome is ProviderOutcome.ABSENT

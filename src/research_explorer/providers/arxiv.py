@@ -40,9 +40,11 @@ from research_explorer.providers.base import (
     RETRYABLE,
     FullTextResult,
     ResilientProvider,
+    TransientProviderError,
     _raise_for_retryable,
     _wait_retry_after,
 )
+from research_explorer.redaction import redact_secrets
 from research_explorer.references.bibliography import segment_bibliography
 
 log = get_logger("providers")
@@ -284,17 +286,67 @@ class ArxivProvider(ResilientProvider):
 
     async def _get_xml(self, path: str, **params: Any) -> ET.Element | None:
         key = self._cache_key(path, params)
-        hit = self.cache.get(key)
-        xml_text = hit
+        xml_text = self.cache.get(key)
         if xml_text is None:
             try:
                 resp = await self.breaker.call(self._attempt_get, path, **params)
-                xml_text = resp.text
-                self.cache.set(key, xml_text, expire=self.cache_ttl)
-            except Exception:
+            except aiobreaker.CircuitBreakerError as exc:
+                if self.strict_transient:
+                    raise TransientProviderError(
+                        self.name, "circuit_open", path
+                    ) from exc
+                log.warning("circuit_open", provider=self.name, path=redact_secrets(path))
                 return None
-        if not xml_text:
+            except RETRYABLE as exc:
+                if self.strict_transient:
+                    url = getattr(exc, "url", None) or path
+                    raise TransientProviderError(
+                        self.name,
+                        "retry_exhausted",
+                        url,
+                        status=getattr(exc, "status", None),
+                    ) from exc
+                log.warning("request_failed", provider=self.name, path=redact_secrets(path))
+                return None
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status != 404:
+                    log.warning(
+                        "http_error",
+                        provider=self.name,
+                        path=redact_secrets(path),
+                        status=status,
+                    )
+                    if self.strict_transient:
+                        raise TransientProviderError(
+                            self.name, "http_error", path, status=status
+                        ) from exc
+                return None
+            if resp.status_code != 200:
+                if resp.status_code != 404 and self.strict_transient:
+                    raise TransientProviderError(
+                        self.name, "http_error", path, status=resp.status_code
+                    )
+                return None
+            xml_text = resp.text
+            if not xml_text:
+                if self.strict_transient:
+                    raise TransientProviderError(
+                        self.name, "malformed_response", path, status=200
+                    )
+                return None
+            self.cache.set(key, xml_text, expire=self.cache_ttl)
+        root = self._parse_xml(xml_text)
+        if root is None:
+            if self.strict_transient:
+                raise TransientProviderError(
+                    self.name, "malformed_response", path, status=200
+                )
             return None
+        return root
+
+    @staticmethod
+    def _parse_xml(xml_text: str) -> ET.Element | None:
         try:
             return ET.fromstring(xml_text)
         except ET.ParseError:

@@ -64,7 +64,7 @@ class LLMConfig:
     max_concurrent: int = 5
     rpm: int = 60
     explorer_model: str = "qwen3.6"
-    judge_model: str = "deepseek-v4-flash"
+    judge_model: str = "glm-5.3-flash"
     embedding_model: str = "qwen3-embedding"
     rerank_model: str = "rerank"
     temperature: float = 0.6
@@ -227,6 +227,9 @@ class ResearchKernelConfig:
     snapshot_interval: int = 1
     plateau_turns: int = 3
     convergence_epsilon: float = 0.01
+    search_enabled: bool = True
+    max_search_queries: int = 3
+    search_results_limit: int = 5
     weights: dict[str, float] = field(default_factory=_default_eval_weights)
 
 
@@ -590,6 +593,15 @@ def load_config(path: str | Path) -> Config:
             plateau_turns=rk.get("plateau_turns", cfg.research_kernel.plateau_turns),
             convergence_epsilon=rk.get(
                 "convergence_epsilon", cfg.research_kernel.convergence_epsilon
+            ),
+            search_enabled=rk.get(
+                "search_enabled", cfg.research_kernel.search_enabled
+            ),
+            max_search_queries=rk.get(
+                "max_search_queries", cfg.research_kernel.max_search_queries
+            ),
+            search_results_limit=rk.get(
+                "search_results_limit", cfg.research_kernel.search_results_limit
             ),
             weights=rk.get("weights", cfg.research_kernel.weights),
         )

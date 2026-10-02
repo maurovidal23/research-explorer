@@ -83,7 +83,13 @@ def test_open_question_priority_bounds() -> None:
 def test_evidence_ref_is_a_pointer_only() -> None:
     ref = EvidenceRef(paper_id="openalex:W1", locator="p.3", content_hash="abc")
     assert ref.paper_id == "openalex:W1"
-    assert set(ref.model_dump()) == {"paper_id", "locator", "content_hash", "acquisition_event"}
+    assert set(ref.model_dump()) == {
+        "paper_id",
+        "locator",
+        "content_hash",
+        "acquisition_event",
+        "setting",
+    }
 
 
 def test_supported_claim_evidence_predicate() -> None:
