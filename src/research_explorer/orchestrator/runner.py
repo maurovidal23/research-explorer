@@ -11,7 +11,7 @@ import contextlib
 import dataclasses
 import json
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from research_explorer.aco.colony import Colony
 from research_explorer.aco.convergence import ConvergenceChecker
@@ -565,6 +565,7 @@ class Orchestrator:
             weights=weights,
             min_coverage=exam.min_examination_coverage,
             context_max_chars=self.cfg.baseline.context_max_chars,
+            include_seed_context=self.cfg.baseline.include_seed_context,
             answer_batch_size=exam.answer_batch_size,
             max_validation_attempts=exam.max_validation_attempts,
             config_fingerprint=config_fingerprint(
@@ -574,6 +575,7 @@ class Orchestrator:
                     "seed": exam.partition_seed,
                     "selection": exam.selection_count,
                     "holdout": exam.holdout_count,
+                    "include_seed_context": self.cfg.baseline.include_seed_context,
                 }
             ),
             model_ids={
@@ -664,16 +666,23 @@ class Orchestrator:
         set and a fallback model is configured; it is never used silently
         (EXAM-2).
         """
-        from research_explorer.agents.llm_client import LLMClient
         from research_explorer.examination import LLMAnswerClient, LLMExaminer
 
         exam = self.cfg.examination
-        examiner_llm = LLMClient(
-            base_url=exam.examiner_base_url,
-            api_key=resolve_examiner_key(exam.examiner_api_key_env),
-            max_concurrent=self.cfg.llm.max_concurrent,
-            rpm=self.cfg.llm.rpm,
-        )
+        examiner_llm: Any
+        if exam.examiner_provider == "opencode":
+            from research_explorer.agents.opencode_client import OpenCodeLLMClient
+
+            examiner_llm = OpenCodeLLMClient()
+        else:
+            from research_explorer.agents.llm_client import LLMClient
+
+            examiner_llm = LLMClient(
+                base_url=exam.examiner_base_url,
+                api_key=resolve_examiner_key(exam.examiner_api_key_env),
+                max_concurrent=self.cfg.llm.max_concurrent,
+                rpm=self.cfg.llm.rpm,
+            )
         self._examiner_llm = examiner_llm
         generator = LLMExaminer(
             examiner_llm,

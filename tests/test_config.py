@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from research_explorer.config import load_config
+from research_explorer.config import _load_env, load_config
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+
+
+def test_linked_worktree_loads_main_worktree_env(tmp_path, monkeypatch) -> None:
+    main = tmp_path / "main"
+    linked = tmp_path / "linked"
+    git_dir = main / ".git" / "worktrees" / "linked"
+    git_dir.mkdir(parents=True)
+    linked.mkdir()
+    (linked / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (main / ".env").write_text("RESEARCH_EXPLORER_TEST_KEY=available\n", encoding="utf-8")
+    monkeypatch.chdir(linked)
+    monkeypatch.delenv("RESEARCH_EXPLORER_TEST_KEY", raising=False)
+
+    _load_env(linked / "config" / "default.toml")
+
+    assert os.environ["RESEARCH_EXPLORER_TEST_KEY"] == "available"
 
 
 def test_default_config_keeps_aco_and_gains_kernel_defaults() -> None:
@@ -137,6 +155,7 @@ def test_old_config_without_examination_sections_gets_defaults(tmp_path) -> None
     assert cfg.examination.enabled is False
     assert cfg.memory.synthesis_words == 2000
     assert cfg.baseline.context_max_chars == 40000
+    assert cfg.baseline.include_seed_context is True
 
 
 def test_invalid_examination_settings_are_rejected(tmp_path) -> None:
@@ -181,4 +200,3 @@ def test_old_agent_state_loads_without_structured_memory() -> None:
     assert state.synthesis == ""
     assert state.extraction_failures == []
     assert state.regenerate_synthesis()  # tolerant default synthesis
-

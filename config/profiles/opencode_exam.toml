@@ -1,0 +1,86 @@
+log_level = "INFO"
+
+[llm]
+base_url = "https://api.nan.builders/v1"
+api_key_env = "NAN_API_KEY"
+max_concurrent = 2
+rpm = 60
+explorer_model = "qwen3.6"
+judge_model = "qwen3.6"
+embedding_model = "qwen3-embedding"
+rerank_model = "rerank"
+temperature = 0.6
+max_tokens = 16000
+evaluation_max_tokens = 16000
+structured_output_attempts = 3
+fulltext_max_chars = 40000
+
+[aco]
+colony_size = 2
+max_concurrent = 2
+k_per_turn = 2
+
+[providers]
+default = "arxiv"
+active = ["arxiv"]
+
+[providers.arxiv]
+rate = 1
+period = 3
+concurrency = 2
+timeout = 30.0
+
+[reference_mapping]
+enabled = true
+max_entries = 20
+
+[budget]
+type = "fetches"
+max_fetches = 8
+max_time_seconds = 3600
+
+[convergence]
+plateau_T = 1
+epsilon = 0.01
+theta = 1.0
+
+[storage]
+db_path = "data/real_exam_lora.db"
+cache_dir = "data/.real_exam_cache"
+trace_db_path = "data/gpt56_full_exam_lora_replay.db"
+research_db_path = "data/gpt56_full_exam_lora_research.db"
+
+[memory]
+enabled = true
+synthesis_words = 1200
+
+[examination]
+enabled = true
+examiner_provider = "opencode"
+examiner_model = "openai/gpt-5.6-sol"
+examiner_reasoning_effort = "medium"
+examiner_temperature = 0.2
+examiner_max_tokens = 24000
+selection_count = 30
+holdout_count = 20
+options_per_item = 4
+partition_seed = 7
+max_validation_attempts = 4
+min_examination_coverage = 0.5
+require_both_partitions = true
+evidence_max_chars = 20000
+answer_model = "openai/gpt-5.6-sol"
+answer_temperature = 0.0
+answer_max_tokens = 8000
+answer_batch_size = 10
+answer_reasoning_effort = "medium"
+
+[terminal_selection]
+w_selection = 0.70
+w_process = 0.20
+w_grounding = 0.10
+
+[baseline]
+enabled = true
+context_max_chars = 20000
+include_seed_context = false

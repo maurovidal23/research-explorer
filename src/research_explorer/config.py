@@ -15,17 +15,46 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[no-redef]
 
 
+def _main_worktree_env(start: Path) -> Path | None:
+    for directory in (start, *start.parents):
+        dot_git = directory / ".git"
+        if dot_git.is_dir():
+            return directory / ".env"
+        if not dot_git.is_file():
+            continue
+        try:
+            marker = dot_git.read_text(encoding="utf-8").strip()
+            if not marker.startswith("gitdir:"):
+                return None
+            git_dir = Path(marker.removeprefix("gitdir:").strip())
+            if not git_dir.is_absolute():
+                git_dir = (directory / git_dir).resolve()
+            common = Path((git_dir / "commondir").read_text(encoding="utf-8").strip())
+            if not common.is_absolute():
+                common = (git_dir / common).resolve()
+            return common.parent / ".env"
+        except OSError:
+            return None
+    return None
+
+
 def _load_env(config_path: str | Path) -> None:
-    """Load .env files: one next to the config, then the project root, then CWD."""
+    """Load local, project, linked-main-worktree, and current-directory env files."""
     config_path = Path(config_path)
     candidates = [
         config_path.parent / ".env",
         config_path.parent.parent / ".env",
         Path.cwd() / ".env",
     ]
+    main_worktree_env = _main_worktree_env(Path.cwd())
+    if main_worktree_env is not None:
+        candidates.append(main_worktree_env)
+    loaded: set[Path] = set()
     for p in candidates:
-        if p.is_file():
-            load_dotenv(p, override=False)
+        resolved = p.resolve()
+        if resolved not in loaded and resolved.is_file():
+            load_dotenv(resolved, override=False)
+            loaded.add(resolved)
 
 
 @dataclass
@@ -267,6 +296,7 @@ class BaselineConfig:
 
     enabled: bool = True
     context_max_chars: int = 40_000
+    include_seed_context: bool = True
 
 
 @dataclass
@@ -638,6 +668,9 @@ def load_config(path: str | Path) -> Config:
         cfg.baseline = BaselineConfig(
             enabled=b.get("enabled", cfg.baseline.enabled),
             context_max_chars=b.get("context_max_chars", cfg.baseline.context_max_chars),
+            include_seed_context=b.get(
+                "include_seed_context", cfg.baseline.include_seed_context
+            ),
         )
 
     validate_config(cfg)

@@ -193,6 +193,8 @@ class LLMExaminer:
         self.evidence_max_chars = evidence_max_chars
 
     async def generate(self, pack: EvidencePack, spec: GenerationSpec) -> list[ExamItem]:
+        from research_explorer.examination.validation import validate_bank
+
         collected: list[ExamItem] = []
         seen: set[str] = set()
         for attempt in range(spec.max_validation_attempts):
@@ -204,7 +206,8 @@ class LLMExaminer:
                     continue
                 seen.add(item.question_id)
                 collected.append(item)
-            if len(collected) >= spec.total:
+            accepted, _rejected, _reasons = validate_bank(collected, pack)
+            if len(accepted) >= spec.total:
                 break
         if not collected:
             raise EvidenceInsufficientError("examiner returned no items")
@@ -398,11 +401,10 @@ def _parse_items(payload: dict, model_id: str, id_prefix: str = "") -> list[Exam
                 for o in raw.get("options", [])
             ]
             prefix = f"{id_prefix}-" if id_prefix else ""
+            raw_question_id = str(raw.get("question_id") or f"q-{index + 1:04d}")
             items.append(
                 ExamItem(
-                    question_id=str(
-                        raw.get("question_id") or f"{prefix}q-{index + 1:04d}"
-                    ),
+                    question_id=f"{prefix}{raw_question_id}",
                     category=str(raw.get("category", CATEGORY_CONCEPTS)),
                     difficulty=str(raw.get("difficulty", DIFFICULTY_MEDIUM)),
                     question=str(raw["question"]),

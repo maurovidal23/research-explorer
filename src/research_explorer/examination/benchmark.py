@@ -84,6 +84,7 @@ class BenchmarkConfig:
         model_ids: dict[str, str] | None = None,
         prompt_versions: dict[str, str] | None = None,
         context_max_chars: int = 40_000,
+        include_seed_context: bool = True,
         answer_batch_size: int = 5,
         max_validation_attempts: int = 2,
     ) -> None:
@@ -98,6 +99,7 @@ class BenchmarkConfig:
         self.model_ids = model_ids or {}
         self.prompt_versions = prompt_versions or {}
         self.context_max_chars = context_max_chars
+        self.include_seed_context = include_seed_context
         self.answer_batch_size = max(1, answer_batch_size)
         self.max_validation_attempts = max(1, max_validation_attempts)
 
@@ -425,7 +427,11 @@ class BenchmarkRunner:
         survivor_ctx = assemble_context(
             bundle, "holdout examination", max_chars=self.cfg.context_max_chars
         )
-        naive_ctx = _naive_context(self.pack, self.cfg.context_max_chars)
+        naive_ctx = (
+            _naive_context(self.pack, self.cfg.context_max_chars)
+            if self.cfg.include_seed_context
+            else ""
+        )
         try:
             holdout_sets = await self._run_partition(
                 bank,

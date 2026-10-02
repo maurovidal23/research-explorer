@@ -280,6 +280,24 @@ def test_arms_share_model_and_public_payload() -> None:
     assert selection_calls  # selection exam also ran
 
 
+def test_zero_context_baseline_receives_no_evidence() -> None:
+    pack, candidates, acquired = build_synthetic_corpus()
+    client = _RecordingAnswerClient()
+    config = BenchmarkConfig(
+        6,
+        4,
+        7,
+        include_seed_context=False,
+        model_ids={"answer_model": client.model_id},
+    )
+
+    _runner, result = _run_sync(pack, candidates, acquired, client, config)
+
+    naive_call = next(call for call in client.calls if call[0] == "naive")
+    assert result.outcome == OUTCOME_BENCHMARKED
+    assert naive_call[2] == ""
+
+
 def test_survivor_snapshot_matches_examined_structured_memory() -> None:
     pack, candidates, acquired = build_synthetic_corpus()
     runner, result = _run_sync(pack, candidates, acquired, FakeAnswerClient())

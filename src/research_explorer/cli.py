@@ -627,6 +627,7 @@ def benchmark(
             ),
             min_coverage=exam.min_examination_coverage,
             context_max_chars=cfg.baseline.context_max_chars,
+            include_seed_context=cfg.baseline.include_seed_context,
             answer_batch_size=exam.answer_batch_size,
             max_validation_attempts=exam.max_validation_attempts,
             model_ids={
